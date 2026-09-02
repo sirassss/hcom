@@ -58,8 +58,8 @@ Verified behavior when mixing different AI coding tools via hcom.
 ### Cursor (cursor-agent)
 - **Hooks**: sessionStart, beforeSubmitPrompt, preToolUse, postToolUse, stop, sessionEnd
 - **Payload**: JSON via stdin
-- **Session binding**: On sessionStart hook, immediate
-- **Message delivery**: Hook-based when hcom-launched. Active turn → body in postToolUse `additional_context`. Idle agent → a sentinel turn whose `stop` hook carries the body in `followup_message` (one extra turn vs. other tools — the idle wake costs a round-trip).
+- **Session binding**: On sessionStart. Identity is **process-lifetime** (`process_id`): `sessionEnd` does not unregister. A second session UUID on the same live Cursor process is an alias. Process death is reaped on the next `hcom` CLI process (`mark_dead_instances` in `main.rs`), not by a background watcher.
+- **Message delivery**: Hook-based when hcom-launched. Active turn → body in postToolUse `additional_context`. Idle agent → PTY injects only `<hcom>`; a healthy `stop` hook puts the packet in `followup_message` (status need not be `completed`). Empty stdin on stop does not ACK; the next healthy stop re-delivers. `stop.timeout` is 30s (rewritten on next `hcom cursor-agent` spawn if still 15).
 - **Background mode**: HeadlessPty — runs under a PTY even when headless (cursor-agent `--print` drops the beforeSubmitPrompt + stop hooks, so hcom keeps the interactive TUI). No detached `--print` background like Claude.
 - **Approval handling**: cursor's interactive approval prompt ("Run this command?") is detected by PTY screen scrape; a message held at an approval surfaces status `blocked: approval pending`.
 - **Status detail**: edit tool is `StrReplace` (not `Edit`); file/edit tools key the path off `path` (not `file_path`); shell has the `run_terminal_cmd` variant; delegates are `Task`/`Subagent`.

@@ -17,6 +17,7 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 const HCOM_TRIGGER: &str = "<hcom>";
 const HOOK_TIMEOUT_SECS: u64 = 15;
+const STOP_HOOK_TIMEOUT_SECS: u64 = 30;
 const CURSOR_HOOK_COMMANDS: &[(&str, &str)] = &[
     ("sessionStart", "cursor-sessionstart"),
     ("beforeSubmitPrompt", "cursor-beforesubmitprompt"),
@@ -118,7 +119,14 @@ fn expected_hook(event: &str, command: &str) -> Value {
             "command".to_string(),
             Value::String(build_cursor_hook_command(command)),
         ),
-        ("timeout".to_string(), json!(HOOK_TIMEOUT_SECS)),
+        (
+            "timeout".to_string(),
+            json!(if event == "stop" {
+                STOP_HOOK_TIMEOUT_SECS
+            } else {
+                HOOK_TIMEOUT_SECS
+            }),
+        ),
     ]);
     if event == "stop" {
         obj.insert("loop_limit".to_string(), Value::Null);
@@ -233,7 +241,12 @@ fn verify_hooks_at(path: &Path) -> bool {
                 entries.iter().any(|entry| {
                     entry.get("command").and_then(Value::as_str)
                         == Some(build_cursor_hook_command(command).as_str())
-                        && entry.get("timeout").and_then(Value::as_u64).is_some()
+                        && entry.get("timeout").and_then(Value::as_u64)
+                            == Some(if *event == "stop" {
+                                STOP_HOOK_TIMEOUT_SECS
+                            } else {
+                                HOOK_TIMEOUT_SECS
+                            })
                         && (*event != "stop" || entry.get("loop_limit").is_some_and(Value::is_null))
                 })
             })
@@ -513,7 +526,13 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     let Some(instance_name) = instance_name else {
         return json!({ "env": cursor_session_env(ctx) });
     };
-    let _ = db.rebind_instance_session(&instance_name, session_id);
+    if let Err(e) = db.rebind_session(session_id, &instance_name) {
+        log::log_warn(
+            "hooks",
+            "cursor.sessionstart.rebind_session",
+            &format!("instance={instance_name} err={e}"),
+        );
+    }
     instance_binding::capture_and_store_launch_context(db, &instance_name);
     let Some(instance) = db.get_instance_full(&instance_name).ok().flatten() else {
         return json!({ "env": cursor_session_env(ctx) });
@@ -601,9 +620,6 @@ fn handle_stop(
     };
     lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
-    if payload.raw.get("status").and_then(Value::as_str) != Some("completed") {
-        return (json!({}), None);
-    }
     match common::prepare_pending_messages(db, &instance.name) {
         Some(prepared) => (
             json!({ "followup_message": prepared.formatted }),
@@ -613,6 +629,9 @@ fn handle_stop(
     }
 }
 
+// Cursor sessionEnd fires per conversation UUID, not per process death, so it is
+// ignored here rather than finalizing the instance (mirrors finalize_session's
+// process-lifetime handling in common.rs, just a no-op for this transport).
 fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
     if let Some(instance) = resolved_instance(db, ctx, payload) {
         let reason = payload
@@ -620,7 +639,14 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> V
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        common::finalize_session(db, &instance.name, reason, None);
+        log::log_info(
+            "hooks",
+            "cursor.sessionend.ignored",
+            &format!(
+                "instance={} reason={} (process-lifetime; not unregistering)",
+                instance.name, reason
+            ),
+        );
     }
     json!({})
 }
@@ -702,6 +728,133 @@ mod tests {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
         (dir, workspace, guard)
+    }
+
+    /// Seeds a Cursor instance row for tests. Caller contract: call after
+    /// `cursor_test_env()` and after `crate::config::Config::init()`; the caller is
+    /// also responsible for setting `HCOM_PROCESS_ID` (via `EnvVarGuard`) to match
+    /// `process_id`.
+    fn seed_cursor_row(name: &str, session_id: &str, process_id: &str) {
+        let db = HcomDb::open().unwrap();
+        let initialized = crate::instance_binding::initialize_instance_in_position_file(
+            &db,
+            name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            None,
+            Some("cursor"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(initialized, "failed to initialize instance in position file");
+        db.rebind_session(session_id, name).unwrap();
+        db.set_process_binding(process_id, session_id, name)
+            .unwrap();
+        lifecycle::set_status(&db, name, ST_ACTIVE, "prompt", Default::default());
+    }
+
+    fn insert_broadcast(db: &HcomDb, from: &str, text: &str) {
+        db.log_event(
+            "message",
+            from,
+            &json!({"from": from, "text": text, "scope": "broadcast"}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn stop_followup_without_completed_status() {
+        let (_dir, _workspace, _guard) = cursor_test_env();
+        crate::config::Config::init();
+        let _process_id = crate::instance_binding::EnvVarGuard::set("HCOM_PROCESS_ID", "proc-kali");
+        seed_cursor_row("kali", "sess-k", "proc-kali");
+        let db = HcomDb::open().unwrap();
+        insert_broadcast(&db, "ops", "task for kali");
+        let ctx = HcomContext::from_os();
+        let payload = HookPayload::from_cursor_native(
+            "cursor-stop",
+            json!({"session_id": "sess-k", "conversation_id": "sess-k"}),
+        );
+        let (out, ack) = handle_stop(&db, &ctx, &payload);
+        assert!(
+            out.get("followup_message")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("task for kali")),
+            "{out}"
+        );
+        assert!(ack.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn stop_empty_queue_has_no_followup() {
+        let (_dir, _workspace, _guard) = cursor_test_env();
+        crate::config::Config::init();
+        let _process_id = crate::instance_binding::EnvVarGuard::set("HCOM_PROCESS_ID", "proc-idle");
+        seed_cursor_row("idle", "sess-i", "proc-idle");
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_os();
+        let payload = HookPayload::from_cursor_native(
+            "cursor-stop",
+            json!({"session_id": "sess-i", "status": "completed"}),
+        );
+        let (out, ack) = handle_stop(&db, &ctx, &payload);
+        assert_eq!(out, json!({}));
+        assert!(ack.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn sessionend_completed_keeps_instance() {
+        let (_dir, _workspace, _guard) = cursor_test_env();
+        crate::config::Config::init();
+        let _process_id = crate::instance_binding::EnvVarGuard::set("HCOM_PROCESS_ID", "proc-zilo");
+        seed_cursor_row("zilo", "sess-a", "proc-zilo");
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_os();
+        let raw = json!({
+            "session_id": "sess-a",
+            "conversation_id": "sess-a",
+            "reason": "completed"
+        });
+        let payload = HookPayload::from_cursor_native("cursor-sessionend", raw);
+        let out = handle_sessionend(&db, &ctx, &payload);
+        assert_eq!(out, json!({}));
+        let row = db.get_instance_full("zilo").unwrap().expect("row deleted");
+        assert_ne!(row.status, crate::shared::ST_INACTIVE);
+        assert!(!row.status_context.starts_with("exit:"));
+    }
+
+    #[test]
+    #[serial]
+    fn sessionstart_second_uuid_keeps_first_session_binding() {
+        let (_dir, _workspace, _guard) = cursor_test_env();
+        crate::config::Config::init();
+        let _process_id = crate::instance_binding::EnvVarGuard::set("HCOM_PROCESS_ID", "proc-dual");
+        seed_cursor_row("dual", "uuid-a", "proc-dual");
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_os();
+        let payload = HookPayload::from_cursor_native(
+            "cursor-sessionstart",
+            json!({"session_id": "uuid-b", "conversation_id": "uuid-b"}),
+        );
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+        assert_eq!(
+            db.get_session_binding("uuid-a").unwrap(),
+            Some("dual".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("uuid-b").unwrap(),
+            Some("dual".to_string())
+        );
+        assert!(db.get_instance_full("dual").unwrap().is_some());
     }
 
     #[test]
@@ -1007,5 +1160,58 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(root["permissions"]["allow"], json!(["Shell(custom)"]));
         }
+    }
+
+    #[test]
+    #[serial]
+    fn verify_rejects_fifteen_second_stop_timeout() {
+        let (_dir, workspace, _guard) = cursor_test_env();
+        let hooks_path = workspace.join(".cursor/hooks.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        try_setup_cursor_hooks(false).unwrap();
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        for entry in root["hooks"]["stop"].as_array_mut().unwrap() {
+            if entry["command"] == build_cursor_hook_command("cursor-stop") {
+                entry["timeout"] = json!(15);
+            }
+        }
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&root).unwrap(),
+        )
+        .unwrap();
+        assert!(!verify_cursor_hooks_installed(false));
+    }
+
+    #[test]
+    #[serial]
+    fn setup_writes_stop_timeout_thirty() {
+        let (_dir, workspace, _guard) = cursor_test_env();
+        try_setup_cursor_hooks(false).unwrap();
+        let root: Value = serde_json::from_str(
+            &std::fs::read_to_string(workspace.join(".cursor/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        let stop = root["hooks"]["stop"].as_array().unwrap();
+        let hcom = stop
+            .iter()
+            .find(|h| h["command"] == build_cursor_hook_command("cursor-stop"))
+            .unwrap();
+        assert_eq!(hcom["timeout"], json!(30));
+        assert!(hcom["loop_limit"].is_null());
+        for event in ["sessionStart", "sessionEnd", "preToolUse", "postToolUse"] {
+            let entries = root["hooks"][event].as_array().unwrap();
+            let hcom = entries
+                .iter()
+                .find(|h| {
+                    h["command"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("cursor-"))
+                })
+                .unwrap();
+            assert_eq!(hcom["timeout"], json!(15), "{event}");
+        }
+        assert!(verify_cursor_hooks_installed(false));
     }
 }

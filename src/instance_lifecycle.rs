@@ -810,11 +810,11 @@ pub fn mark_dead_instances(db: &HcomDb) -> i32 {
             "last_event_id": inst.last_event_id,
         });
 
+        // Defense-in-depth: redundant with the `instances` ON DELETE CASCADE
+        // on `session_bindings.instance_name`, kept for correctness
+        // independent of the FK and for any path that skips the cascade.
+        let _ = db.delete_session_bindings_for_instance(&inst.name);
         if let Some(ref session_id) = inst.session_id {
-            let _ = db.conn().execute(
-                "DELETE FROM session_bindings WHERE session_id = ?",
-                rusqlite::params![session_id],
-            );
             let _ = db.conn().execute(
                 "DELETE FROM process_bindings WHERE session_id = ?",
                 rusqlite::params![session_id],
@@ -1369,6 +1369,37 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         assert_eq!(deleted, 0);
         assert!(db.get_instance_full("real").unwrap().is_some());
 
+        cleanup(path);
+    }
+
+    #[test]
+    fn mark_dead_deletes_all_session_aliases() {
+        let (db, path) = setup_test_db();
+        // Recreate session_bindings without ON DELETE CASCADE. No migration
+        // touches this table and init_db uses CREATE TABLE IF NOT EXISTS, so
+        // an existing table's shape is never rebuilt on upgrade — this pins
+        // the explicit delete as correct independent of FK enforcement.
+        db.conn()
+            .execute_batch(
+                "DROP TABLE session_bindings;
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE INDEX idx_session_bindings_instance ON session_bindings(instance_name);",
+            )
+            .unwrap();
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("deadc"));
+        data.insert("tool".into(), serde_json::json!("cursor"));
+        data.insert("status".into(), serde_json::json!(ST_LISTENING));
+        data.insert("pid".into(), serde_json::json!(1_000_000_007));
+        data.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("deadc", &data).unwrap();
+
+        db.rebind_session("uuid-a", "deadc").unwrap();
+        db.rebind_session("uuid-b", "deadc").unwrap();
+        let n = mark_dead_instances(&db);
+        assert!(n >= 1);
+        assert_eq!(db.get_session_binding("uuid-a").unwrap(), None);
+        assert_eq!(db.get_session_binding("uuid-b").unwrap(), None);
         cleanup(path);
     }
 }

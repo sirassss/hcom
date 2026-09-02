@@ -508,26 +508,43 @@ pub fn bind_session_to_process(
                 // else a migrate failure leaves a duplicate active/listening row and a
                 // stale session binding. Endpoints may remain imperfect on the old name,
                 // but the delivery loop re-registers under the canonical name.
-                if !migrated {
+                let is_cursor = placeholder_data
+                    .as_ref()
+                    .is_some_and(|row| row.tool == "cursor");
+                if is_cursor {
+                    // Cursor issues a fresh session UUID on resume/session-switch but keeps
+                    // the same OS process. Retiring the placeholder here would kill the
+                    // still-live instance; alias the new session id onto it instead.
+                    // The orphaned placeholder (e.g. "temp") is deliberately left listening
+                    // with no process binding after this path fires; it is cleaned up later
+                    // by the normal stop / dead-PID cascade (mark_dead_instances), not immediately.
                     crate::log::log_info(
                         "binding",
-                        "bind_canonical.session_switch_migrate_failed",
-                        &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
+                        "bind_canonical.cursor_alias",
+                        &format!("not retiring {ph_name}; process rebound to {canonical_name}"),
                     );
-                }
-                crate::instance_lifecycle::set_status(
-                    db,
-                    ph_name,
-                    ST_INACTIVE,
-                    "exit:session_switch",
-                    Default::default(),
-                );
-                if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.delete_session_bindings",
-                        &format!("{e}"),
+                } else {
+                    if !migrated {
+                        crate::log::log_info(
+                            "binding",
+                            "bind_canonical.session_switch_migrate_failed",
+                            &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
+                        );
+                    }
+                    crate::instance_lifecycle::set_status(
+                        db,
+                        ph_name,
+                        ST_INACTIVE,
+                        "exit:session_switch",
+                        Default::default(),
                     );
+                    if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
+                        crate::log::log_error(
+                            "binding",
+                            "bind_canonical.delete_session_bindings",
+                            &format!("{e}"),
+                        );
+                    }
                 }
             }
         }
@@ -1027,44 +1044,50 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
     }
 }
 
+/// Scoped guard that sets one env var and restores its prior value (or absence) on
+/// drop. Callers using `set`/`unset` must be marked `#[serial]` (env var mutation is
+/// process-global).
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: callers of this guard are marked #[serial].
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: callers of this guard are marked #[serial].
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: callers of this guard are marked #[serial].
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use std::path::PathBuf;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1260,6 +1283,77 @@ mod tests {
 
         let inst = db.get_instance_full("miso").unwrap().unwrap();
         assert_eq!(inst.tag.as_deref(), Some("team"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_bind_session_path1b_cursor_keeps_process_instance() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut canonical_data = serde_json::Map::new();
+        canonical_data.insert("name".into(), serde_json::json!("miso"));
+        canonical_data.insert("session_id".into(), serde_json::json!("sid-789"));
+        canonical_data.insert("tool".into(), serde_json::json!("cursor"));
+        canonical_data.insert("created_at".into(), serde_json::json!(now));
+        canonical_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("miso", &canonical_data).unwrap();
+        db.rebind_session("sid-789", "miso").unwrap();
+
+        let mut ph_data = serde_json::Map::new();
+        ph_data.insert("name".into(), serde_json::json!("temp"));
+        ph_data.insert("session_id".into(), serde_json::json!("sid-old"));
+        ph_data.insert("tool".into(), serde_json::json!("cursor"));
+        ph_data.insert("created_at".into(), serde_json::json!(now));
+        ph_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("temp", &ph_data).unwrap();
+        db.rebind_session("sid-old", "temp").unwrap();
+        db.set_process_binding("pid-123", "sid-old", "temp")
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "sid-789", Some("pid-123"));
+        assert_eq!(result, Some("miso".to_string()));
+
+        let placeholder = db.get_instance_full("temp").unwrap().unwrap();
+        assert_ne!(placeholder.status_context, "exit:session_switch");
+        assert_ne!(placeholder.status, ST_INACTIVE);
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_bind_session_path1b_non_cursor_still_session_switches() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut canonical_data = serde_json::Map::new();
+        canonical_data.insert("name".into(), serde_json::json!("miso"));
+        canonical_data.insert("session_id".into(), serde_json::json!("sid-789"));
+        canonical_data.insert("tool".into(), serde_json::json!("claude"));
+        canonical_data.insert("created_at".into(), serde_json::json!(now));
+        canonical_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("miso", &canonical_data).unwrap();
+        db.rebind_session("sid-789", "miso").unwrap();
+
+        let mut ph_data = serde_json::Map::new();
+        ph_data.insert("name".into(), serde_json::json!("temp"));
+        ph_data.insert("session_id".into(), serde_json::json!("sid-old"));
+        ph_data.insert("tool".into(), serde_json::json!("claude"));
+        ph_data.insert("created_at".into(), serde_json::json!(now));
+        ph_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("temp", &ph_data).unwrap();
+        db.rebind_session("sid-old", "temp").unwrap();
+        db.set_process_binding("pid-123", "sid-old", "temp")
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "sid-789", Some("pid-123"));
+        assert_eq!(result, Some("miso".to_string()));
+        let placeholder = db.get_instance_full("temp").unwrap().unwrap();
+        assert_eq!(placeholder.status, ST_INACTIVE);
+        assert_eq!(placeholder.status_context, "exit:session_switch");
 
         cleanup(path);
     }

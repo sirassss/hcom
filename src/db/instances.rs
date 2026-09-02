@@ -422,11 +422,15 @@ impl HcomDb {
                 return Ok(false);
             }
 
+            // Defense-in-depth: `session_bindings.instance_name` already has
+            // ON DELETE CASCADE from `instances`, so this is redundant here,
+            // but kept for correctness independent of the FK and for any
+            // path that doesn't go through the cascade.
+            tx.execute(
+                "DELETE FROM session_bindings WHERE instance_name = ?",
+                params![name],
+            )?;
             if let Some(session_id) = session_id {
-                tx.execute(
-                    "DELETE FROM session_bindings WHERE session_id = ?",
-                    params![session_id],
-                )?;
                 tx.execute(
                     "DELETE FROM process_bindings WHERE session_id = ?",
                     params![session_id],
@@ -1157,6 +1161,51 @@ mod tests {
         // Should be ordered by created_at DESC
         assert_eq!(instances[0]["name"], "luna");
         assert_eq!(instances[1]["name"], "nova");
+
+        cleanup_test_db(db_path);
+    }
+
+    /// Recreate session_bindings without the `ON DELETE CASCADE` FK. No
+    /// migration in this file touches session_bindings and init_db uses
+    /// `CREATE TABLE IF NOT EXISTS`, so an existing table's shape is never
+    /// rebuilt on upgrade — this pins the explicit delete below as correct
+    /// independent of whether FK enforcement happens to cover it.
+    fn drop_session_bindings_cascade(db: &HcomDb) {
+        db.conn()
+            .execute_batch(
+                "DROP TABLE session_bindings;
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE INDEX idx_session_bindings_instance ON session_bindings(instance_name);",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn finalize_instance_stop_deletes_all_session_aliases() {
+        let (db, db_path) = setup_full_test_db();
+        drop_session_bindings_cascade(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('zilo', 'uuid-a', 'cursor', 'listening', 'start', 0, 1.0, 0)",
+                [],
+            )
+            .unwrap();
+        db.rebind_session("uuid-a", "zilo").unwrap();
+        db.rebind_session("uuid-b", "zilo").unwrap();
+        let won = db
+            .finalize_instance_stop(
+                "zilo",
+                1.0,
+                Some("uuid-a"),
+                None,
+                &serde_json::json!({"action":"stopped"}),
+            )
+            .unwrap();
+        assert!(won);
+        assert_eq!(db.get_session_binding("uuid-a").unwrap(), None);
+        assert_eq!(db.get_session_binding("uuid-b").unwrap(), None);
+        assert!(db.get_instance_full("zilo").unwrap().is_none());
 
         cleanup_test_db(db_path);
     }
