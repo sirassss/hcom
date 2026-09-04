@@ -115,6 +115,93 @@ fn hook_sessionstart_cmd(hcom_cmd: &str) -> String {
     hook_sh_cmd(hcom_cmd, "gemini-sessionstart", "")
 }
 
+/// Fallback JSON constant for hooks where agy requires a decision response when
+/// hcom is missing. PreToolUse needs `{"decision":"allow"}`; Stop needs a decision
+/// field where any value other than "continue" allows the stop. PostToolUse and the
+/// *Invocation lifecycle hooks accept an empty body (`""` in [`AGY_HOOK_CONFIGS`]).
+const ALLOW_JSON: &str = "{\"decision\":\"allow\"}";
+
+/// 15s timeout: agy default is 30s; 5s was tight under cold-start + busy sqlite
+/// on slower machines / CI. 15s leaves margin without leaving a stuck hook
+/// blocking the agent turn for half a minute.
+pub(crate) const HOOK_TIMEOUT_SEC: u64 = 15;
+
+/// (event, entry name, subcommand, matcher, fallback JSON, description).
+///
+/// `""` means "no matcher" / "no fallback", the same convention
+/// [`crate::hooks::claude::CLAUDE_HOOK_CONFIGS`] uses for an empty matcher.
+///
+/// The two events with a matcher (`PreToolUse`, `PostToolUse`) get nested
+/// under `"hooks": [...]` by [`try_setup_antigravity_hooks`]; the lifecycle
+/// events stay flat arrays. `PreInvocation` carries two rows, both landing in
+/// the same array.
+pub(crate) const AGY_HOOK_CONFIGS: &[(&str, &str, &str, &str, &str, &str)] = &[
+    (
+        "PreInvocation",
+        "hcom-sessionstart",
+        "gemini-sessionstart",
+        "",
+        "",
+        "Initialize hcom session",
+    ),
+    (
+        "PreInvocation",
+        "hcom-beforeagent",
+        "gemini-beforeagent",
+        "",
+        "",
+        "Deliver pending messages",
+    ),
+    (
+        "PostInvocation",
+        "hcom-afteragent",
+        "gemini-afteragent",
+        "",
+        "",
+        "Signal ready for messages",
+    ),
+    (
+        "Stop",
+        "hcom-sessionend",
+        "gemini-sessionend",
+        "",
+        ALLOW_JSON,
+        "Disconnect from hcom",
+    ),
+    (
+        "PreToolUse",
+        "hcom-beforetool",
+        "gemini-beforetool",
+        ".*",
+        ALLOW_JSON,
+        "Track tool execution",
+    ),
+    (
+        "PostToolUse",
+        "hcom-aftertool",
+        "gemini-aftertool",
+        ".*",
+        "",
+        "Deliver messages after tools",
+    ),
+];
+
+/// Build the `command` string for one [`AGY_HOOK_CONFIGS`] row. `hcom-sessionstart`
+/// routes through [`hook_sessionstart_cmd`] (which takes no fallback); every other
+/// row goes through [`hook_sh_cmd`] directly.
+pub(crate) fn agy_hook_command(
+    hcom_cmd: &str,
+    name: &str,
+    subcmd: &str,
+    fallback_json: &str,
+) -> String {
+    if name == "hcom-sessionstart" {
+        hook_sessionstart_cmd(hcom_cmd)
+    } else {
+        hook_sh_cmd(hcom_cmd, subcmd, fallback_json)
+    }
+}
+
 /// Try to set up Antigravity hooks in `hooks.json`.
 /// Reads existing hooks.json, merges "hcom-lifecycle" group, and preserves all other keys.
 pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), SetupError> {
@@ -148,81 +235,33 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
 
     let hcom_cmd = crate::runtime_env::build_hcom_command();
 
-    // Fallback JSON constants for hooks where agy requires a decision response when
-    // hcom is missing. PreToolUse needs `{"decision":"allow"}`; Stop needs a decision
-    // field where any value other than "continue" allows the stop. PostToolUse and the
-    // *Invocation lifecycle hooks accept an empty body.
-    const ALLOW_JSON: &str = "{\"decision\":\"allow\"}";
-
-    // 15s timeout: agy default is 30s; 5s was tight under cold-start + busy sqlite
-    // on slower machines / CI. 15s leaves margin without leaving a stuck hook
-    // blocking the agent turn for half a minute.
-    const HOOK_TIMEOUT_SEC: u64 = 15;
-
-    let hcom_lifecycle = json!({
-        "PreInvocation": [
-            {
-                "name": "hcom-sessionstart",
-                "type": "command",
-                "command": hook_sessionstart_cmd(&hcom_cmd),
-                "timeout": HOOK_TIMEOUT_SEC,
-                "description": "Initialize hcom session"
-            },
-            {
-                "name": "hcom-beforeagent",
-                "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "gemini-beforeagent", ""),
-                "timeout": HOOK_TIMEOUT_SEC,
-                "description": "Deliver pending messages"
-            }
-        ],
-        "PostInvocation": [
-            {
-                "name": "hcom-afteragent",
-                "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "gemini-afteragent", ""),
-                "timeout": HOOK_TIMEOUT_SEC,
-                "description": "Signal ready for messages"
-            }
-        ],
-        "Stop": [
-            {
-                "name": "hcom-sessionend",
-                "type": "command",
-                "command": hook_sh_cmd(&hcom_cmd, "gemini-sessionend", ALLOW_JSON),
-                "timeout": HOOK_TIMEOUT_SEC,
-                "description": "Disconnect from hcom"
-            }
-        ],
-        "PreToolUse": [
-            {
-                "matcher": ".*",
-                "hooks": [
-                    {
-                        "name": "hcom-beforetool",
-                        "type": "command",
-                        "command": hook_sh_cmd(&hcom_cmd, "gemini-beforetool", ALLOW_JSON),
-                        "timeout": HOOK_TIMEOUT_SEC,
-                        "description": "Track tool execution"
-                    }
-                ]
-            }
-        ],
-        "PostToolUse": [
-            {
-                "matcher": ".*",
-                "hooks": [
-                    {
-                        "name": "hcom-aftertool",
-                        "type": "command",
-                        "command": hook_sh_cmd(&hcom_cmd, "gemini-aftertool", ""),
-                        "timeout": HOOK_TIMEOUT_SEC,
-                        "description": "Deliver messages after tools"
-                    }
-                ]
-            }
-        ]
-    });
+    // Build each event's array from AGY_HOOK_CONFIGS, preserving both the
+    // table's row order (within an event) and its first-seen event order —
+    // matches the inline json! literal this replaced byte-for-byte.
+    let mut lifecycle_events: Vec<(&str, Vec<Value>)> = Vec::new();
+    for &(event, name, subcmd, matcher, fallback, description) in AGY_HOOK_CONFIGS {
+        let hook = json!({
+            "name": name,
+            "type": "command",
+            "command": agy_hook_command(&hcom_cmd, name, subcmd, fallback),
+            "timeout": HOOK_TIMEOUT_SEC,
+            "description": description
+        });
+        let entry = if matcher.is_empty() {
+            hook
+        } else {
+            json!({ "matcher": matcher, "hooks": [hook] })
+        };
+        match lifecycle_events.iter_mut().find(|(e, _)| *e == event) {
+            Some((_, entries)) => entries.push(entry),
+            None => lifecycle_events.push((event, vec![entry])),
+        }
+    }
+    let mut lifecycle_map = serde_json::Map::new();
+    for (event, entries) in lifecycle_events {
+        lifecycle_map.insert(event.to_string(), Value::Array(entries));
+    }
+    let hcom_lifecycle = Value::Object(lifecycle_map);
 
     hooks_root.insert("hcom-lifecycle".to_string(), hcom_lifecycle);
 

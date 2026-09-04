@@ -16,9 +16,9 @@ use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 const HCOM_TRIGGER: &str = "<hcom>";
-const HOOK_TIMEOUT_SECS: u64 = 15;
-const STOP_HOOK_TIMEOUT_SECS: u64 = 30;
-const CURSOR_HOOK_COMMANDS: &[(&str, &str)] = &[
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = 15;
+pub(crate) const STOP_HOOK_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CURSOR_HOOK_COMMANDS: &[(&str, &str)] = &[
     ("sessionStart", "cursor-sessionstart"),
     ("beforeSubmitPrompt", "cursor-beforesubmitprompt"),
     ("preToolUse", "cursor-pretooluse"),
@@ -752,7 +752,10 @@ mod tests {
             None,
             None,
         );
-        assert!(initialized, "failed to initialize instance in position file");
+        assert!(
+            initialized,
+            "failed to initialize instance in position file"
+        );
         db.rebind_session(session_id, name).unwrap();
         db.set_process_binding(process_id, session_id, name)
             .unwrap();
@@ -1176,11 +1179,7 @@ mod tests {
                 entry["timeout"] = json!(15);
             }
         }
-        std::fs::write(
-            &hooks_path,
-            serde_json::to_string_pretty(&root).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&hooks_path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
         assert!(!verify_cursor_hooks_installed(false));
     }
 
@@ -1204,11 +1203,7 @@ mod tests {
             let entries = root["hooks"][event].as_array().unwrap();
             let hcom = entries
                 .iter()
-                .find(|h| {
-                    h["command"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("cursor-"))
-                })
+                .find(|h| h["command"].as_str().is_some_and(|c| c.contains("cursor-")))
                 .unwrap();
             assert_eq!(hcom["timeout"], json!(15), "{event}");
         }

@@ -2756,7 +2756,7 @@ use super::common::SAFE_HCOM_COMMANDS;
 
 /// Hook configuration: (hook_type, matcher, command_suffix, timeout_secs).
 /// Single source of truth — all hook properties derived from this.
-const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
+pub(crate) const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
     ("SessionStart", "", "sessionstart", None),
     ("UserPromptSubmit", "", "userpromptsubmit", None),
     (
@@ -2857,19 +2857,36 @@ pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
 /// Build a hook command that silently exits 0 when hcom is not installed.
 ///
 /// Claude already executes hook commands through a shell, so this command keeps
-/// all shell logic inline instead of spawning another `sh -c`. It uses the
-/// ${HCOM:-hcom} env var (set in settings.json env block) so it works for both
-/// direct `hcom` and `uvx hcom` invocations. When the binary is absent (e.g.
-/// after `brew uninstall hcom`), the hook exits 0 instead of emitting a "command
-/// not found" error inside the tool.
-fn build_hook_entry_command(cmd_suffix: &str) -> String {
+/// all shell logic inline instead of spawning another `sh -c`. It's self-contained:
+/// it tries `$HCOM` (set in settings.json's env block, when present) or bare `hcom`,
+/// and falls back to `uvx hcom` when that's not on PATH — the plugin manifest path
+/// has no env block, so a uvx-only install must still resolve. When neither
+/// resolves (e.g. after `brew uninstall hcom`), the hook exits 0 instead of
+/// emitting a "command not found" error inside the tool.
+pub(crate) fn build_hook_entry_command(cmd_suffix: &str) -> String {
+    build_hook_entry_command_with(cmd_suffix, "", "exit 0")
+}
+
+/// Same self-resolving guard as [`build_hook_entry_command`], generalized for
+/// callers whose command needs more than a bare `exec $cmd <suffix>`. Its real
+/// consumers are the static Antigravity plugin manifest
+/// (`plugin/hcom-agy/hooks/hooks.json`) and the test in `src/hooks/plugin.rs`
+/// that pins it: that manifest both prefixes an env var to route the shared
+/// `gemini-*` handler and, on two events, must still emit a decision JSON when
+/// hcom is missing rather than plain `exit 0`. `src/hooks/antigravity.rs`
+/// itself does not call this — its live installer has its own `hook_sh_cmd`.
+pub(crate) fn build_hook_entry_command_with(
+    cmd_suffix: &str,
+    env_prefix: &str,
+    on_missing: &str,
+) -> String {
     // Claude runs hook commands through a POSIX shell on every platform
-    // (Git Bash on Windows), so the same command works everywhere. The
-    // `${HCOM:-hcom}` default plus the `command -v` guard make it silently
-    // exit 0 when hcom isn't on PATH.
+    // (Git Bash on Windows), so the same command works everywhere. Try
+    // `${HCOM:-hcom}` first, fall back to `uvx hcom` if that's not on PATH,
+    // then the `command -v` guard runs `on_missing` if neither is.
     format!(
-        "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
-        cmd_suffix
+        "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && {}exec $cmd {} || {}",
+        env_prefix, cmd_suffix, on_missing
     )
 }
 
@@ -4197,7 +4214,7 @@ mod tests {
         let command = build_hook_entry_command("poll");
         assert_eq!(
             command,
-            "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
+            "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
         );
         assert!(!command.starts_with("sh -c"));
     }

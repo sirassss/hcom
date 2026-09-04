@@ -1,0 +1,12 @@
+{
+  "name": "hcom",
+  "displayName": "hcom",
+  "description": "Let AI agents message, watch, and spawn each other across terminals.",
+  "version": "1.0.0",
+  "author": { "name": "aannoo" },
+  "homepage": "https://github.com/aannoo/hcom",
+  "repository": "https://github.com/aannoo/hcom",
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks-cursor.json"
+}
