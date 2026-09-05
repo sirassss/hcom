@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-03
 **Prior art:** `docs/superpowers/specs/2026-08-29-cursor-cli-sessionend-and-idle-followup-design.md` (the Cursor fix whose acceptance run exposed this)
-**Status:** Design approved; plan at `docs/superpowers/plans/2026-09-03-hcom-hooks-as-plugin.md`; revised 2026-09-03 after the Task 1 spike measured three assumptions to be wrong
+**Status:** Plan written at docs/superpowers/plans/2026-09-03-hcom-hooks-as-plugin.md
 
 **Scope:** How hcom *installs* its hooks for Claude Code, Cursor, and Antigravity (agy). Handler code in `src/hooks/*.rs` is untouched. Codex, Gemini, Kimi, Copilot keep their current install path. Pi, Oh My Pi, OpenCode already ship plugins and are out of scope.
 
@@ -79,6 +79,8 @@ A probe plugin was installed into all three tools and removed. Three results con
 2. **Cursor cannot install a plugin from the CLI.** `cursor-agent plugin` exposes only `marketplace`; installation happens in the interactive `/plugins` picker.
 3. **Cursor marketplaces must be remote git URLs.** A local path is coerced into `https://<first segment>.git` and fails DNS, so `dev_root` cannot drive a Cursor install.
 
+**Measured after review flagged it as an unrecorded assumption:** Cursor executes hook commands through a POSIX shell. A probe `sessionStart` hook using `${HOME:-nohome}`, `||` and a redirect ran correctly under `cursor-agent`. This is what permits `hooks-cursor.json` to reuse Claude's self-resolving `cmd=${HCOM:-hcom}; …` guard rather than needing Antigravity's explicit `sh -c '…'` wrapper — and nothing before the measurement established it, since Cursor's legacy commands were bare `hcom cursor-stop` with no shell metacharacters. Had Cursor argv-split instead, none of Cursor's plugin hooks would have fired on any platform.
+
 **Unmeasured, and load-bearing for Windows.** `hook_sh_cmd` (`src/hooks/antigravity.rs`) emits two different command syntaxes: a POSIX `sh -c '…'` form, and under `cfg!(windows)` a `cmd.exe` form (`where … && (set "ANTIGRAVITY_AGENT=1" && …) || exit /b 0`). A committed manifest is one static file and cannot carry both, and the spike measured no per-platform discovery mechanism in any of the three tools. Claude documents that it runs hook commands through a POSIX shell on every platform (Git Bash on Windows); Antigravity's behavior is unknown and was not measured.
 
 **The routing has since switched** (`src/tool.rs` now sends Antigravity to the plugin installer), so this is live rather than hypothetical, and it was not measured first as this section originally asked. The failure would be loud rather than fail-open: if Antigravity spawns hook commands through `cmd.exe`, `sh` is not found and the hook errors instead of exiting 0, inverting the contract every manifest here upholds.
@@ -123,7 +125,7 @@ superpowers ships one repo to five harnesses. What it does, and what we take:
 | Launch behavior when not installed | Warn and continue. `hcom claude` / `hcom cursor-agent` / `hcom agy` print what is missing and the exact command to fix it, then launch the agent anyway. Never install, never block. |
 | Plugin layout | **Two plugin directories.** `plugin/hcom/` carries Claude's `hooks/hooks.json` plus Cursor's declared `hooks/hooks-cursor.json`; `plugin/hcom-agy/` carries Antigravity's `hooks/hooks.json`. Antigravity reads the same conventional path as Claude, so separate directories are the only way to give them different hooks. |
 | Install mechanism | The tool's own CLI where one exists: `claude plugin marketplace add` + `claude plugin install`, `agy plugin install <dir>`. **Cursor has no CLI install**, so `hcom hooks add cursor` adds the marketplace and then prints the one manual step (`/plugins` inside Cursor). hcom does not hand-write plugin registration for any tool. |
-| Cursor's manual step | Because the install completes outside hcom, verify cannot pass in the same command — so `hcom hooks add cursor` **does not strip Cursor's legacy hooks**. The strip happens on a later `hcom hooks add cursor` (or `hcom hooks status`) once verification sees the plugin. Until then Cursor keeps working on `~/.cursor/hooks.json`. |
+| Cursor's manual step | The install completes in Cursor's `/plugins` TUI, which hcom cannot drive, and Cursor's enabled marker is not readable from disk. So **hcom never strips Cursor's legacy hooks — on any pass.** An earlier draft of this row promised a later `hooks add` or `hooks status` would do it once verification saw the plugin; that was wrong, because `verify_cursor_plugin_installed` turns true the moment `marketplace add` creates the checkout, well before the user has enabled anything. Cursor keeps working on `~/.cursor/hooks.json` until the user removes those entries deliberately with `hcom hooks remove cursor --legacy-only`. |
 | Verify mechanism | Read files. Verify runs before every spawn; shelling out to a CLI there is too slow. |
 | Migration | Plugin wins. Remove hcom's own legacy entries — **only after** the plugin verifies. |
 | Ordering | install → verify → remove legacy. Never remove first. |
@@ -234,6 +236,23 @@ This is a deliberate break from the current behavior, where the launcher silentl
 Goal 5 says hcom installs nothing the user did not ask for. Honouring that meant finding every place that installs as a side effect, and the first pass missed one: `start_bare` in `src/commands/start.rs` auto-installs hooks when it detects an unmanaged ("vanilla") tool. Once the three tools route to the plugin path, that call shells out to their CLI and clones a marketplace over the network — from a command whose only job is to join the bus. Four existing tests caught it; one hung two minutes on a real clone.
 
 `Tool::hooks_ship_as_plugin()` is the single source of truth for which tools this applies to, so a fourth call site cannot be fixed by remembering a list. Sites that install because the user explicitly asked — `hcom hooks add` — are unaffected.
+
+### 3c. `auto_approve` no longer manages permissions for these three
+
+A plugin manifest cannot carry permission rules, so the plugin installers take no `include_permissions` argument. Two consequences, both accepted:
+
+- `hcom config auto_approve <v>` used to re-run each installed tool's writer to add or remove hcom's permission allowances. For Claude, Cursor and Antigravity it now skips them — `refresh_installed_hook_permissions` returns early on `hooks_ship_as_plugin()`. Left unskipped it would have cloned a marketplace over the network from a config command, and still not applied the setting. This was the fourth side-effect install path the migration turned up.
+- Permission allowances for those three become the user's to manage in their own tool. hcom stops writing them, which is the same trade the rest of this design makes: less reach into config files hcom does not own.
+
+Codex, Gemini, Kimi, Copilot, Pi, OMP and OpenCode are unaffected and keep the existing behavior.
+
+### 3d. `--legacy-only`, and why Cursor needs it
+
+`hcom hooks remove <tool>` takes down both the plugin and the legacy entries — right for "get hcom out of this tool", wrong for finishing a migration, where the plugin is the part being kept. Claude and Antigravity do not need a separate command: `hcom hooks add <tool>` finishes their migration by stripping leftover legacy entries when the plugin already verifies.
+
+Cursor cannot use that route, because "plugin verifies" does not mean "plugin enabled" there. So it gets `hcom hooks remove cursor --legacy-only`: strip the old config, leave the plugin alone. The user runs it once `/plugins` shows hcom enabled — they can see that state, and hcom cannot.
+
+This was caught in cross-vendor review: the status advice had pointed at a plain `hooks remove`, which would have left Cursor with no hooks at all.
 
 ### 4. Legacy entry removal
 

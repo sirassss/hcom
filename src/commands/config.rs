@@ -2226,6 +2226,20 @@ fn kitty_setup() -> i32 {
     0
 }
 
+/// Message for `hcom config auto_approve <v>` naming the tools it actually
+/// manages. Built from `auto_approve_managed_tools()` rather than a hardcoded
+/// string so it cannot drift from what `refresh_installed_hook_permissions`
+/// touches — split out as its own function so a test can pin the tool list
+/// without capturing stdout.
+fn auto_approve_enabled_message() -> String {
+    let names = super::hooks::auto_approve_managed_tools()
+        .iter()
+        .map(|tool| tool.spec().label)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("Auto-approve enabled for safe hcom commands in {names}")
+}
+
 /// Update tool permissions when auto_approve changes.
 fn update_auto_approve_permissions(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
@@ -2233,9 +2247,7 @@ fn update_auto_approve_permissions(value: &str) -> bool {
     let failures = super::hooks::refresh_installed_hook_permissions(enabled);
 
     if enabled {
-        println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot"
-        );
+        println!("{}", auto_approve_enabled_message());
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");
     }
@@ -2257,6 +2269,36 @@ mod tests {
         assert_eq!(normalize_key("HCOM_TAG"), "HCOM_TAG");
         assert_eq!(normalize_key("terminal"), "HCOM_TERMINAL");
         assert_eq!(normalize_key("hcom_timeout"), "HCOM_TIMEOUT");
+    }
+
+    /// Pins the printed tool list to `auto_approve_managed_tools()` itself,
+    /// not a hardcoded string — so a future edit that reaches for
+    /// `hook_tools()` (which still includes the plugin tools) here instead
+    /// fails this test rather than silently naming tools the command no
+    /// longer touches.
+    #[test]
+    fn auto_approve_enabled_message_names_only_managed_tools() {
+        let expected = super::super::hooks::auto_approve_managed_tools()
+            .iter()
+            .map(|tool| tool.spec().label)
+            .collect::<Vec<_>>()
+            .join("/");
+        let message = super::auto_approve_enabled_message();
+        assert_eq!(
+            message,
+            format!("Auto-approve enabled for safe hcom commands in {expected}")
+        );
+        // Direct regression guard for the exact mutation caught by hand:
+        // reverting to `hook_tools()` re-lists the three plugin tools.
+        for tool in super::super::hooks::hook_tools() {
+            if tool.hooks_ship_as_plugin() {
+                assert!(
+                    !message.contains(tool.spec().label),
+                    "plugin tool {} must not appear in: {message}",
+                    tool.as_str()
+                );
+            }
+        }
     }
 
     #[test]

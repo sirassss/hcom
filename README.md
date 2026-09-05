@@ -46,6 +46,13 @@ hcom update
 
 </details>
 
+Hooks are not installed automatically. Enable them per tool:
+
+```bash
+hcom hooks add claude    # or: cursor, antigravity
+hcom hooks status
+```
+
 ---
 
 ## Quickstart

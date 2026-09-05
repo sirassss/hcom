@@ -3417,11 +3417,39 @@ fn remove_hooks_from_settings_path(settings_path: &Path) -> bool {
 
     let mut settings = match load_claude_settings(settings_path) {
         Some(s) => s,
-        None => return true, // Empty/missing is fine
+        // An empty file is fine — nothing to strip. A file with bytes we cannot
+        // parse is not: hcom's entries may still be in there, so reporting
+        // success would tell the user the migration finished while both hook
+        // sets keep firing. Never rewrite a file we failed to understand.
+        None => {
+            let empty = std::fs::read_to_string(settings_path)
+                .map(|c| c.trim().is_empty())
+                .unwrap_or(false);
+            if !empty {
+                crate::log::log_warn(
+                    "hooks",
+                    "claude.strip.unparseable",
+                    &format!(
+                        "left {} untouched: not valid JSON, so any hcom entries remain",
+                        settings_path.display()
+                    ),
+                );
+                return false;
+            }
+            return true;
+        }
     };
 
     if !settings.is_object() {
-        return true;
+        crate::log::log_warn(
+            "hooks",
+            "claude.strip.not_an_object",
+            &format!(
+                "left {} untouched: root is not a JSON object",
+                settings_path.display()
+            ),
+        );
+        return false;
     }
 
     remove_hcom_hooks_from_settings(&mut settings);

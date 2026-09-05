@@ -19,6 +19,7 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Headless mode**: `-p` (print) flag for background, `setsid()` detach
 - **Subagent support**: Yes, via Task with background=true
 - **Bootstrap injection**: On SessionStart, includes command reference, active agents, scripts
+- **Hook install**: Ships as a plugin (`hcom hooks add claude`), not as entries in the tool's shared config. Config files like `~/.claude/settings.json` are read by other harnesses — Cursor reads Claude's — so hooks placed there fire under agents they were never meant for. hcom never installs hooks automatically; launching an agent without them warns and falls back to ad-hoc mode.
 
 ### Codex
 - **Hooks**: SessionStart, UserPromptSubmit, PreToolUse (Bash), PostToolUse (Bash), Stop
@@ -65,6 +66,11 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Status detail**: edit tool is `StrReplace` (not `Edit`); file/edit tools key the path off `path` (not `file_path`); shell has the `run_terminal_cmd` variant; delegates are `Task`/`Subagent`.
 - **Fork**: not supported (cursor-agent has no native branch primitive — only `--resume`/`--continue`); resume preserved.
 - **Transcript**: cursor-agent writes JSONL under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Parser support is limited: no timestamps, `cwd`, or tool-result blocks; user prompts require wrapper removal.
+- **Hook install**: Ships as a plugin (`hcom hooks add cursor`), not as entries in the tool's shared config. Config files like `~/.claude/settings.json` are read by other harnesses — Cursor reads Claude's — so hooks placed there fire under agents they were never meant for. hcom never installs hooks automatically; launching an agent without them warns and falls back to ad-hoc mode. Cursor's install cannot be completed by hcom alone: `hcom hooks add cursor` only adds the marketplace, and you finish it by hand in Cursor's `/plugins` TUI. hcom never removes Cursor's legacy hooks for you — do that yourself with `hcom hooks remove cursor` once the plugin is enabled.
+
+### Antigravity
+- **Hooks**: sessionstart, beforeagent, afteragent, beforetool, aftertool, sessionend (same conventional `hooks/hooks.json` path Claude reads, so its plugin ships from a separate directory)
+- **Hook install**: Ships as a plugin (`hcom hooks add antigravity`), not as entries in the tool's shared config. Config files like `~/.claude/settings.json` are read by other harnesses — Cursor reads Claude's — so hooks placed there fire under agents they were never meant for. hcom never installs hooks automatically; launching an agent without them warns and falls back to ad-hoc mode.
 
 ## Working Patterns
 

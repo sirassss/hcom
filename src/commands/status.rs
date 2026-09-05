@@ -78,6 +78,11 @@ struct ToolStatus {
     installed: bool,
     hooks: bool,
     settings_path: String,
+    /// Non-empty when this tool ships hooks as a plugin and needs the user's
+    /// attention — not installed, or plugin and legacy hooks both present.
+    /// Shares wording with `hcom hooks status` via `plugin_status_line`
+    /// rather than a second copy of the text (spec §3a).
+    advice: String,
 }
 
 impl ToolStatus {
@@ -96,12 +101,30 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
     crate::integration_spec::ALL
         .iter()
         .filter(|spec| spec.released)
-        .map(|spec| ToolStatus {
-            key: spec.name,
-            name: spec.label,
-            installed: is_tool_installed(spec.tool),
-            hooks: spec.tool.verify_hooks_installed(false),
-            settings_path: spec.tool.hooks_settings_path(),
+        .map(|spec| {
+            let tool = spec.tool;
+            let hooks = tool.verify_hooks_installed(false);
+            let (settings_path, advice) = if tool.hooks_ship_as_plugin() {
+                // The legacy path is empty (or stale) once the plugin is in
+                // use, and printing it next to "installed" points at a file
+                // that holds nothing — same reasoning as `hcom hooks status`.
+                let advice = super::hooks::plugin_status_line(
+                    tool.as_str(),
+                    hooks,
+                    super::hooks::legacy_hooks_present(tool),
+                );
+                (String::new(), advice)
+            } else {
+                (tool.hooks_settings_path(), String::new())
+            };
+            ToolStatus {
+                key: spec.name,
+                name: spec.label,
+                installed: is_tool_installed(tool),
+                hooks,
+                settings_path,
+                advice,
+            }
         })
         .collect()
 }
@@ -114,6 +137,9 @@ fn tool_statuses_json(tools: &[ToolStatus]) -> serde_json::Value {
         ]);
         if !tool.settings_path.is_empty() {
             status.insert("settings_path".to_string(), json!(tool.settings_path));
+        }
+        if !tool.advice.is_empty() {
+            status.insert("advice".to_string(), json!(tool.advice));
         }
         (tool.key.to_string(), serde_json::Value::Object(status))
     });
@@ -362,6 +388,11 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         .collect::<Vec<_>>()
         .join("  ");
     println!("tools:     {tools_str}");
+    for tool in &tools {
+        if !tool.advice.is_empty() {
+            println!("  {}", tool.advice);
+        }
+    }
 
     // Terminal — show preset name with availability
     if terminal_config == "default" {
@@ -565,6 +596,7 @@ mod tests {
             installed: true,
             hooks: true,
             settings_path: String::new(),
+            advice: String::new(),
         };
         assert_eq!(t.symbol(), "✓");
 
@@ -574,6 +606,7 @@ mod tests {
             installed: true,
             hooks: false,
             settings_path: String::new(),
+            advice: String::new(),
         };
         assert_eq!(t.symbol(), "~");
 
@@ -583,6 +616,7 @@ mod tests {
             installed: false,
             hooks: false,
             settings_path: String::new(),
+            advice: String::new(),
         };
         assert_eq!(t.symbol(), "✗");
     }
@@ -641,6 +675,7 @@ mod tests {
                 installed: true,
                 hooks: false,
                 settings_path: "/tmp/kimi.json".to_string(),
+                advice: String::new(),
             },
             ToolStatus {
                 key: "claude",
@@ -648,6 +683,7 @@ mod tests {
                 installed: false,
                 hooks: false,
                 settings_path: String::new(),
+                advice: String::new(),
             },
         ];
         let value = tool_statuses_json(&tools);
@@ -716,6 +752,61 @@ mod tests {
         assert!(
             available(builtin),
             "user-defined {builtin} must show available on {platform}"
+        );
+    }
+
+    /// A plugin tool with nothing installed must not carry the legacy
+    /// settings path (it holds nothing useful once plugins exist) and must
+    /// carry the same not-installed advice `hcom hooks status` would print —
+    /// bringing `hcom status` in line with spec §3a.
+    #[test]
+    #[serial]
+    fn plugin_tool_not_installed_has_no_legacy_path_but_has_advice() {
+        use crate::hooks::test_helpers::isolated_test_env;
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+
+        let tools = get_tool_statuses();
+        let claude = tools
+            .iter()
+            .find(|t| t.key == "claude")
+            .expect("claude in status list");
+        assert!(
+            claude.settings_path.is_empty(),
+            "plugin tool must not surface the legacy path: {}",
+            claude.settings_path
+        );
+        assert_eq!(
+            claude.advice,
+            super::super::hooks::plugin_status_line("claude", false, false)
+        );
+        assert!(claude.advice.contains("hcom hooks add claude"));
+
+        let json = tool_statuses_json(&tools);
+        assert!(json["claude"].get("settings_path").is_none());
+        assert_eq!(json["claude"]["advice"], claude.advice.as_str());
+    }
+
+    /// A plugin tool with both plugin and legacy hooks present must flag the
+    /// double-fire risk here too, with the same wording `hcom hooks status`
+    /// uses (via `plugin_status_line`), not a second hand-written copy.
+    #[test]
+    #[serial]
+    fn plugin_tool_double_fire_advice_matches_hooks_status() {
+        use crate::hooks::test_helpers::{install_fake_claude_plugin, isolated_test_env};
+        let (_dir, _hcom_dir, home, _guard) = isolated_test_env();
+        // Full legacy install first (every configured hook type — verify
+        // rejects a partial set), then the plugin markers on top, so both
+        // halves `legacy_hooks_present` / `verify_claude_plugin_installed`
+        // check are genuinely present.
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+        install_fake_claude_plugin(&home);
+
+        let tools = get_tool_statuses();
+        let claude = tools.iter().find(|t| t.key == "claude").unwrap();
+        assert!(claude.advice.contains("double-fire"), "{}", claude.advice);
+        assert_eq!(
+            claude.advice,
+            super::super::hooks::plugin_status_line("claude", true, true)
         );
     }
 

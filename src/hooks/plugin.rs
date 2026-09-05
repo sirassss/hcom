@@ -31,6 +31,14 @@
 //!    cannot drive a Cursor install; `cursor-agent --plugin-dir <path>` is the
 //!    local-development route instead.
 //!
+//! Cursor runs hook commands through a POSIX shell (measured 2026-09-03: a
+//! `sessionStart` hook using `${HOME:-nohome}`, `||` and a redirect executed
+//! correctly). That is what lets `hooks-cursor.json` carry the same
+//! self-resolving `cmd=${HCOM:-hcom}; …` guard as Claude's manifest instead of
+//! needing Antigravity's explicit `sh -c '…'` wrapper. Cursor's legacy commands
+//! were bare `hcom cursor-stop` with no metacharacters, so nothing before this
+//! measurement established it.
+//!
 //! Claude's install commands are idempotent: re-running `plugin marketplace add`
 //! on a known marketplace prints "already on disk" and `plugin install` on an
 //! installed plugin prints "is already installed", both exiting 0 (measured
@@ -89,6 +97,26 @@ pub(crate) fn agy_import_manifest() -> PathBuf {
     crate::runtime_env::gemini_family_config_dir()
         .join("config")
         .join("import_manifest.json")
+}
+
+/// Source harness hcom's Antigravity plugin was imported from, if any.
+///
+/// A genuine `agy plugin install` never touches this file — only
+/// `agy plugin import <harness>` does. Its entries look like
+/// `{"name": "hcom", "source": "claude-code", ...}`. Since Claude's
+/// `hooks/hooks.json` sits at the exact path Antigravity reads (module doc),
+/// an import lands Claude's handlers on Antigravity agents. Returns the
+/// `source` string when such an entry exists, so status can name it.
+pub(crate) fn agy_imported_hcom_source() -> Option<String> {
+    let contents = std::fs::read_to_string(agy_import_manifest()).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    manifest
+        .get("imports")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("name").and_then(|n| n.as_str()) == Some(PLUGIN_NAME))
+        .and_then(|entry| entry.get("source").and_then(|s| s.as_str()))
+        .map(str::to_string)
 }
 
 /// Root under which Cursor checks out marketplace repositories:
@@ -305,6 +333,73 @@ pub(crate) fn install_agy_plugin() -> Result<(), String> {
     )
 }
 
+/// Commands hcom runs to remove the Claude plugin: uninstall it, then drop the
+/// marketplace registration too — otherwise `claude plugin marketplace list`
+/// keeps showing it after `hcom hooks remove claude`.
+fn claude_uninstall_commands() -> [(&'static str, Vec<&'static str>); 2] {
+    [
+        ("claude", vec!["plugin", "uninstall", CLAUDE_PLUGIN_ID]),
+        (
+            "claude",
+            vec!["plugin", "marketplace", "remove", CLAUDE_MARKETPLACE],
+        ),
+    ]
+}
+
+/// Cursor's plugin registry is account state, not a local file — deleting
+/// anything under `~/.cursor` cannot clear it, so removal must go through the
+/// CLI (design doc, "Decisions": Uninstall).
+fn cursor_uninstall_command() -> (&'static str, Vec<&'static str>) {
+    (
+        "cursor-agent",
+        vec!["plugin", "marketplace", "remove", PLUGIN_NAME],
+    )
+}
+
+fn agy_uninstall_command() -> (&'static str, Vec<&'static str>) {
+    ("agy", vec!["plugin", "uninstall", PLUGIN_NAME])
+}
+
+/// Remove the Claude plugin. Gated on [`verify_claude_plugin_installed`] so a
+/// user who never installed it (the common case today) does not see a CLI
+/// failure on every `hcom hooks remove claude`.
+pub(crate) fn uninstall_claude_plugin() -> Result<(), String> {
+    if !verify_claude_plugin_installed() {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    for (program, args) in claude_uninstall_commands() {
+        if let Err(e) = run_tool_cli(program, &args) {
+            errors.push(e);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Remove Cursor's marketplace registration. Gated on
+/// [`verify_cursor_plugin_installed`] for the same reason as Claude above.
+pub(crate) fn uninstall_cursor_plugin() -> Result<(), String> {
+    if !verify_cursor_plugin_installed() {
+        return Ok(());
+    }
+    let (program, args) = cursor_uninstall_command();
+    run_tool_cli(program, &args)
+}
+
+/// Remove the Antigravity plugin. Gated on [`verify_agy_plugin_installed`] for
+/// the same reason as Claude above.
+pub(crate) fn uninstall_agy_plugin() -> Result<(), String> {
+    if !verify_agy_plugin_installed() {
+        return Ok(());
+    }
+    let (program, args) = agy_uninstall_command();
+    run_tool_cli(program, &args)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hooks::test_helpers::EnvGuard;
@@ -338,6 +433,30 @@ mod tests {
         crate::config::Config::reset();
         crate::config::Config::init();
         (dir, home, guard)
+    }
+
+    #[test]
+    #[serial]
+    fn agy_imported_hcom_source_reads_a_foreign_import() {
+        let (_dir, home, _guard) = plugin_test_env();
+        let config_dir = home.join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("import_manifest.json"),
+            r#"{"imports":[{"name":"hcom","source":"claude-code","importedAt":"2026-01-01T00:00:00Z","components":["hooks"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::agy_imported_hcom_source().as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agy_imported_hcom_source_is_none_without_a_manifest() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        assert_eq!(super::agy_imported_hcom_source(), None);
     }
 
     #[test]
@@ -463,6 +582,23 @@ mod tests {
         assert!(
             !after.contains("exec $cmd sessionstart"),
             "hcom hook survived:\n{after}"
+        );
+    }
+
+    /// A strip that could not parse the file must not report success: hcom's
+    /// entries may still be in there, so "migration finished" would be a lie
+    /// and both hook sets would keep firing unnoticed.
+    #[test]
+    #[serial]
+    fn strip_reports_failure_on_malformed_json() {
+        let (_dir, home, _guard) = plugin_test_env();
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "{ this is not json").unwrap();
+
+        assert!(
+            !crate::hooks::claude::remove_claude_hooks(),
+            "an unparseable settings.json must report a failed strip"
         );
     }
 
@@ -1008,5 +1144,69 @@ mod tests {
                 "AGY manifest calls Cursor subcommand {suffix}"
             );
         }
+    }
+
+    // ── Uninstall command shapes ──────────────────────────────────────
+    //
+    // Pure argument-list assertions — no subprocess. The end-to-end effect
+    // (does `claude plugin marketplace remove hcom` actually clear the
+    // registry) is not verifiable without a real Claude/Cursor/Antigravity
+    // CLI and account state, so it stays a manual check.
+
+    #[test]
+    fn claude_uninstall_runs_uninstall_then_marketplace_remove() {
+        let commands = super::claude_uninstall_commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[0],
+            (
+                "claude",
+                vec!["plugin", "uninstall", super::CLAUDE_PLUGIN_ID]
+            )
+        );
+        assert_eq!(
+            commands[1],
+            (
+                "claude",
+                vec!["plugin", "marketplace", "remove", super::CLAUDE_MARKETPLACE]
+            )
+        );
+    }
+
+    #[test]
+    fn cursor_uninstall_removes_the_marketplace() {
+        assert_eq!(
+            super::cursor_uninstall_command(),
+            (
+                "cursor-agent",
+                vec!["plugin", "marketplace", "remove", super::PLUGIN_NAME]
+            )
+        );
+    }
+
+    #[test]
+    fn agy_uninstall_uninstalls_the_plugin() {
+        assert_eq!(
+            super::agy_uninstall_command(),
+            ("agy", vec!["plugin", "uninstall", super::PLUGIN_NAME])
+        );
+    }
+
+    /// Uninstall must not shell out at all when the tool reports no plugin —
+    /// otherwise every `hcom hooks remove <tool>` on a machine that never
+    /// installed the plugin would spawn a CLI call that fails with a noisy
+    /// "not installed" error. Verified by pointing verify at an empty test
+    /// env rather than by mocking `run_tool_cli`, matching the pattern the
+    /// verify tests above already use.
+    #[test]
+    #[serial]
+    fn uninstall_is_a_noop_when_nothing_is_installed() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        assert!(!super::verify_claude_plugin_installed());
+        assert!(super::uninstall_claude_plugin().is_ok());
+        assert!(!super::verify_cursor_plugin_installed());
+        assert!(super::uninstall_cursor_plugin().is_ok());
+        assert!(!super::verify_agy_plugin_installed());
+        assert!(super::uninstall_agy_plugin().is_ok());
     }
 }

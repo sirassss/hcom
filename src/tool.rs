@@ -155,9 +155,33 @@ impl Tool {
     /// Remove hooks for this tool. Returns `Ok(true)` on success, `Ok(false)`
     /// if the tool reports a non-error failure, and `Err(message)` on
     /// recoverable errors that callers should display verbatim.
+    /// Strip only this tool's legacy config entries, leaving any installed
+    /// plugin alone.
+    ///
+    /// `remove_hooks` takes both down, which is right for "I want hcom out of
+    /// this tool" but wrong for finishing a migration: there the plugin is what
+    /// the user is keeping. Only meaningful for `hooks_ship_as_plugin` tools.
+    pub fn remove_legacy_hooks_only(&self) -> bool {
+        match self {
+            Tool::Claude => crate::hooks::claude::remove_claude_hooks(),
+            Tool::Cursor => crate::hooks::cursor::remove_cursor_hooks(),
+            Tool::Antigravity => crate::hooks::antigravity::remove_antigravity_hooks(),
+            _ => false,
+        }
+    }
+
     pub fn remove_hooks(&self) -> Result<bool, String> {
         match self {
-            Tool::Claude => Ok(crate::hooks::claude::remove_claude_hooks()),
+            // These three also carry a plugin (`hooks_ship_as_plugin`). The
+            // plugin uninstall is best-effort: a missing CLI or a plugin that
+            // was never installed must not stop the legacy config from being
+            // stripped, which is the part `hcom hooks remove` must never skip.
+            Tool::Claude => {
+                if let Err(e) = crate::hooks::plugin::uninstall_claude_plugin() {
+                    eprintln!("note: could not remove Claude plugin: {e}");
+                }
+                Ok(crate::hooks::claude::remove_claude_hooks())
+            }
             Tool::Gemini => Ok(crate::hooks::gemini::remove_gemini_hooks()),
             Tool::Codex => Ok(crate::hooks::codex::remove_codex_hooks()),
             Tool::OpenCode => crate::hooks::opencode::remove_opencode_plugin()
@@ -166,8 +190,18 @@ impl Tool {
             Tool::Kilo => crate::hooks::opencode::remove_kilo_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
-            Tool::Antigravity => Ok(crate::hooks::antigravity::remove_antigravity_hooks()),
-            Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
+            Tool::Antigravity => {
+                if let Err(e) = crate::hooks::plugin::uninstall_agy_plugin() {
+                    eprintln!("note: could not remove Antigravity plugin: {e}");
+                }
+                Ok(crate::hooks::antigravity::remove_antigravity_hooks())
+            }
+            Tool::Cursor => {
+                if let Err(e) = crate::hooks::plugin::uninstall_cursor_plugin() {
+                    eprintln!("note: could not remove Cursor plugin: {e}");
+                }
+                Ok(crate::hooks::cursor::remove_cursor_hooks())
+            }
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
