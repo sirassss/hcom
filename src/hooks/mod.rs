@@ -185,6 +185,29 @@ pub mod test_helpers {
         crate::config::Config::init();
         (dir, hcom_dir, test_home, guard)
     }
+
+    /// Fake a completed Claude plugin install inside an [`isolated_test_env`].
+    ///
+    /// Claude's hooks now ship in the hcom plugin, so a test that wants "hooks
+    /// are installed" can no longer express that by calling the legacy
+    /// `setup_claude_hooks` writer — `verify_claude_plugin_installed` reads the
+    /// `enabledPlugins` flag and the cached plugin directory instead. Writing
+    /// both here keeps those tests about what they were testing.
+    pub fn install_fake_claude_plugin(test_home: &std::path::Path) {
+        let settings_path = crate::hooks::claude::get_claude_settings_path();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let mut settings = crate::hooks::claude::load_claude_settings(&settings_path)
+            .unwrap_or_else(|| serde_json::json!({}));
+        settings["enabledPlugins"][crate::hooks::plugin::CLAUDE_PLUGIN_ID] =
+            serde_json::Value::Bool(true);
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+        let _ = test_home;
+        std::fs::create_dir_all(crate::hooks::plugin::claude_plugin_dir().join("1.0.0")).unwrap();
+    }
 }
 
 // Re-export key types.

@@ -81,7 +81,9 @@ A probe plugin was installed into all three tools and removed. Three results con
 
 **Unmeasured, and load-bearing for Windows.** `hook_sh_cmd` (`src/hooks/antigravity.rs`) emits two different command syntaxes: a POSIX `sh -c '…'` form, and under `cfg!(windows)` a `cmd.exe` form (`where … && (set "ANTIGRAVITY_AGENT=1" && …) || exit /b 0`). A committed manifest is one static file and cannot carry both, and the spike measured no per-platform discovery mechanism in any of the three tools. Claude documents that it runs hook commands through a POSIX shell on every platform (Git Bash on Windows); Antigravity's behavior is unknown and was not measured.
 
-This is not a defect while `src/tool.rs` still routes Antigravity to the legacy writer — that path keeps emitting the `cmd.exe` form. It becomes a regression at the task that switches the routing, and the failure would be loud rather than fail-open: if Antigravity uses `cmd.exe`, `sh` is not found and the hook errors instead of exiting 0, which inverts the contract every manifest here upholds. **Measure it before switching the routing**, on a Windows host or by inspecting how Antigravity spawns hook commands; if it needs `cmd.exe`, Antigravity keeps the legacy writer on Windows.
+**The routing has since switched** (`src/tool.rs` now sends Antigravity to the plugin installer), so this is live rather than hypothetical, and it was not measured first as this section originally asked. The failure would be loud rather than fail-open: if Antigravity spawns hook commands through `cmd.exe`, `sh` is not found and the hook errors instead of exiting 0, inverting the contract every manifest here upholds.
+
+Two things narrow the exposure. `install_agy_plugin` requires a local checkout (`agy plugin install` takes a directory, not a URL), so a Windows user with no `dev_root` gets an actionable error and never reaches the manifest. And nothing installs as a side effect any more, so no one arrives here without having typed `hcom hooks add antigravity`. **Still unresolved:** a Windows contributor with `dev_root` set would install a manifest that may not run. Measure on a Windows host before release; if Antigravity needs `cmd.exe`, keep the legacy writer for Antigravity on Windows.
 
 One assumption held: Cursor resolves a plugin declared in a repo subdirectory (`"source": "./plugin/hcom"`), so the plugin body stays where it is.
 
@@ -226,6 +228,12 @@ Messages will not be delivered automatically this session.
 No install, no config write, no prompt, no blocked launch. The agent starts; it simply runs without hook-based delivery, which is the documented ad-hoc mode that already exists. The same warning surfaces in `hcom status` and `hcom hooks status`.
 
 This is a deliberate break from the current behavior, where the launcher silently rewrote a stale `~/.cursor/hooks.json` on the next spawn (the migration trigger used for the 15s→30s timeout change). That convenience is what let a config change land without anyone deciding to make it. Upgrades are now visible: an existing machine keeps its legacy hooks and keeps working until someone runs `hcom hooks add`.
+
+### 3b. Every install trigger, not just the launcher
+
+Goal 5 says hcom installs nothing the user did not ask for. Honouring that meant finding every place that installs as a side effect, and the first pass missed one: `start_bare` in `src/commands/start.rs` auto-installs hooks when it detects an unmanaged ("vanilla") tool. Once the three tools route to the plugin path, that call shells out to their CLI and clones a marketplace over the network — from a command whose only job is to join the bus. Four existing tests caught it; one hung two minutes on a real clone.
+
+`Tool::hooks_ship_as_plugin()` is the single source of truth for which tools this applies to, so a fourth call site cannot be fixed by remembering a list. Sites that install because the user explicitly asked — `hcom hooks add` — are unaffected.
 
 ### 4. Legacy entry removal
 

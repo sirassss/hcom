@@ -952,6 +952,8 @@ Expected: FAIL — `install_then_strip` is not defined.
 
 - [ ] **Step 3: Write the implementation**
 
+**Do not gate a strip on `verify_cursor_plugin_installed` here.** An earlier draft did, and review caught it: that verifier only proves a marketplace checkout exists, and `marketplace add` — the line immediately above it — is what creates the checkout. Once the repo ships `plugin/hcom/hooks/hooks-cursor.json`, the gate passes the instant that command succeeds, so the strip would delete `~/.cursor/hooks.json` (and hcom's Cursor permissions, which `remove_cursor_hooks` also clears) while the plugin sits un-enabled in the TUI — leaving Cursor with no hooks at all, silently. Cursor's enabled marker is not readable from disk, so there is no honest signal to gate on. The Cursor path never strips.
+
 ```rust
 /// Install → verify → strip, in that order.
 ///
@@ -998,15 +1000,18 @@ pub(crate) const HCOM_REPOSITORY_URL: &str = "https://github.com/aannoo/hcom";
 /// without pushing — both `claude plugin marketplace add` and
 /// `agy plugin install` accept a local path. Cursor does not; see
 /// `install_cursor_plugin`.
-fn marketplace_source(db_path: &std::path::Path) -> String {
-    if let Some((root, _source)) = crate::router::resolve_effective_dev_root(db_path) {
+fn marketplace_source() -> String {
+    // `paths::db_path()` is a free function, so nothing has to be threaded
+    // through `try_setup_hooks` to reach dev_root.
+    let db_path = crate::paths::db_path();
+    if let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) {
         return root.to_string_lossy().to_string();
     }
-    "https://github.com/aannoo/hcom".to_string()
+    HCOM_REPOSITORY_URL.to_string()
 }
 
-pub(crate) fn install_claude_plugin(db_path: &std::path::Path) -> Result<(), String> {
-    let source = marketplace_source(db_path);
+pub(crate) fn install_claude_plugin() -> Result<(), String> {
+    let source = marketplace_source();
     install_then_strip(
         || {
             run_tool_cli("claude", &["plugin", "marketplace", "add", &source])?;
@@ -1033,19 +1038,15 @@ pub(crate) fn install_cursor_plugin() -> Result<(), String> {
         &["plugin", "marketplace", "add", HCOM_REPOSITORY_URL],
     )?;
 
-    if verify_cursor_plugin_installed() {
-        crate::hooks::cursor::remove_cursor_hooks();
-        return Ok(());
-    }
-
     Err(format!(
         "marketplace added. Finish inside Cursor: run /plugins and install \"{PLUGIN_NAME}\".\n\
-         Then re-run: hcom hooks add cursor  (that pass removes the legacy hooks)"
+         Your existing hooks in ~/.cursor/hooks.json are left in place and keep working;\n\
+         remove them with `hcom hooks remove cursor` once the plugin is enabled."
     ))
 }
 
-pub(crate) fn install_agy_plugin(db_path: &std::path::Path) -> Result<(), String> {
-    let source = format!("{}/plugin/hcom-agy", marketplace_source(db_path));
+pub(crate) fn install_agy_plugin() -> Result<(), String> {
+    let source = format!("{}/plugin/hcom-agy", marketplace_source());
     install_then_strip(
         || run_tool_cli("agy", &["plugin", "install", &source]),
         verify_agy_plugin_installed,
@@ -1058,7 +1059,7 @@ pub(crate) fn install_agy_plugin(db_path: &std::path::Path) -> Result<(), String
 
 `agy plugin install` takes a **directory**, not a git URL. With `dev_root` set it points at the working tree's `plugin/hcom-agy`. With `dev_root` unset there is no local checkout to point at, so `install_agy_plugin` must detect that case and return an actionable error — `clone the repo and run: agy plugin install <repo>/plugin/hcom-agy` — rather than passing a URL that `agy` will reject.
 
-Also add the matching Cursor case to `Tool::try_setup_hooks` in Task 7: `install_cursor_plugin()` takes no `db_path`, unlike the other two.
+All three installers take no arguments.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1132,12 +1133,12 @@ In `src/tool.rs`, replace the three arms in `verify_hooks_installed`:
 and the three arms in `try_setup_hooks`:
 
 ```rust
-            Tool::Claude => crate::hooks::plugin::install_claude_plugin(&db_path()),
+            Tool::Claude => crate::hooks::plugin::install_claude_plugin(),
             Tool::Cursor => crate::hooks::plugin::install_cursor_plugin(),
-            Tool::Antigravity => crate::hooks::plugin::install_agy_plugin(&db_path()),
+            Tool::Antigravity => crate::hooks::plugin::install_agy_plugin(),
 ```
 
-`try_setup_hooks` already returns `Result<(), String>`, so no signature change there. It does not currently have a database path in scope: resolve one the way the rest of `src/tool.rs` does, or — if no such helper exists in this file — add a `db_path: &Path` parameter to `try_setup_hooks` and pass it from the single call site in `src/commands/hooks.rs:129`. Prefer the parameter; it keeps path resolution in one place.
+`try_setup_hooks` already returns `Result<(), String>`, and no signature change is needed: `crate::paths::db_path()` is a free function, so `marketplace_source` resolves dev_root on its own. (An earlier draft of this plan proposed threading a `db_path` parameter through `try_setup_hooks` — unnecessary, and it would have rippled to every caller.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1288,6 +1289,13 @@ EOF
 ---
 
 ### Task 9: Status reports the two conditions that now need a human
+
+**Facts confirmed against the code before writing this task:**
+
+- `cmd_hooks_status` (`src/commands/hooks.rs:83`) prints from `get_tool_status()` (`:69`), which returns `(tool, tool.verify_hooks_installed(false), tool.hooks_settings_path())`. After Task 7 the boolean is the *plugin* verifier's answer for Claude/Cursor/Antigravity — so the "installed" half needs no new plumbing.
+- The legacy verifiers are all still public and are how to detect the second half: `crate::hooks::claude::verify_claude_hooks_installed(None, false)`, `crate::hooks::cursor::verify_cursor_hooks_installed(false)`, `crate::hooks::antigravity::verify_antigravity_hooks_installed(false)`.
+- **`hooks_settings_path()` becomes misleading for these three** (`src/tool.rs:182-188`): it returns `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.gemini/config/hooks.json`, none of which hold hcom's hooks once the plugin is in use. Status must not print that path as the location of an installed plugin. Print the plugin directory instead, or omit the path for these tools.
+
 
 **Files:**
 - Modify: `src/commands/hooks.rs`

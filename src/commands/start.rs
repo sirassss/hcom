@@ -710,6 +710,22 @@ fn start_bare(
     if !has_valid_identity && ctx.detect_vanilla_tool().is_some() {
         let vanilla_tool = ctx.tool;
         if !vanilla_tool.hooks().is_empty() && !vanilla_tool.verify_hooks_installed(false) {
+            // Tools whose hooks ship as a plugin are never installed as a side
+            // effect: doing so would shell out to that tool's CLI, which clones
+            // a marketplace over the network, and `hcom start` is a request to
+            // join the bus, not a request to change the machine. Report and let
+            // the user decide — the same contract `ensure_hooks_installed` in
+            // src/launcher.rs follows.
+            if vanilla_tool.hooks_ship_as_plugin() {
+                eprintln!(
+                    "hcom hooks are not installed for {}.\n\
+                     Messages will not be delivered automatically.\n  \
+                     Install:  hcom hooks add {}",
+                    vanilla_tool.as_str(),
+                    vanilla_tool.as_str()
+                );
+                return Ok(1);
+            }
             println!("Installing {} hooks...", vanilla_tool.as_str());
             let include_perms = crate::config::load_config_snapshot().core.auto_approve;
             match vanilla_tool.try_setup_hooks(include_perms) {
@@ -998,6 +1014,32 @@ mod tests {
         );
     }
 
+    /// `hcom start` asks to join the bus, not to change the machine. For tools
+    /// whose hooks ship as a plugin, installing means shelling out to that
+    /// tool's CLI and cloning a marketplace over the network — so this path
+    /// must report and stop, never install. Without the guard this test hung
+    /// for two minutes on a real clone attempt.
+    #[test]
+    #[serial]
+    fn test_vanilla_start_never_installs_a_plugin_tool() {
+        let (_dir, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+
+        let before = std::fs::read_to_string(home.join(".claude/settings.json")).ok();
+        assert_eq!(
+            start_bare(&db, &hcom_dir, &ctx, None).unwrap(),
+            1,
+            "a missing plugin must stop bare start, not proceed"
+        );
+        let after = std::fs::read_to_string(home.join(".claude/settings.json")).ok();
+        assert_eq!(before, after, "bare start must not write hook config");
+        assert!(
+            !home.join(".claude/plugins").exists(),
+            "bare start must not install a plugin"
+        );
+    }
+
     #[test]
     #[serial]
     fn test_vanilla_claude_start_immediately_binds_exported_session() {
@@ -1015,7 +1057,7 @@ mod tests {
 
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        assert!(crate::hooks::claude::setup_claude_hooks(false));
+        crate::hooks::test_helpers::install_fake_claude_plugin(&_home);
 
         let _restore = RestoreEnv(std::env::var_os("HCOM_CLAUDE_UNIX_SESSION_ID"));
         unsafe {
@@ -1097,7 +1139,7 @@ mod tests {
     fn test_vanilla_claude_start_reuses_claude_code_session_id() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        assert!(crate::hooks::claude::setup_claude_hooks(false));
+        crate::hooks::test_helpers::install_fake_claude_plugin(&_home);
 
         // No CLAUDE_ENV_FILE round trip, so HCOM_CLAUDE_UNIX_SESSION_ID never
         // arrives — the case that used to mint a second identity per start.
@@ -1142,7 +1184,7 @@ mod tests {
     fn test_vanilla_claude_rebind_binds_session_and_drops_old_identity() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        assert!(crate::hooks::claude::setup_claude_hooks(false));
+        crate::hooks::test_helpers::install_fake_claude_plugin(&_home);
 
         let ctx = make_claude_ctx(
             Some(("CLAUDE_CODE_SESSION_ID", "sess-rebind")),
@@ -1182,7 +1224,7 @@ mod tests {
     fn test_unidentifiable_claude_start_lists_unbound_candidates() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        assert!(crate::hooks::claude::setup_claude_hooks(false));
+        crate::hooks::test_helpers::install_fake_claude_plugin(&_home);
 
         let cwd = std::env::current_dir().unwrap();
         let ctx = make_claude_ctx(None, cwd.to_str().unwrap());

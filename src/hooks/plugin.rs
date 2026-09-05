@@ -31,6 +31,13 @@
 //!    cannot drive a Cursor install; `cursor-agent --plugin-dir <path>` is the
 //!    local-development route instead.
 //!
+//! Claude's install commands are idempotent: re-running `plugin marketplace add`
+//! on a known marketplace prints "already on disk" and `plugin install` on an
+//! installed plugin prints "is already installed", both exiting 0 (measured
+//! 2026-09-03). That matters because re-running `hcom hooks add claude` is the
+//! documented recovery after a failed install — a nonzero exit there would
+//! abort at the `?` before verification ever ran.
+//!
 //! Cursor does resolve a plugin declared in a repo subdirectory
 //! (`marketplace.json` → `"source": "./plugin/hcom"`), so the plugin body can
 //! stay where it is.
@@ -93,9 +100,472 @@ pub(crate) fn cursor_marketplaces_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// True when the tool has the plugin on disk *and* records it as enabled.
+///
+/// Reads files only — this runs before every agent spawn, so a subprocess here
+/// would cost a process launch per agent.
+pub(crate) fn verify_claude_plugin_installed() -> bool {
+    let settings_path = crate::hooks::claude::get_claude_settings_path();
+    let Some(settings) = crate::hooks::claude::load_claude_settings(&settings_path) else {
+        return false;
+    };
+    let enabled = settings
+        .get("enabledPlugins")
+        .and_then(|p| p.get(CLAUDE_PLUGIN_ID))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    claude_plugin_dir().is_dir()
+}
+
+/// True once Antigravity's copy of the plugin carries the hook file it reads.
+/// The directory alone can exist mid-import or from a stale copy; only the
+/// hook file proves hooks are live.
+pub(crate) fn verify_agy_plugin_installed() -> bool {
+    agy_plugin_dir().join(AGY_HOOKS_RELATIVE).is_file()
+}
+
+/// Cursor checks a marketplace out under
+/// `plugins/marketplaces/<host>/<owner>/<repo>/<commit sha>/`, so the plugin
+/// body sits at `<sha>/plugin/hcom/`. Any checkout carrying our Cursor hook
+/// file counts.
+///
+/// This proves the marketplace checkout is present on disk — it does NOT
+/// prove the user finished enabling the plugin in Cursor's `/plugins` TUI.
+/// Cursor's enabled marker could not be measured (see the module doc): there
+/// is no non-interactive install to probe. Callers relying on this as an
+/// "installed" signal are relying on the weaker of the two guarantees.
+pub(crate) fn verify_cursor_plugin_installed() -> bool {
+    let Ok(hosts) = std::fs::read_dir(cursor_marketplaces_dir()) else {
+        return false;
+    };
+    hosts
+        .flatten()
+        .flat_map(|host| {
+            std::fs::read_dir(host.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .flat_map(|owner| {
+            std::fs::read_dir(owner.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .flat_map(|repo| {
+            std::fs::read_dir(repo.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .any(|sha| {
+            sha.path()
+                .join("plugin")
+                .join(PLUGIN_NAME)
+                .join("hooks")
+                .join("hooks-cursor.json")
+                .is_file()
+        })
+}
+
+/// Install → verify → strip, in that order.
+///
+/// `strip` runs only when `verify` returns true. A CLI that exits 0 without
+/// actually installing must not cost the user their working legacy hooks, so
+/// verification — not the exit code — is the gate.
+pub(crate) fn install_then_strip<I, V, S>(install: I, verify: V, strip: S) -> Result<(), String>
+where
+    I: FnOnce() -> Result<(), String>,
+    V: FnOnce() -> bool,
+    S: FnOnce() -> bool,
+{
+    install()?;
+    if !verify() {
+        return Err("plugin install reported success but verification failed".to_string());
+    }
+    // A strip that fails leaves the legacy hooks next to the freshly installed
+    // plugin — the double-fire state the design exists to avoid. It is not
+    // dangerous (nothing is left without hooks), but reporting success here
+    // would hide it, so surface it and let status tell the user what to do.
+    if !strip() {
+        return Err(
+            "plugin installed, but the legacy hook entries could not be removed. \
+             Both will fire until they are; see `hcom hooks status`."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Run a tool CLI, returning its stderr on failure.
+fn run_tool_cli(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            format!("{program} not runnable: {e}. Install it or run the command by hand.")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{program} {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Published repository, used verbatim by Cursor (which rejects local paths).
+pub(crate) const HCOM_REPOSITORY_URL: &str = "https://github.com/aannoo/hcom";
+
+/// Marketplace source: the local checkout when dev_root is set, else the
+/// repository URL. Used by Claude, which accepts either a local path or a
+/// URL for its marketplace. Antigravity also accepts a local path but does
+/// not call this — `install_agy_plugin` resolves `dev_root` itself, because
+/// it must hard-fail (not fall back to a URL) when there is no checkout to
+/// point at. Cursor accepts neither; see `install_cursor_plugin`.
+fn marketplace_source() -> String {
+    // `paths::db_path()` is a free function, so nothing has to be threaded
+    // through to reach dev_root here.
+    let db_path = crate::paths::db_path();
+    if let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) {
+        return root.to_string_lossy().to_string();
+    }
+    HCOM_REPOSITORY_URL.to_string()
+}
+
+pub(crate) fn install_claude_plugin() -> Result<(), String> {
+    let source = marketplace_source();
+    install_then_strip(
+        || {
+            run_tool_cli("claude", &["plugin", "marketplace", "add", &source])?;
+            run_tool_cli("claude", &["plugin", "install", CLAUDE_PLUGIN_ID])
+        },
+        verify_claude_plugin_installed,
+        crate::hooks::claude::remove_claude_hooks,
+    )
+}
+
+/// Cursor: add the marketplace, then hand the user the one step hcom cannot do.
+///
+/// `cursor-agent plugin` exposes only `marketplace` — installation happens in
+/// the interactive `/plugins` picker (measured, module doc). Cursor also
+/// rejects local paths for a marketplace, so `dev_root` cannot drive this and
+/// the remote URL is always used.
+///
+/// **This never strips the legacy hooks, on any pass.** It is tempting to gate
+/// a strip on [`verify_cursor_plugin_installed`], but that verifier only proves
+/// a marketplace checkout exists on disk — and `marketplace add`, the command
+/// immediately above, is what creates that checkout. Gating on it would delete
+/// `~/.cursor/hooks.json` (and hcom's Cursor permissions, which
+/// `remove_cursor_hooks` also clears) the instant the marketplace was added,
+/// while the plugin sits un-enabled in the TUI. Cursor would then be running
+/// neither plugin hooks nor legacy hooks, silently.
+///
+/// Cursor's enabled marker is not readable from disk — Task 1 measured it as
+/// unavailable, since there is no non-interactive install to observe — so no
+/// honest signal exists to gate on. Leaving the legacy hooks in place is the
+/// safe half of the trade: both sets call the same `cursor-*` subcommands, so
+/// the worst case is one redundant hook invocation, never a wrong handler.
+pub(crate) fn install_cursor_plugin() -> Result<(), String> {
+    run_tool_cli(
+        "cursor-agent",
+        &["plugin", "marketplace", "add", HCOM_REPOSITORY_URL],
+    )?;
+
+    Err(format!(
+        "marketplace added. Finish inside Cursor: run /plugins and install \"{PLUGIN_NAME}\".\n\
+         Your existing hooks in ~/.cursor/hooks.json are left in place and keep working;\n\
+         remove them with `hcom hooks remove cursor` once the plugin is enabled."
+    ))
+}
+
+/// `agy plugin install` takes a directory, not a URL — and with no local
+/// checkout (`dev_root` unset) there is nothing to point it at. Rather than
+/// pass `agy` a remote URL it will reject, hand the user the exact command
+/// to run once they have a checkout.
+pub(crate) fn install_agy_plugin() -> Result<(), String> {
+    let db_path = crate::paths::db_path();
+    let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) else {
+        return Err(
+            "agy plugin install needs a local checkout of hcom (agy rejects a URL here). \
+             Clone the repo, then run by hand: agy plugin install <repo>/plugin/hcom-agy"
+                .to_string(),
+        );
+    };
+    let source = root.join("plugin").join("hcom-agy");
+    let source = source.to_string_lossy().to_string();
+    install_then_strip(
+        || run_tool_cli("agy", &["plugin", "install", &source]),
+        verify_agy_plugin_installed,
+        crate::hooks::antigravity::remove_antigravity_hooks,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::hooks::test_helpers::EnvGuard;
     use serde_json::Value;
+    use serial_test::serial;
+    use std::path::PathBuf;
+
+    /// Isolated env for verify tests: a single `home` dir so `HCOM_DIR`'s
+    /// parent (what `claude_config_dir`/`tool_config_root` resolve against)
+    /// is the same directory tests write fixtures into. Clears
+    /// `GEMINI_CLI_HOME` deliberately — `agy_plugin_dir()` reads it, and a
+    /// developer's real env must not leak into the AGY test.
+    fn plugin_test_env() -> (tempfile::TempDir, PathBuf, EnvGuard) {
+        let guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::remove_var("CURSOR_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("GEMINI_CLI_HOME");
+        }
+        // Config's test guard redirects any unregistered HCOM_DIR to a
+        // throwaway location (see config.rs from_env) — claude_config_dir
+        // resolves through cached Config, so without this the settings file
+        // this test writes and the one the verifier reads would disagree.
+        crate::paths::test_roots::register(&home);
+        crate::config::Config::reset();
+        crate::config::Config::init();
+        (dir, home, guard)
+    }
+
+    #[test]
+    fn install_does_not_strip_legacy_when_the_cli_fails() {
+        let stripped = std::cell::Cell::new(false);
+        let outcome = super::install_then_strip(
+            || Err("marketplace add failed: network unreachable".to_string()),
+            || false, // verify says not installed
+            || {
+                stripped.set(true);
+                true
+            },
+        );
+        assert!(outcome.is_err(), "failed install must report an error");
+        assert!(
+            !stripped.get(),
+            "legacy hooks must survive a failed install"
+        );
+    }
+
+    #[test]
+    fn install_does_not_strip_legacy_when_verify_fails() {
+        let stripped = std::cell::Cell::new(false);
+        let outcome = super::install_then_strip(
+            || Ok(()), // CLI claims success
+            || false,  // but verify disagrees
+            || {
+                stripped.set(true);
+                true
+            },
+        );
+        assert!(outcome.is_err());
+        assert!(!stripped.get(), "verify is the gate, not the CLI exit code");
+    }
+
+    /// A strip that fails must not read as success: the user would be told the
+    /// migration completed while both hook sets stay live and double-fire.
+    #[test]
+    fn install_reports_a_failed_strip() {
+        let outcome = super::install_then_strip(|| Ok(()), || true, || false);
+        assert!(outcome.is_err(), "a failed strip must surface");
+        assert!(
+            outcome.unwrap_err().contains("legacy hook"),
+            "the error must name what went wrong"
+        );
+    }
+
+    /// Regression guard for a defect caught in review: gating Cursor's strip on
+    /// `verify_cursor_plugin_installed` deleted the user's hooks the moment the
+    /// marketplace was added, because that verifier only proves a checkout
+    /// exists and `marketplace add` is what creates it. Cursor's enabled marker
+    /// is not readable from disk, so no gate is honest — the source must simply
+    /// never strip.
+    #[test]
+    fn cursor_installer_never_strips_legacy_hooks() {
+        let src = include_str!("plugin.rs");
+        let body = src
+            .split_once("pub(crate) fn install_cursor_plugin")
+            .expect("install_cursor_plugin must exist")
+            .1
+            .split_once("\n}")
+            .expect("function must be brace-terminated")
+            .0;
+        assert!(
+            !body.contains("remove_cursor_hooks"),
+            "install_cursor_plugin must not strip legacy hooks; found:\n{body}"
+        );
+    }
+
+    #[test]
+    fn install_strips_legacy_only_after_verify_passes() {
+        let stripped = std::cell::Cell::new(false);
+        let outcome = super::install_then_strip(
+            || Ok(()),
+            || true,
+            || {
+                stripped.set(true);
+                true
+            },
+        );
+        assert!(outcome.is_ok());
+        assert!(stripped.get());
+    }
+
+    /// The strip runs on this user's real machine, where settings.json also holds
+    /// agentpet, rtk, and herdr entries. Losing those would be a worse bug than
+    /// the one we are fixing.
+    #[test]
+    #[serial]
+    fn strip_preserves_hooks_owned_by_other_tools() {
+        let (_dir, home, _guard) = plugin_test_env();
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{
+              "hooks": {
+                "SessionStart": [
+                  {"hooks":[{"type":"command","command":"bash '/home/u/.claude/hooks/herdr-agent-state.sh' session"}]},
+                  {"hooks":[{"type":"command","command":"/home/u/.local/bin/agentpet-hook claude"}]},
+                  {"hooks":[{"type":"command","command":"cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd sessionstart || exit 0"}]}
+                ],
+                "PreToolUse": [
+                  {"hooks":[{"type":"command","command":"rtk hook claude"}]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        crate::hooks::claude::remove_claude_hooks();
+
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            after.contains("herdr-agent-state.sh"),
+            "herdr hook lost:\n{after}"
+        );
+        assert!(
+            after.contains("agentpet-hook"),
+            "agentpet hook lost:\n{after}"
+        );
+        assert!(after.contains("rtk hook claude"), "rtk hook lost:\n{after}");
+        assert!(
+            !after.contains("exec $cmd sessionstart"),
+            "hcom hook survived:\n{after}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn strip_leaves_malformed_json_untouched() {
+        let (_dir, home, _guard) = plugin_test_env();
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let broken = "{ this is not json";
+        std::fs::write(&settings, broken).unwrap();
+
+        crate::hooks::claude::remove_claude_hooks();
+
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            broken,
+            "a file we cannot parse must not be rewritten"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_verify_needs_both_directory_and_enabled_flag() {
+        let (_dir, home, _guard) = plugin_test_env();
+
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+
+        // Neither half present.
+        std::fs::write(&settings, r#"{}"#).unwrap();
+        assert!(!super::verify_claude_plugin_installed());
+
+        // Enabled flag only, no plugin directory.
+        std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":true}}"#).unwrap();
+        assert!(!super::verify_claude_plugin_installed());
+
+        // Directory only, no enabled flag.
+        std::fs::write(&settings, r#"{}"#).unwrap();
+        std::fs::create_dir_all(super::claude_plugin_dir().join("1.0.0")).unwrap();
+        assert!(!super::verify_claude_plugin_installed());
+
+        // Both halves present.
+        std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":true}}"#).unwrap();
+        assert!(super::verify_claude_plugin_installed());
+
+        // Explicitly disabled by the user.
+        std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":false}}"#).unwrap();
+        assert!(!super::verify_claude_plugin_installed());
+    }
+
+    #[test]
+    #[serial]
+    fn agy_verify_needs_the_hook_file_not_just_the_directory() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        let plugin_dir = super::agy_plugin_dir();
+
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        assert!(
+            !super::verify_agy_plugin_installed(),
+            "empty dir is not installed"
+        );
+
+        std::fs::create_dir_all(plugin_dir.join(super::AGY_HOOKS_RELATIVE).parent().unwrap())
+            .unwrap();
+        std::fs::write(
+            plugin_dir.join(super::AGY_HOOKS_RELATIVE),
+            r#"{"hooks":{}}"#,
+        )
+        .unwrap();
+        assert!(super::verify_agy_plugin_installed());
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_verify_walks_to_the_hook_file() {
+        let (_dir, _home, _guard) = plugin_test_env();
+
+        // No marketplaces directory at all.
+        assert!(!super::verify_cursor_plugin_installed());
+
+        let marketplaces = super::cursor_marketplaces_dir();
+        let checkout = marketplaces
+            .join("github.com")
+            .join("hcom-owner")
+            .join("hcom-repo")
+            .join("deadbeef");
+
+        // A nested-but-wrong file: present somewhere under the checkout, but
+        // not at the exact path the verifier requires. Proves the walk
+        // checks the specific file, not "any file exists under a checkout".
+        let wrong = checkout
+            .join("plugin")
+            .join(super::PLUGIN_NAME)
+            .join("hooks");
+        std::fs::create_dir_all(&wrong).unwrap();
+        std::fs::write(wrong.join("not-the-hook-file.json"), "{}").unwrap();
+        assert!(!super::verify_cursor_plugin_installed());
+
+        // The real hook file lands the checkout counts.
+        std::fs::write(wrong.join("hooks-cursor.json"), "{}").unwrap();
+        assert!(super::verify_cursor_plugin_installed());
+    }
 
     const CLAUDE_MANIFEST: &str = include_str!("../../plugin/hcom/hooks/hooks.json");
 

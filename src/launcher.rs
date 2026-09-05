@@ -516,6 +516,23 @@ fn generate_process_id() -> String {
     format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a, b, c, d, e)
 }
 
+/// Message shown when a tool's hooks are not installed.
+///
+/// Launching must never fix this: installing hooks edits files on the user's
+/// machine, and that should happen because they asked, not as a side effect of
+/// starting an agent.
+fn hooks_missing_warning(tool: &LaunchTool) -> String {
+    let name = match tool {
+        LaunchTool::ClaudePty => "claude",
+        other => other.as_str(),
+    };
+    format!(
+        "hcom hooks are not installed for {name}.\n\
+         Messages will not be delivered automatically this session.\n  \
+         Install:  hcom hooks add {name}"
+    )
+}
+
 fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -582,22 +599,8 @@ fn ensure_hooks_installed(
 ) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => {
-            if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::claude::try_setup_claude_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "settings_path",
-                        crate::hooks::claude::get_claude_settings_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Claude hooks: {e}\n\
-                     Run: hcom hooks add claude\n\
-                     {diag}"
-                );
+            if !crate::hooks::plugin::verify_claude_plugin_installed() {
+                eprintln!("{}", hooks_missing_warning(tool));
             }
             Ok(())
         }
@@ -727,41 +730,14 @@ fn ensure_hooks_installed(
             bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
         }
         LaunchTool::Antigravity => {
-            if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) =
-                crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
-            {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "hooks_path",
-                        crate::hooks::antigravity::get_antigravity_hooks_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Antigravity hooks: {e}\n\
-                     Run: hcom hooks add antigravity\n\
-                     {diag}"
-                );
+            if !crate::hooks::plugin::verify_agy_plugin_installed() {
+                eprintln!("{}", hooks_missing_warning(tool));
             }
             Ok(())
         }
         LaunchTool::Cursor => {
-            if crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::cursor::try_setup_cursor_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[("hooks_path", crate::hooks::cursor::get_cursor_hooks_path())],
-                );
-                bail!(
-                    "Failed to setup Cursor hooks: {e}\n\
-                     Run: hcom hooks add cursor\n\
-                     {diag}"
-                );
+            if !crate::hooks::plugin::verify_cursor_plugin_installed() {
+                eprintln!("{}", hooks_missing_warning(tool));
             }
             Ok(())
         }
@@ -3822,5 +3798,109 @@ mod tests {
         assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
+    }
+
+    /// Same isolation `hooks::plugin::tests::plugin_test_env` uses: a fresh
+    /// HOME so `Config` (cached, and what the plugin verifiers resolve paths
+    /// through) agrees with the fixtures a test writes.
+    fn hooks_missing_test_env() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::hooks::test_helpers::EnvGuard,
+    ) {
+        let guard = crate::hooks::test_helpers::EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::remove_var("CURSOR_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("GEMINI_CLI_HOME");
+        }
+        crate::paths::test_roots::register(&home);
+        crate::config::Config::reset();
+        crate::config::Config::init();
+        (dir, home, guard)
+    }
+
+    /// Every file under `root`, by path, with its bytes — used to prove a call
+    /// touched nothing on disk rather than just the one file a test happened
+    /// to hardcode.
+    fn snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let bytes = std::fs::read(&p).unwrap_or_default();
+                    out.insert(p, bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// The regression guard this task exists for: launching must never install
+    /// hooks, write config, or block on a missing plugin — for every tool
+    /// `ensure_hooks_installed` now only warns about, not just Claude.
+    #[test]
+    #[serial]
+    fn launching_never_installs_hooks() {
+        let (_dir, home, _guard) = hooks_missing_test_env();
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "{}\n").unwrap();
+
+        // Snapshot after Config::init (in hooks_missing_test_env) has already
+        // done its own writes, so those don't read as noise below.
+        let before = snapshot(&home);
+
+        for tool in [
+            LaunchTool::Claude,
+            LaunchTool::ClaudePty,
+            LaunchTool::Cursor,
+            LaunchTool::Antigravity,
+        ] {
+            let result = super::ensure_hooks_installed(&tool, false, None);
+            assert!(
+                result.is_ok(),
+                "{tool:?}: a missing plugin must not block a launch"
+            );
+        }
+
+        let after = snapshot(&home);
+        assert_eq!(
+            before, after,
+            "launching must not write, create, or delete any file under HOME"
+        );
+        assert!(
+            !home.join(".claude/plugins").exists(),
+            "launching must not install a plugin"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn launching_reports_the_install_command_when_hooks_are_missing() {
+        let (_dir, _home, _guard) = hooks_missing_test_env();
+        for (tool, name) in [
+            (LaunchTool::Claude, "claude"),
+            (LaunchTool::ClaudePty, "claude"),
+            (LaunchTool::Cursor, "cursor"),
+            (LaunchTool::Antigravity, "antigravity"),
+        ] {
+            let warning = super::hooks_missing_warning(&tool);
+            assert!(
+                warning.contains(&format!("hcom hooks add {name}")),
+                "{tool:?}: {warning}"
+            );
+            assert!(warning.contains("not installed"), "{warning}");
+        }
     }
 }

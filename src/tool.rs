@@ -79,11 +79,19 @@ impl Tool {
 
     /// Verify hooks are installed for this tool. `include_permissions` controls
     /// whether the auto-approve permission block is also checked.
+    /// True when this tool's hooks ship inside the hcom plugin rather than
+    /// being written into a config file the tool shares with other harnesses.
+    ///
+    /// Installing these means shelling out to that tool's own CLI, which clones
+    /// a marketplace over the network — so callers that are not an explicit
+    /// `hcom hooks add` must report instead of installing.
+    pub fn hooks_ship_as_plugin(&self) -> bool {
+        matches!(self, Tool::Claude | Tool::Cursor | Tool::Antigravity)
+    }
+
     pub fn verify_hooks_installed(&self, include_permissions: bool) -> bool {
         match self {
-            Tool::Claude => {
-                crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions)
-            }
+            Tool::Claude => crate::hooks::plugin::verify_claude_plugin_installed(),
             Tool::Gemini => {
                 crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions)
             }
@@ -93,12 +101,8 @@ impl Tool {
             }
             Tool::OpenCode => crate::hooks::opencode::verify_opencode_plugin_installed(),
             Tool::Kilo => crate::hooks::opencode::verify_kilo_plugin_installed(),
-            Tool::Antigravity => {
-                crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
-            }
-            Tool::Cursor => {
-                crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
-            }
+            Tool::Antigravity => crate::hooks::plugin::verify_agy_plugin_installed(),
+            Tool::Cursor => crate::hooks::plugin::verify_cursor_plugin_installed(),
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
             Tool::Copilot => {
                 crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
@@ -113,8 +117,7 @@ impl Tool {
     /// `Tool::Adhoc` always errors — adhoc has no hook surface.
     pub fn try_setup_hooks(&self, include_permissions: bool) -> Result<(), String> {
         match self {
-            Tool::Claude => crate::hooks::claude::try_setup_claude_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
+            Tool::Claude => crate::hooks::plugin::install_claude_plugin(),
             Tool::Gemini => crate::hooks::gemini::try_setup_gemini_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
             Tool::Codex => crate::hooks::codex::try_setup_codex_hooks(include_permissions)
@@ -129,12 +132,8 @@ impl Tool {
                 Ok(false) => Err(String::new()),
                 Err(e) => Err(e.to_string()),
             },
-            Tool::Antigravity => {
-                crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
-                    .map_err(|e| e.to_string())
-            }
-            Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
+            Tool::Antigravity => crate::hooks::plugin::install_agy_plugin(),
+            Tool::Cursor => crate::hooks::plugin::install_cursor_plugin(),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
             Tool::Copilot => crate::hooks::copilot::try_setup_copilot_hooks(include_permissions)
@@ -316,5 +315,52 @@ mod tests {
         assert_eq!(Tool::Kilo.hooks(), Tool::OpenCode.hooks());
         assert!(!Tool::Kilo.owns_hook("opencode-start"));
         assert_eq!(Tool::from_hook_name("opencode-start"), Some(Tool::OpenCode));
+    }
+
+    /// Same isolation `plugin::tests::plugin_test_env` uses: a fresh HOME so
+    /// `Config` (cached, and what the plugin verifiers resolve paths through)
+    /// agrees with the fixtures this test writes.
+    fn plugin_tool_test_env() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::hooks::test_helpers::EnvGuard,
+    ) {
+        let guard = crate::hooks::test_helpers::EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::remove_var("CURSOR_CONFIG_DIR");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("GEMINI_CLI_HOME");
+        }
+        crate::paths::test_roots::register(&home);
+        crate::config::Config::reset();
+        crate::config::Config::init();
+        (dir, home, guard)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_tools_verify_through_the_plugin_path() {
+        let (_dir, home, _guard) = plugin_tool_test_env();
+
+        // Nothing installed anywhere.
+        assert!(!Tool::Claude.verify_hooks_installed(false));
+        assert!(!Tool::Cursor.verify_hooks_installed(false));
+        assert!(!Tool::Antigravity.verify_hooks_installed(false));
+
+        // A legacy settings.json full of hcom hooks must NOT count as installed
+        // any more — that file is exactly what we are migrating away from.
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        crate::hooks::claude::try_setup_claude_hooks(false).unwrap();
+        assert!(
+            !Tool::Claude.verify_hooks_installed(false),
+            "legacy hooks must not satisfy the plugin verifier"
+        );
     }
 }
