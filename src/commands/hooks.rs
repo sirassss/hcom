@@ -121,10 +121,34 @@ pub(crate) fn plugin_status_line(tool: &str, plugin: bool, legacy: bool) -> Stri
         // checkout exists, not that the user enabled the plugin in the TUI, so
         // hcom must never strip Cursor's legacy hooks on its own — the user
         // says when, once they know the plugin is live.
+        // Cursor's verifier proves a marketplace checkout exists — which
+        // `marketplace add` itself creates. Nothing hcom can read says whether
+        // the plugin is enabled, so none of Cursor's four states may be stated
+        // as an observation of what is firing.
+        // Order matters: this bare (true, true) is the cursor branch — the guarded arm above must stay first.
         (true, true) => format!(
-            "{tool}: plugin and legacy hooks both present — both are firing (double-fire risk). \
-             Once /plugins shows hcom enabled, run: hcom hooks remove {tool} --legacy-only \
+            "{tool}: legacy hooks are firing, and the plugin may be too once /plugins shows \
+             hcom enabled — a double-fire risk hcom cannot confirm. Once it is enabled, run: \
+             hcom hooks remove {tool} --legacy-only \
              (plain `hooks remove` would uninstall the plugin too, leaving no hooks)"
+        ),
+        (true, false) if tool == "cursor" => format!(
+            "{tool}: marketplace indexed; finish in Cursor with /plugins → install \"hcom\". \
+             hcom cannot see whether the plugin is enabled — confirm with a spawned agent \
+             showing `bindings: hooks, pty` in hcom list, read after its first turn."
+        ),
+        // Not "no hooks": measured 2026-09-08, a Cursor agent ran hcom's hooks
+        // with no marketplace at all, because cursor-agent reads Claude's
+        // plugin cache. Saying "not installed" here contradicted a live agent.
+        (false, false) if tool == "cursor" => format!(
+            "{tool}: no marketplace checkout. Cursor may still be running hcom's hooks out of \
+             Claude's plugin cache — check a spawned agent's `bindings` after its first turn. \
+             For a Cursor-owned install: hcom hooks add {tool}, then /plugins → install \"hcom\"."
+        ),
+        (false, true) if tool == "cursor" => format!(
+            "{tool}: no marketplace checkout; the legacy hook entries are what is firing. \
+             Run: hcom hooks add {tool}, then /plugins → install \"hcom\", and only then \
+             hcom hooks remove {tool} --legacy-only"
         ),
         (false, _) => format!("{tool}: hooks not installed. Run: hcom hooks add {tool}"),
         (true, false) => String::new(),
@@ -151,23 +175,55 @@ fn cmd_hooks_status() -> i32 {
             // `hooks_settings_path()` returns the legacy file for these three
             // tools, which holds nothing once the plugin is in use — printing
             // it next to "installed" would point at an empty file.
-            if *installed {
-                println!("{}:  installed    (plugin)", tool.spec().label);
+            // Cursor's signal is weaker than the others' in both directions: a
+            // marketplace checkout is not a live plugin, and no checkout is not
+            // "no hooks". Neither headline may be stated flatly for it.
+            let state = match (tool == Tool::Cursor, *installed) {
+                (true, true) => "marketplace ready",
+                (true, false) => "no marketplace",
+                (false, true) => "installed   ",
+                (false, false) => "not installed",
+            };
+            if *installed || tool == Tool::Cursor {
+                println!("{}:  {state} (plugin)", tool.spec().label);
             } else {
-                println!("{}:  not installed", tool.spec().label);
+                println!("{}:  {state}", tool.spec().label);
             }
             let advice = plugin_status_line(tool.as_str(), *installed, legacy_hooks_present(tool));
             if !advice.is_empty() {
                 println!("  {advice}");
             }
-            if tool == Tool::Antigravity
-                && let Some(source) = crate::hooks::plugin::agy_imported_hcom_source()
-            {
-                println!(
-                    "  antigravity: hcom hooks came from `agy plugin import` ({source}), not a \
-                     local install — Antigravity is running {source}'s handlers. \
-                     Run: hcom hooks remove antigravity && hcom hooks add antigravity"
-                );
+            if tool == Tool::Antigravity && *installed {
+                use crate::hooks::plugin::AgyHooks;
+                match crate::hooks::plugin::agy_hook_state() {
+                    // Our own manifest. The import entry says `claude-code`
+                    // because our manifest dir is `.claude-plugin/`; that is a
+                    // format label, and warning on it printed advice that could
+                    // never clear itself.
+                    AgyHooks::Hcom => {}
+                    AgyHooks::Foreign(source) => println!(
+                        "  antigravity: the installed manifest carries SessionStart and none \
+                         of hcom's handlers, so Antigravity is not running hcom's hooks. \
+                         agy records the import as `{source}` — that names the manifest \
+                         format, so treat it as a hint, not as proof of what is running. \
+                         Run: hcom hooks remove antigravity && hcom hooks add antigravity"
+                    ),
+                    // Not attributed to anyone: a half-written or hand-edited
+                    // manifest is not evidence that another harness did it.
+                    AgyHooks::Malformed => println!(
+                        "  antigravity: the installed manifest carries none of hcom's working \
+                         hooks — hcom's events are missing, empty, or invoke something else, \
+                         so no message will be delivered. \
+                         Run: hcom hooks remove antigravity && hcom hooks add antigravity"
+                    ),
+                    AgyHooks::Unverifiable => println!(
+                        "  antigravity: {} could not be read or parsed — hook state unverifiable. \
+                         Run: hcom hooks remove antigravity && hcom hooks add antigravity",
+                        crate::hooks::plugin::agy_plugin_dir()
+                            .join(crate::hooks::plugin::AGY_HOOKS_RELATIVE)
+                            .display()
+                    ),
+                }
             }
         } else if *installed {
             println!("{}:  installed    ({path})", tool.spec().label);
@@ -476,6 +532,65 @@ mod tests {
             line.is_empty(),
             "healthy state needs no advice, got: {line}"
         );
+    }
+
+    #[test]
+    fn plugin_status_line_cursor_marketplace_only_is_not_an_install() {
+        let line = super::plugin_status_line("cursor", true, false);
+        assert!(
+            line.contains("/plugins"),
+            "a marketplace checkout is not an install; status must name the \
+             remaining step. got: {line:?}"
+        );
+        assert!(
+            !line.contains("installed"),
+            "a marketplace checkout must not be reported as an install. got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_status_line_cursor_no_checkout_admits_hooks_may_still_fire() {
+        // Measured 2026-09-08: probe3-dune bound `hooks, pty` and took delivery
+        // end to end with no Cursor marketplace at all — Cursor was reading
+        // Claude's plugin cache. Flat "not installed" contradicted that.
+        let line = super::plugin_status_line("cursor", false, false);
+        assert!(
+            line.contains("Claude"),
+            "status must not claim Cursor has no hcom hooks. got: {line:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_status_line_cursor_double_fire_is_a_risk_not_an_observation() {
+        let line = super::plugin_status_line("cursor", true, true);
+        assert!(
+            !line.contains("both are firing"),
+            "hcom cannot see whether the plugin is enabled, so it cannot say both \
+             are firing. got: {line:?}"
+        );
+        assert!(line.contains("--legacy-only"), "got: {line:?}");
+    }
+
+    #[test]
+    fn plugin_status_line_cursor_no_checkout_with_legacy_names_what_fires() {
+        let line = super::plugin_status_line("cursor", false, true);
+        assert!(
+            line.contains("legacy"),
+            "with legacy entries present, they are what is firing — status must \
+             say so instead of repeating the generic install advice. got: {line:?}"
+        );
+        assert!(line.contains("/plugins"), "got: {line:?}");
+    }
+
+    #[test]
+    fn plugin_status_line_other_tools_keep_their_wording() {
+        assert_eq!(super::plugin_status_line("claude", true, false), "");
+        assert_eq!(super::plugin_status_line("antigravity", true, false), "");
+        assert!(
+            super::plugin_status_line("claude", true, true).contains("both are firing"),
+            "only Cursor's plugin state is unobservable; Claude's is not"
+        );
+        assert!(super::plugin_status_line("antigravity", false, false).contains("hooks add"));
     }
 
     #[test]

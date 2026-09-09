@@ -693,7 +693,9 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     tui_prefix: "agy ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"? for shortcuts",
+    // Claude's pattern was copied here; agy never prints it. Its status bar
+    // renders "Ctx <pct>% (<used>/<total>)" in every frame once the TUI is up.
+    ready_pattern: b"Ctx ",
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },

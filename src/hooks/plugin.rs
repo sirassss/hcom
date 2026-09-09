@@ -50,7 +50,7 @@
 //! (`marketplace.json` → `"source": "./plugin/hcom"`), so the plugin body can
 //! stay where it is.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Plugin name as every tool addresses it.
 pub(crate) const PLUGIN_NAME: &str = "hcom";
@@ -101,8 +101,11 @@ pub(crate) fn agy_import_manifest() -> PathBuf {
 
 /// Source harness hcom's Antigravity plugin was imported from, if any.
 ///
-/// A genuine `agy plugin install` never touches this file — only
-/// `agy plugin import <harness>` does. Its entries look like
+/// Measured 2026-09-08: `agy plugin install <dir>` DOES write here, recording
+/// our plugin as `source: "claude-code"` because our manifest directory is
+/// named `.claude-plugin/`. So an entry alone proves nothing about origin —
+/// callers must check the installed manifest's shape; see [`agy_hook_state`],
+/// which is the only caller that should reach for this label. Entries look like
 /// `{"name": "hcom", "source": "claude-code", ...}`. Since Claude's
 /// `hooks/hooks.json` sits at the exact path Antigravity reads (module doc),
 /// an import lands Claude's handlers on Antigravity agents. Returns the
@@ -117,6 +120,150 @@ pub(crate) fn agy_imported_hcom_source() -> Option<String> {
         .find(|entry| entry.get("name").and_then(|n| n.as_str()) == Some(PLUGIN_NAME))
         .and_then(|entry| entry.get("source").and_then(|s| s.as_str()))
         .map(str::to_string)
+}
+
+/// Which harness's hooks Antigravity is actually running.
+///
+/// Only meaningful once `verify_agy_plugin_installed()` is true — it is the
+/// verifier that proves the file exists at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AgyHooks {
+    /// hcom's agy manifest: every event we install is present and carries entries.
+    Hcom,
+    /// Another harness's manifest: it carries that harness's events and none
+    /// of ours. Only this state names a source, and only because the shape is
+    /// the evidence — the import label alone is a manifest-format name.
+    Foreign(String),
+    /// Parsed, but neither ours nor recognisably another harness's: a partial
+    /// or hand-edited install. Reported as broken, not blamed on anybody.
+    Malformed,
+    /// The manifest is on disk but cannot be read or parsed, so nothing can be
+    /// claimed either way. Silence here would report a corrupt file as healthy.
+    Unverifiable,
+}
+
+/// The handlers hcom's agy manifest installs, per event, that wake actually
+/// depends on. `gemini-beforeagent` is the delivery hook and
+/// `gemini-afteragent` the ready signal; `gemini-sessionstart` binds the
+/// session they run in. A manifest missing any of them cannot wake an agent
+/// however agy-shaped the rest of it looks — which is why the check is for
+/// these subcommands and not for the events that contain them.
+const AGY_REQUIRED_HANDLERS: [(&str, &[&str]); 2] = [
+    (
+        "PreInvocation",
+        &["gemini-sessionstart", "gemini-beforeagent"],
+    ),
+    ("PostInvocation", &["gemini-afteragent"]),
+];
+
+/// The one event Claude declares that agy's manifest does not.
+///
+/// `PostToolUse` and `Stop` are in **both** manifests, so neither is evidence
+/// of anything: a partial agy install keeping only `PostToolUse` would be
+/// blamed on Claude. `SessionStart` is the discriminator, and it counts only
+/// when it carries a real command entry — a bare key proves nothing either.
+const CLAUDE_ONLY_EVENT: &str = "SessionStart";
+
+/// Every command string an event's entries carry.
+///
+/// agy takes flat entries; a matcher-style entry nests them under `hooks`.
+/// Entries without `type: "command"` are skipped — a malformed or non-command
+/// entry runs nothing, so counting it would be the same false pass as
+/// counting `[]`.
+fn event_commands(events: &serde_json::Value, name: &str) -> Vec<String> {
+    let Some(entries) = events.get(name).and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .flat_map(
+            |entry| match entry.get("hooks").and_then(serde_json::Value::as_array) {
+                Some(nested) => nested.iter().collect::<Vec<_>>(),
+                None => vec![entry],
+            },
+        )
+        .filter(|e| e.get("type").and_then(serde_json::Value::as_str) == Some("command"))
+        .filter_map(|e| {
+            e.get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// True when `haystack` carries `token` as a whole word.
+///
+/// A substring test is not enough: `gemini-beforeagent-disabled` contains
+/// `gemini-beforeagent` and invokes a different subcommand entirely. This is
+/// not a shell parser — it only checks that neither neighbouring character
+/// could be part of the same token, which is what separates a subcommand from
+/// a longer name built out of it. `-` and `_` count as token characters
+/// because the subcommands themselves contain them.
+fn contains_token(haystack: &str, token: &str) -> bool {
+    let is_token_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    haystack.match_indices(token).any(|(idx, _)| {
+        let before = haystack[..idx].chars().next_back();
+        let after = haystack[idx + token.len()..].chars().next();
+        before.is_none_or(|c| !is_token_char(c)) && after.is_none_or(|c| !is_token_char(c))
+    })
+}
+
+/// True when any of `handlers` appears as a whole token in `event`'s commands.
+fn event_runs_any(events: &serde_json::Value, event: &str, handlers: &[&str]) -> bool {
+    let commands = event_commands(events, event);
+    handlers
+        .iter()
+        .any(|handler| commands.iter().any(|cmd| contains_token(cmd, handler)))
+}
+
+/// True when every handler hcom installs for `event` is present in it.
+///
+/// Matched by subcommand token, not by full string: the commands are long
+/// `sh -c` one-liners whose text varies with `$HCOM` resolution, but the
+/// subcommand is the part that decides which handler runs, and it is stable.
+fn event_has_handlers(events: &serde_json::Value, event: &str, handlers: &[&str]) -> bool {
+    let commands = event_commands(events, event);
+    handlers
+        .iter()
+        .all(|handler| commands.iter().any(|cmd| contains_token(cmd, handler)))
+}
+
+/// Read the installed manifest and say whose hooks agy will run.
+///
+/// `agy_imported_hcom_source` alone is not the answer: `agy plugin install`
+/// records our own plugin as `source: "claude-code"`, because our manifest
+/// directory follows Claude's `.claude-plugin/` convention. The label names
+/// the manifest *format*, not the origin — so the hooks on disk are what gets
+/// compared, and the label is quoted only once the shape already proves the
+/// manifest is another harness's.
+pub(crate) fn agy_hook_state() -> AgyHooks {
+    let path = agy_plugin_dir().join(AGY_HOOKS_RELATIVE);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return AgyHooks::Unverifiable;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return AgyHooks::Unverifiable;
+    };
+    let events = manifest.get("hooks").unwrap_or(&manifest);
+    if AGY_REQUIRED_HANDLERS
+        .iter()
+        .all(|(event, handlers)| event_has_handlers(events, event, handlers))
+    {
+        return AgyHooks::Hcom;
+    }
+    // Claude's own event, carrying a real command, and not one of our handlers
+    // anywhere: the shape is the evidence, and only now is the import label
+    // worth quoting — and even then only as the format hint it is.
+    let claude_shaped = !event_commands(events, CLAUDE_ONLY_EVENT).is_empty();
+    let any_of_ours = AGY_REQUIRED_HANDLERS
+        .iter()
+        .any(|(event, handlers)| event_runs_any(events, event, handlers));
+    if claude_shaped && !any_of_ours {
+        return AgyHooks::Foreign(
+            agy_imported_hcom_source().unwrap_or_else(|| "unknown".to_string()),
+        );
+    }
+    AgyHooks::Malformed
 }
 
 /// Root under which Cursor checks out marketplace repositories:
@@ -246,23 +393,64 @@ fn run_tool_cli(program: &str, args: &[&str]) -> Result<(), String> {
     ))
 }
 
-/// Published repository, used verbatim by Cursor (which rejects local paths).
+/// Upstream's published repository: the fallback `marketplace_source` returns
+/// for both Claude and Cursor installs when no fork remote can be resolved.
 pub(crate) const HCOM_REPOSITORY_URL: &str = "https://github.com/aannoo/hcom";
 
-/// Marketplace source: the local checkout when dev_root is set, else the
-/// repository URL. Used by Claude, which accepts either a local path or a
-/// URL for its marketplace. Antigravity also accepts a local path but does
-/// not call this — `install_agy_plugin` resolves `dev_root` itself, because
-/// it must hard-fail (not fall back to a URL) when there is no checkout to
-/// point at. Cursor accepts neither; see `install_cursor_plugin`.
+/// Marketplace source: the git remote the checkout's current branch tracks.
+///
+/// A developer's work lives on a fork, and that fork is what Claude and Cursor
+/// must index — Claude has no branch flag, so the fork's default branch has to
+/// carry the work. Handing Claude the `dev_root` *path* instead (what this used
+/// to do) re-points the marketplace at a local directory and undoes that.
+/// Antigravity does not call this: `agy plugin install` takes a directory only.
 fn marketplace_source() -> String {
     // `paths::db_path()` is a free function, so nothing has to be threaded
     // through to reach dev_root here.
     let db_path = crate::paths::db_path();
-    if let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) {
-        return root.to_string_lossy().to_string();
+    let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) else {
+        return HCOM_REPOSITORY_URL.to_string();
+    };
+    checkout_remote_url(&root).unwrap_or_else(|| HCOM_REPOSITORY_URL.to_string())
+}
+
+/// URL of the remote the checkout's branch tracks, falling back to `origin`.
+fn checkout_remote_url(root: &Path) -> Option<String> {
+    let branch = git_output(root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let remote = git_output(
+        root,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )
+    .unwrap_or_else(|| "origin".to_string());
+    let url = git_output(root, &["remote", "get-url", &remote])?;
+    Some(normalize_git_url(&url))
+}
+
+/// Run git in `root`, returning trimmed stdout when it exits 0.
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    HCOM_REPOSITORY_URL.to_string()
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// `git@host:owner/repo.git` → `https://host/owner/repo`. Neither Claude nor
+/// Cursor accepts an SSH remote as a marketplace source.
+fn normalize_git_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches(".git");
+    if let Some(rest) = url.strip_prefix("git@")
+        && let Some((host, path)) = rest.split_once(':')
+    {
+        return format!("https://{host}/{path}");
+    }
+    url.to_string()
 }
 
 pub(crate) fn install_claude_plugin() -> Result<(), String> {
@@ -280,9 +468,10 @@ pub(crate) fn install_claude_plugin() -> Result<(), String> {
 /// Cursor: add the marketplace, then hand the user the one step hcom cannot do.
 ///
 /// `cursor-agent plugin` exposes only `marketplace` — installation happens in
-/// the interactive `/plugins` picker (measured, module doc). Cursor also
-/// rejects local paths for a marketplace, so `dev_root` cannot drive this and
-/// the remote URL is always used.
+/// the interactive `/plugins` picker (measured, module doc). Cursor rejects
+/// local paths, so `dev_root` cannot be passed directly; what it can index is
+/// the *remote* that checkout tracks, which is what `marketplace_source`
+/// resolves.
 ///
 /// **This never strips the legacy hooks, on any pass.** It is tempting to gate
 /// a strip on [`verify_cursor_plugin_installed`], but that verifier only proves
@@ -299,9 +488,14 @@ pub(crate) fn install_claude_plugin() -> Result<(), String> {
 /// safe half of the trade: both sets call the same `cursor-*` subcommands, so
 /// the worst case is one redundant hook invocation, never a wrong handler.
 pub(crate) fn install_cursor_plugin() -> Result<(), String> {
+    // Same source as Claude: the fork this checkout tracks, so a developer's
+    // Cursor indexes the branch that actually carries hooks-cursor.json.
+    // Cursor takes a git URL only — a path or file:// URL is mangled into an
+    // unresolvable https host (measured 2026-09-09).
+    let source = marketplace_source();
     run_tool_cli(
         "cursor-agent",
-        &["plugin", "marketplace", "add", HCOM_REPOSITORY_URL],
+        &["plugin", "marketplace", "add", source.as_str()],
     )?;
 
     Err(format!(
@@ -457,6 +651,123 @@ mod tests {
     fn agy_imported_hcom_source_is_none_without_a_manifest() {
         let (_dir, _home, _guard) = plugin_test_env();
         assert_eq!(super::agy_imported_hcom_source(), None);
+    }
+
+    /// Write an import entry plus an installed manifest, and read the state back.
+    fn agy_state_with(manifest: &str) -> super::AgyHooks {
+        let config_dir = crate::runtime_env::gemini_family_config_dir().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // `hcom hooks add antigravity` produces exactly this entry: labelled
+        // claude-code, because our manifest dir is `.claude-plugin/`.
+        std::fs::write(
+            config_dir.join("import_manifest.json"),
+            r#"{"imports":[{"name":"hcom","source":"claude-code","importedAt":"2026-01-01T00:00:00Z","components":["hooks"]}]}"#,
+        )
+        .unwrap();
+        let hooks_path = super::agy_plugin_dir().join(super::AGY_HOOKS_RELATIVE);
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(&hooks_path, manifest).unwrap();
+        super::agy_hook_state()
+    }
+
+    /// A stand-in for one Claude-shaped entry.
+    const CLAUDE_ENTRY: &str =
+        r#"{"name":"hcom-sessionstart","type":"command","command":"hcom claude-sessionstart"}"#;
+
+    #[test]
+    #[serial]
+    fn agy_hook_state_is_hcom_for_the_bundled_manifest() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        // The real thing, not a hand-written stand-in: if the shipped manifest
+        // ever stops satisfying this check, the check is what is wrong.
+        let manifest = include_str!("../../plugin/hcom-agy/hooks/hooks.json");
+        assert_eq!(agy_state_with(manifest), super::AgyHooks::Hcom);
+    }
+
+    #[test]
+    #[serial]
+    fn agy_hook_state_is_foreign_only_for_a_claude_shaped_manifest() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        // SessionStart carrying a real command, and not one of our handlers
+        // anywhere: that shape is the evidence, so naming the source is warranted.
+        let manifest = format!(
+            r#"{{"hooks":{{"SessionStart":[{CLAUDE_ENTRY}],"PostToolUse":[{CLAUDE_ENTRY}]}}}}"#
+        );
+        assert_eq!(
+            agy_state_with(&manifest),
+            super::AgyHooks::Foreign("claude-code".to_string())
+        );
+        // A bare key is not a handler.
+        assert_eq!(
+            agy_state_with(r#"{"hooks":{"SessionStart":[]}}"#),
+            super::AgyHooks::Malformed
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agy_hook_state_is_malformed_for_present_but_useless_events() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        // Each of these parses, carries our event names, and cannot wake an agent.
+        // A presence check would call every one of them healthy — and none of them
+        // is evidence that another harness installed anything.
+        for manifest in [
+            r#"{"hooks":{"PreInvocation":[],"PostInvocation":[]}}"#,
+            r#"{"hooks":{"PreInvocation":null,"PostInvocation":null}}"#,
+            r#"{"hooks":{"PreInvocation":[null],"PostInvocation":[null]}}"#,
+            r#"{"hooks":{"PreInvocation":[{"type":"command","command":"true"}],
+                         "PostInvocation":[{"type":"command","command":"true"}]}}"#,
+            // The word "hcom" without a handler that does anything.
+            r#"{"hooks":{"PreInvocation":[{"type":"command","command":"hcom --version"}],
+                         "PostInvocation":[{"type":"command","command":"hcom --version"}]}}"#,
+            // Not a command entry — it runs nothing.
+            r#"{"hooks":{"PreInvocation":[{"type":"http","command":"hcom gemini-beforeagent"}],
+                         "PostInvocation":[{"type":"http","command":"hcom gemini-afteragent"}]}}"#,
+            // Half an install: PostInvocation missing entirely.
+            r#"{"hooks":{"PreInvocation":[{"type":"command","command":"hcom gemini-beforeagent"}]}}"#,
+        ] {
+            assert_eq!(
+                agy_state_with(manifest),
+                super::AgyHooks::Malformed,
+                "must be reported as broken, not as another harness's: {manifest}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn agy_hook_state_is_malformed_for_mutations_of_the_bundled_manifest() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        let bundled = include_str!("../../plugin/hcom-agy/hooks/hooks.json");
+
+        let swapped = bundled.replace("gemini-beforeagent", "claude-sessionstart");
+        assert_eq!(agy_state_with(&swapped), super::AgyHooks::Malformed);
+
+        let no_after = bundled.replace("gemini-afteragent", "gemini-sessionstart");
+        assert_eq!(agy_state_with(&no_after), super::AgyHooks::Malformed);
+
+        for renamed in [
+            bundled.replace("gemini-beforeagent", "gemini-beforeagent-disabled"),
+            bundled.replace("gemini-beforeagent", "x-gemini-beforeagent"),
+            bundled.replace("gemini-afteragent", "gemini-afteragent2"),
+        ] {
+            assert_eq!(
+                agy_state_with(&renamed),
+                super::AgyHooks::Malformed,
+                "a handler name that merely contains ours is not ours"
+            );
+        }
+
+        let shared_only = r#"{"hooks":{"PostToolUse":[{"matcher":".*","hooks":[
+            {"type":"command","command":"hcom gemini-aftertool"}]}]}}"#;
+        assert_eq!(agy_state_with(shared_only), super::AgyHooks::Malformed);
+    }
+
+    #[test]
+    #[serial]
+    fn agy_hook_state_is_unverifiable_for_broken_json() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        assert_eq!(agy_state_with("{not json"), super::AgyHooks::Unverifiable);
     }
 
     #[test]
@@ -1208,5 +1519,35 @@ mod tests {
         assert!(super::uninstall_cursor_plugin().is_ok());
         assert!(!super::verify_agy_plugin_installed());
         assert!(super::uninstall_agy_plugin().is_ok());
+    }
+
+    // One `cargo test` filter takes one positional TESTNAME, so these three share
+    // a prefix rather than being named for what each asserts alone.
+    #[test]
+    fn normalize_git_url_rewrites_an_ssh_remote() {
+        assert_eq!(
+            super::normalize_git_url("git@github.com:sirassss/hcom.git"),
+            "https://github.com/sirassss/hcom"
+        );
+    }
+
+    #[test]
+    fn normalize_git_url_strips_only_the_git_suffix() {
+        assert_eq!(
+            super::normalize_git_url("https://github.com/sirassss/hcom.git"),
+            "https://github.com/sirassss/hcom"
+        );
+        assert_eq!(
+            super::normalize_git_url("https://github.com/sirassss/hcom"),
+            "https://github.com/sirassss/hcom"
+        );
+    }
+
+    #[test]
+    fn normalize_git_url_trims_git_output_whitespace() {
+        assert_eq!(
+            super::normalize_git_url("git@github.com:sirassss/hcom.git\n"),
+            "https://github.com/sirassss/hcom"
+        );
     }
 }

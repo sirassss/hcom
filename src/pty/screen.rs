@@ -952,20 +952,16 @@ impl ScreenTracker {
             return match self.is_dim_after_prompt(row_idx as u16, ">") {
                 Some(true) => Some(String::new()),
                 Some(false) => Some(text.to_string()),
-                None => {
-                    if self.is_ready() {
-                        Some(String::new())
-                    } else {
-                        Some(text.to_string())
-                    }
-                }
+                // Readiness answers "is the TUI up", not "is the prompt empty":
+                // agy's status bar renders while it is busy too. When dimness is
+                // undecidable, treat the glyphs as the user's text — reporting
+                // "empty" here would let a wake overwrite what they typed.
+                None => Some(text.to_string()),
             };
         }
 
-        if self.is_ready() {
-            return Some(String::new());
-        }
-
+        // Prompt row not located. Unknown is not empty; `is_prompt_empty`
+        // treats None as "not safe", which is the answer we want.
         None
     }
 
@@ -1902,6 +1898,65 @@ mod tests {
         t.process("some agent output\r\n".as_bytes());
         t.process("> \r\n? for shortcuts\r\n".as_bytes());
         assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_no_prompt_line_is_unknown_not_empty() {
+        // Only the status bar is on screen — the prompt row is not located.
+        // "Unknown" must not be reported as "empty", or the delivery gate would
+        // inject over whatever the user has typed.
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process(" Ctx 6% (66k/1048k) |  5h 0% |  ~/workspaces/hcom\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), None);
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    // ---- Antigravity readiness ----
+
+    #[test]
+    fn antigravity_idle_frame_is_ready() {
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process(
+            concat!(
+                "> \r\n",
+                " Gemini 3.8 Flash (High) |  high |  65ce493d\r\n",
+                " Ctx 6% (66k/1048k) |  5h 0% |  ~/workspaces/hcom | branch\r\n",
+            )
+            .as_bytes(),
+        );
+        assert!(t.is_ready(), "agy idle frame must satisfy the ready gate");
+    }
+
+    #[test]
+    fn antigravity_busy_frame_is_also_ready() {
+        // The status bar renders while agy is running a command. Readiness answers
+        // "is the TUI up", not "is agy idle" — idleness is the gate's own check.
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process(
+            concat!(
+                "* Running command...\r\n",
+                "> \r\n",
+                " Ctx 3% (33k/1048k) |  5h 1% |  ~/workspaces/hcom | branch\r\n",
+            )
+            .as_bytes(),
+        );
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn antigravity_ready_pattern_survives_a_narrow_terminal() {
+        // Claude's pattern hides when the terminal is narrow (integration_spec.rs:536).
+        // agy's status bar is left-anchored, so the label survives truncation.
+        let mut t = make_tracker(24, 40, "Ctx ");
+        t.process(" Ctx 6% (66k/1048k) |  5h 0%\r\n".as_bytes());
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn antigravity_frame_without_status_bar_is_not_ready() {
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process("starting agy...\r\n".as_bytes());
+        assert!(!t.is_ready());
     }
 
     // ---- Claude input extraction ----

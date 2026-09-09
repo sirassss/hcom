@@ -319,7 +319,11 @@ mod tests {
 
     #[test]
     fn antigravity_ready_pattern() {
-        assert_eq!(Tool::Antigravity.ready_pattern(), b"? for shortcuts");
+        // agy 1.1.27 renders no "? for shortcuts"; its status bar carries
+        // "Ctx <pct>% (<used>/<total>)". Measured 2026-09-08: with the old
+        // pattern every AGY launch reported blocked and no message was ever
+        // injected. See docs/superpowers/specs/2026-09-08-agy-wake-design.md.
+        assert_eq!(Tool::Antigravity.ready_pattern(), b"Ctx ");
     }
 
     #[test]
