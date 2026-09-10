@@ -206,6 +206,27 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Clear a gate-block context, but only if it is still the one we wrote.
+    ///
+    /// The delivery loop writes `tui:<reason>` contexts and later clears them,
+    /// while hooks write their own (`tool:Bash`) to the same column. An
+    /// unconditional clear erases whatever the hook put there; a read-then-
+    /// clear still loses the race. Comparing in the WHERE clause is what makes
+    /// this safe. `cmd:listen` details are preserved as in `set_gate_status`.
+    ///
+    /// Returns whether a row matched, so a caller can tell "cleared" from
+    /// "someone else owns it now" — both mean the caller may drop its marker,
+    /// but only an `Err` means it should keep it and retry.
+    pub fn clear_gate_status_if(&self, name: &str, expected_context: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE instances SET status_context = '',
+                status_detail = CASE WHEN status_detail = 'cmd:listen' THEN status_detail ELSE '' END
+             WHERE name = ? AND status_context = ?",
+            params![name, expected_context],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Update instance PID after spawn
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
         self.conn.execute(
@@ -1206,6 +1227,71 @@ mod tests {
         assert_eq!(db.get_session_binding("uuid-a").unwrap(), None);
         assert_eq!(db.get_session_binding("uuid-b").unwrap(), None);
         assert!(db.get_instance_full("zilo").unwrap().is_none());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn clear_gate_status_only_clears_our_own_context() {
+        use crate::shared::ST_ACTIVE;
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, status, status_context) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["nova", "antigravity", 1.0f64, "listening", "start"],
+            )
+            .unwrap();
+
+        // Our own row: both columns cleared.
+        db.set_gate_status("nova", "tui:prompt-has-text:stalled", "gate blocked 60s")
+            .unwrap();
+        assert!(
+            db.clear_gate_status_if("nova", "tui:prompt-has-text:stalled")
+                .unwrap()
+        );
+        let (_, context) = db.get_status("nova").unwrap().unwrap();
+        assert_eq!(context, "");
+        assert_eq!(db.get_instance_status("nova").unwrap().unwrap().detail, "");
+
+        // A hook wrote its own context AND detail after ours. Neither may move.
+        db.set_gate_status("nova", "tui:prompt-has-text:stalled", "gate blocked 60s")
+            .unwrap();
+        db.set_status("nova", ST_ACTIVE, "tool:Bash").unwrap();
+        db.conn
+            .execute(
+                "UPDATE instances SET status_detail = 'running tests' WHERE name = ?1",
+                params!["nova"],
+            )
+            .unwrap();
+        assert!(
+            !db.clear_gate_status_if("nova", "tui:prompt-has-text:stalled")
+                .unwrap()
+        );
+        let (status, context) = db.get_status("nova").unwrap().unwrap();
+        assert_eq!(status, ST_ACTIVE);
+        assert_eq!(context, "tool:Bash");
+        assert_eq!(
+            db.get_instance_status("nova").unwrap().unwrap().detail,
+            "running tests"
+        );
+
+        // A hand-joined instance keeps its cmd:listen detail, as set_gate_status does.
+        db.set_gate_status("nova", "tui:not-idle:stalled", "gate blocked 60s")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE instances SET status_detail = 'cmd:listen' WHERE name = ?1",
+                params!["nova"],
+            )
+            .unwrap();
+        assert!(
+            db.clear_gate_status_if("nova", "tui:not-idle:stalled")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_instance_status("nova").unwrap().unwrap().detail,
+            "cmd:listen"
+        );
 
         cleanup_test_db(db_path);
     }

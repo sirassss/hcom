@@ -495,7 +495,15 @@ pub fn get_status_description(status: &str, context: &str) -> String {
             }
         }
         ST_LISTENING => {
-            if context == "tui:not-ready" {
+            // A delivery gate blocked past the escalation threshold carries a
+            // `:stalled` suffix on its `tui:<reason>` context (see delivery.rs
+            // `gate_block_context`). Strip it before matching so the reason
+            // still renders friendly, then mark it stalled.
+            let (context, stalled) = match context.strip_suffix(":stalled") {
+                Some(base) => (base, " (stalled)"),
+                None => (context, ""),
+            };
+            let desc = if context == "tui:not-ready" {
                 "listening: blocked".to_string()
             } else if context == "tui:not-idle" {
                 "listening: waiting for idle".to_string()
@@ -511,7 +519,8 @@ pub fn get_status_description(status: &str, context: &str) -> String {
                 "listening: suspended".to_string()
             } else {
                 "listening".to_string()
-            }
+            };
+            format!("{desc}{stalled}")
         }
         ST_BLOCKED => {
             if context == "pty:approval" || context == "approval" {
@@ -1284,6 +1293,15 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         assert_eq!(
             get_status_description(ST_LISTENING, "tui:not-ready"),
             "listening: blocked"
+        );
+        // An escalated (stalled) gate keeps the friendly reason and is marked.
+        assert_eq!(
+            get_status_description(ST_LISTENING, "tui:not-idle:stalled"),
+            "listening: waiting for idle (stalled)"
+        );
+        assert_eq!(
+            get_status_description(ST_LISTENING, "tui:prompt-has-text:stalled"),
+            "listening: uncommitted text (stalled)"
         );
         assert_eq!(
             get_status_description(ST_BLOCKED, ""),

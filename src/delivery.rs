@@ -1518,6 +1518,109 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
+/// How long a delivery gate may block continuously before it is escalated. A
+/// judgement call, not a measurement: long enough that an ordinary turn does
+/// not trip it in passing, short enough that a coordinator notices a stuck
+/// agent within one working minute. A genuinely long turn will trip it, and
+/// that is intended — see `gate_block_context`'s callers.
+const DELIVERY_BLOCKED_ESCALATE_SECS: u64 = 60;
+
+/// True once a continuous block has lasted at least `threshold`.
+fn should_escalate_block(blocked_for: Duration, threshold: Duration) -> bool {
+    blocked_for >= threshold
+}
+
+/// The gate-block context `hcom list` renders: `tui:<reason>`, and
+/// `tui:<reason>:stalled` once the block has run past the threshold.
+///
+/// One function because two call sites write this string, and the 2s updater
+/// writes whenever its computed context differs from the last one written. If
+/// the escalation wrote a suffixed string the updater did not know about, the
+/// updater would overwrite it on the very next poll — and the escalation
+/// latch fires once, so the stalled marker would never come back.
+fn gate_block_context(reason: &str, blocked_for: Duration) -> String {
+    let stalled = should_escalate_block(
+        blocked_for,
+        Duration::from_secs(DELIVERY_BLOCKED_ESCALATE_SECS),
+    );
+    format!(
+        "tui:{}{}",
+        reason.replace('_', "-"),
+        if stalled { ":stalled" } else { "" }
+    )
+}
+
+/// Release the gate context this loop owns, if it still owns it.
+///
+/// `marker` is the last context this loop wrote; empty means it owns nothing.
+/// It is cleared once the database has been asked — a row that no longer
+/// matches belongs to a hook now, which is equally "not ours". It is kept only
+/// when the database errored, so `State::Idle` can retry.
+fn release_gate_context(db: &HcomDb, name: &str, marker: &mut String) {
+    if marker.is_empty() {
+        return;
+    }
+    match db.clear_gate_status_if(name, marker) {
+        Ok(_) => marker.clear(),
+        Err(e) => log_warn("native", "delivery.gate_clear_fail", &format!("{e}")),
+    }
+}
+
+/// Keep ownership of the previous context until its replacement is persisted.
+fn update_gate_context(
+    db: &HcomDb,
+    name: &str,
+    context: &str,
+    detail: &str,
+    marker: &mut String,
+) -> anyhow::Result<()> {
+    if context != marker {
+        db.set_gate_status(name, context, detail)?;
+        *marker = context.to_string();
+    }
+    Ok(())
+}
+
+/// How long the current block has run, and whether it has already escalated.
+///
+/// The two live in one value on purpose: the loop clears the clock at several
+/// sites, and a separate `bool` would have to be cleared at all of them too.
+/// Miss one and the first block disarms escalation for every block after it.
+struct BlockClock {
+    since: Instant,
+    escalated: bool,
+}
+
+impl BlockClock {
+    fn start() -> Self {
+        Self {
+            since: Instant::now(),
+            escalated: false,
+        }
+    }
+
+    /// Elapsed time of this block.
+    fn elapsed(&self) -> Duration {
+        self.since.elapsed()
+    }
+
+    /// Mark escalation only after the event is persisted, allowing failed writes to retry.
+    fn emit_escalation(
+        &mut self,
+        db: &HcomDb,
+        name: &str,
+        status: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        if self.escalated {
+            return Ok(false);
+        }
+        db.emit_delivery_blocked_event(name, status, reason, self.elapsed().as_secs())?;
+        self.escalated = true;
+        Ok(true)
+    }
+}
+
 /// Delivery state machine for the native PTY path (Claude/Gemini/Codex/Antigravity).
 ///
 /// OpenCode bypasses this entirely — it early-returns with its own loop
@@ -1751,7 +1854,7 @@ pub fn run_delivery_loop(
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
         // Gate block tracking for TUI status updates
-        let mut block_since: Option<Instant> = None;
+        let mut block_since: Option<BlockClock> = None;
         let mut last_block_context: String = String::new();
 
         // Status tracking for terminal title updates
@@ -1780,6 +1883,14 @@ pub fn run_delivery_loop(
 
             match delivery_state {
                 State::Idle => {
+                    // A failed clear has no other way back: this arm only
+                    // leaves for Pending when a message arrives, and no path
+                    // out of Pending clears a context it did not write. A
+                    // marker surviving into Idle is that failure, so retry it
+                    // here. Compare-and-clear makes the retry safe on its own:
+                    // if a hook has taken the row since, no rows match.
+                    release_gate_context(db, &current_name, &mut last_block_context);
+
                     // Capture wall clock before wait to detect system sleep
                     let wall_before = crate::shared::time::now_epoch_i64() as u64;
 
@@ -1871,6 +1982,8 @@ pub fn run_delivery_loop(
                             "delivery.no_pending",
                             &format!("No pending messages for {}", current_name),
                         );
+                        release_gate_context(db, &current_name, &mut last_block_context);
+                        block_since = None;
                         delivery_state = State::Idle;
                         attempt = 0;
                         continue;
@@ -1891,6 +2004,8 @@ pub fn run_delivery_loop(
                             "delivery.gate_pass",
                             &gate_pass_diagnostics(db, &current_name, state, is_idle),
                         );
+                        release_gate_context(db, &current_name, &mut last_block_context);
+                        block_since = None;
 
                         // Snapshot cursor before injection
                         cursor_before = db.get_cursor(&current_name);
@@ -1965,7 +2080,50 @@ pub fn run_delivery_loop(
 
                         // Track when blocking started
                         if block_since.is_none() {
-                            block_since = Some(Instant::now());
+                            block_since = Some(BlockClock::start());
+                        }
+
+                        // Past the threshold, a block stops being a transient:
+                        // nothing is being delivered, and until now nothing was
+                        // emitted for a coordinator to see. Event only — the
+                        // context is written by the updaters below, and writing
+                        // ST_BLOCKED here would make is_idle() false so the gate
+                        // could never reopen (see D4).
+                        if let Some(clock) = block_since.as_mut()
+                            && should_escalate_block(
+                                clock.elapsed(),
+                                Duration::from_secs(DELIVERY_BLOCKED_ESCALATE_SECS),
+                            )
+                            && !clock.escalated
+                        {
+                            let blocked_secs = clock.elapsed().as_secs();
+                            // The status the event reports is the one observed.
+                            // A failed lookup is not an observation: say so
+                            // rather than naming a state we did not read.
+                            let observed = match db.get_status(&current_name) {
+                                Ok(Some((status, _))) => status,
+                                _ => "unknown".to_string(),
+                            };
+                            // `not_idle` is carried, not filtered: a turn longer
+                            // than the threshold is not a bug, but the message
+                            // is still not being delivered, and the reason field
+                            // is what tells the two apart.
+                            match clock.emit_escalation(db, &current_name, &observed, gate.reason) {
+                                Ok(true) => log_warn(
+                                    "native",
+                                    "delivery.blocked_escalated",
+                                    &format!(
+                                        "{current_name}: gate blocked {blocked_secs}s ({}, status {observed})",
+                                        gate.reason
+                                    ),
+                                ),
+                                Ok(false) => {}
+                                Err(e) => log_warn(
+                                    "native",
+                                    "delivery.escalate_event_fail",
+                                    &format!("{e}"),
+                                ),
+                            }
                         }
 
                         let approval_showing = {
@@ -2020,25 +2178,25 @@ pub fn run_delivery_loop(
                                 }
                             }
                             // Fall through to TUI status update
-                            if let Some(since) = block_since
-                                && since.elapsed().as_secs_f64() >= 2.0
+                            if let Some(clock) = block_since.as_ref()
+                                && clock.elapsed().as_secs_f64() >= 2.0
                             {
                                 match db.get_status(&current_name) {
                                     Ok(Some((status, _))) if status == ST_LISTENING => {
-                                        let context = "tui:not-idle".to_string();
-                                        if context != last_block_context {
-                                            if let Err(e) = db.set_gate_status(
-                                                &current_name,
-                                                &context,
-                                                "waiting for idle status",
-                                            ) {
-                                                log_warn(
-                                                    "native",
-                                                    "delivery.gate_status_fail",
-                                                    &format!("{}", e),
-                                                );
-                                            }
-                                            last_block_context = context;
+                                        let context =
+                                            gate_block_context(gate.reason, clock.elapsed());
+                                        if let Err(e) = update_gate_context(
+                                            db,
+                                            &current_name,
+                                            &context,
+                                            gate_block_detail(gate.reason),
+                                            &mut last_block_context,
+                                        ) {
+                                            log_warn(
+                                                "native",
+                                                "delivery.gate_status_fail",
+                                                &format!("{e}"),
+                                            );
                                         }
                                     }
                                     Ok(Some(_)) | Ok(None) => {
@@ -2053,22 +2211,28 @@ pub fn run_delivery_loop(
                                     }
                                 }
                             }
-                        } else if let Some(since) = block_since {
+                        } else if let Some(clock) = block_since.as_ref() {
                             // After 2 seconds of blocking, update TUI status context
-                            if since.elapsed().as_secs_f64() >= 2.0 {
+                            if clock.elapsed().as_secs_f64() >= 2.0 {
                                 // Only update if status is "listening" (don't overwrite active/blocked)
                                 match db.get_status(&current_name) {
                                     Ok(Some((status, _))) if status == ST_LISTENING => {
                                         // Format context: tui:not-ready, tui:user-active, etc.
-                                        let reason_formatted = gate.reason.replace("_", "-");
-                                        let context = format!("tui:{}", reason_formatted);
+                                        let context =
+                                            gate_block_context(gate.reason, clock.elapsed());
 
-                                        // Only update if context changed
-                                        if context != last_block_context {
-                                            let detail = gate_block_detail(gate.reason);
-                                            let _ =
-                                                db.set_gate_status(&current_name, &context, detail);
-                                            last_block_context = context;
+                                        if let Err(e) = update_gate_context(
+                                            db,
+                                            &current_name,
+                                            &context,
+                                            gate_block_detail(gate.reason),
+                                            &mut last_block_context,
+                                        ) {
+                                            log_warn(
+                                                "native",
+                                                "delivery.gate_status_fail",
+                                                &format!("{e}"),
+                                            );
                                         }
                                     }
                                     Ok(Some(_)) | Ok(None) => {
@@ -2303,12 +2467,7 @@ pub fn run_delivery_loop(
                     let current_cursor = db.get_cursor(&current_name);
                     if current_cursor > cursor_before {
                         // Success! Clear gate block status
-                        if !last_block_context.is_empty() {
-                            if let Err(e) = db.set_gate_status(&current_name, "", "") {
-                                log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
-                            }
-                            last_block_context.clear();
-                        }
+                        release_gate_context(db, &current_name, &mut last_block_context);
                         block_since = None;
 
                         log_info(
@@ -2360,16 +2519,7 @@ pub fn run_delivery_loop(
                                 // pending rows" is also sufficient — avoids
                                 // wedging when hook delivery succeeded but
                                 // cursor bookkeeping did not advance.
-                                if !last_block_context.is_empty() {
-                                    if let Err(e) = db.set_gate_status(&current_name, "", "") {
-                                        log_warn(
-                                            "native",
-                                            "delivery.gate_clear_fail",
-                                            &format!("{}", e),
-                                        );
-                                    }
-                                    last_block_context.clear();
-                                }
+                                release_gate_context(db, &current_name, &mut last_block_context);
                                 block_since = None;
                                 log_info(
                                     "native",
@@ -2404,9 +2554,14 @@ pub fn run_delivery_loop(
                                         "delivery.gate_status_fail",
                                         &format!("{}", e),
                                     );
+                                } else {
+                                    // Only claim the context once the row holds
+                                    // it. Overwriting a marker a failed clear is
+                                    // still carrying would strand that row's
+                                    // stalled context permanently.
+                                    last_block_context = context;
                                 }
-                                last_block_context = context;
-                                block_since = Some(Instant::now());
+                                block_since = Some(BlockClock::start());
                                 log_warn(
                                     "native",
                                     "delivery.wake_unacknowledged",
@@ -2465,10 +2620,7 @@ pub fn run_delivery_loop(
                     let current_cursor = db.get_cursor(&current_name);
                     let has_pending = db.has_pending(&current_name);
                     if current_cursor > cursor_before || !has_pending {
-                        if let Err(e) = db.set_gate_status(&current_name, "", "") {
-                            log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
-                        }
-                        last_block_context.clear();
+                        release_gate_context(db, &current_name, &mut last_block_context);
                         block_since = None;
                         attempt = 0;
                         inject_attempt = 0;
@@ -3308,5 +3460,203 @@ mod tests {
             .unwrap();
 
         assert_eq!(build_wake_inject_text(&db, "keno", 24), "<hcom>");
+    }
+
+    #[test]
+    fn delivery_block_escalates_only_past_the_threshold() {
+        use std::time::Duration;
+        let threshold = Duration::from_secs(DELIVERY_BLOCKED_ESCALATE_SECS);
+        assert!(!should_escalate_block(Duration::from_secs(0), threshold));
+        assert!(!should_escalate_block(
+            threshold - Duration::from_millis(1),
+            threshold
+        ));
+        assert!(should_escalate_block(threshold, threshold));
+    }
+
+    #[test]
+    fn delivery_block_context_is_stable_across_polls() {
+        use std::time::Duration;
+        let below = Duration::from_secs(DELIVERY_BLOCKED_ESCALATE_SECS - 1);
+        let at = Duration::from_secs(DELIVERY_BLOCKED_ESCALATE_SECS);
+        let later = Duration::from_secs(DELIVERY_BLOCKED_ESCALATE_SECS + 30);
+
+        assert_eq!(
+            gate_block_context("prompt_has_text", below),
+            "tui:prompt-has-text"
+        );
+        assert_eq!(
+            gate_block_context("prompt_has_text", at),
+            "tui:prompt-has-text:stalled"
+        );
+        // The bug this test exists for: the 2s updater recomputes the context every
+        // poll and writes whenever it differs from the last one written. If it
+        // rebuilt the unsuffixed string after the escalation, the stalled marker
+        // would vanish on the very next poll and never come back — escalation
+        // fires once. Same input, same string, at any elapsed time past the threshold.
+        assert_eq!(
+            gate_block_context("prompt_has_text", later),
+            gate_block_context("prompt_has_text", at)
+        );
+        // A gate whose reason changes gets a new context and is written again.
+        assert_ne!(
+            gate_block_context("not_idle", at),
+            gate_block_context("prompt_has_text", at)
+        );
+    }
+
+    #[test]
+    fn delivery_block_event_retries_failed_write_and_emits_once_per_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let mut clock = BlockClock::start();
+        clock.since -= Duration::from_secs(63);
+
+        // Force a real SQLite write failure without changing the fixture's rows.
+        db.conn().execute_batch("PRAGMA query_only = ON").unwrap();
+        assert!(
+            clock
+                .emit_escalation(&db, "nova", ST_ACTIVE, "not_idle")
+                .is_err()
+        );
+        assert!(!clock.escalated);
+        assert!(
+            db.get_events_since(0, Some("life"), Some("nova"))
+                .unwrap()
+                .is_empty()
+        );
+
+        db.conn().execute_batch("PRAGMA query_only = OFF").unwrap();
+        assert!(
+            clock
+                .emit_escalation(&db, "nova", ST_ACTIVE, "not_idle")
+                .unwrap()
+        );
+        assert!(
+            !clock
+                .emit_escalation(&db, "nova", ST_ACTIVE, "not_idle")
+                .unwrap()
+        );
+        let events = db.get_events_since(0, Some("life"), Some("nova")).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["action"], "delivery_blocked");
+        assert_eq!(events[0]["data"]["status"], ST_ACTIVE);
+        let blocked_secs: u64 = events[0]["data"]["detail"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("gate blocked ")
+            .unwrap()
+            .strip_suffix("s continuously")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(blocked_secs >= 63);
+
+        // A later block can emit its own event.
+        assert!(
+            BlockClock::start()
+                .emit_escalation(&db, "nova", ST_ACTIVE, "not_idle")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_events_since(0, Some("life"), Some("nova"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn delivery_block_context_failed_write_preserves_cleanup_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn().execute(
+            "INSERT INTO instances (name, tool, created_at, status) VALUES ('nova', 'antigravity', 1, 'listening')",
+            [],
+        ).unwrap();
+        let old = "tui:prompt-has-text:stalled";
+        let new = "tui:not-ready:stalled";
+        let mut marker = String::new();
+
+        for retry_write in [false, true] {
+            update_gate_context(&db, "nova", old, "old detail", &mut marker).unwrap();
+            db.conn().execute_batch("PRAGMA query_only = ON").unwrap();
+            assert!(update_gate_context(&db, "nova", new, "new detail", &mut marker).is_err());
+            assert_eq!(marker, old);
+            assert_eq!(db.get_status("nova").unwrap().unwrap().1, old);
+            db.conn().execute_batch("PRAGMA query_only = OFF").unwrap();
+
+            if retry_write {
+                update_gate_context(&db, "nova", new, "new detail", &mut marker).unwrap();
+                assert_eq!(marker, new);
+                assert_eq!(db.get_status("nova").unwrap().unwrap().1, new);
+                assert_eq!(
+                    db.get_instance_status("nova").unwrap().unwrap().detail,
+                    "new detail"
+                );
+            }
+            // The queue may drain before the replacement succeeds. Either way,
+            // cleanup must still name and remove the context actually on disk.
+            release_gate_context(&db, "nova", &mut marker);
+            assert!(marker.is_empty());
+            assert_eq!(db.get_status("nova").unwrap().unwrap().1, "");
+            assert_eq!(db.get_instance_status("nova").unwrap().unwrap().detail, "");
+        }
+    }
+
+    #[test]
+    fn a_failed_gate_clear_is_retried_and_still_respects_ownership() {
+        // The db::tests helpers are `pub(super)` — visible inside `db`, not here.
+        // This is the fixture `delivery.rs` already uses (see
+        // `status_refresh_repairs_codex_approval_cache_divergence`).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, status, status_context) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["nova", "antigravity", 1.0f64, ST_LISTENING, "start"],
+            )
+            .unwrap();
+        db.set_gate_status("nova", "tui:not-idle:stalled", "gate blocked 60s")
+            .unwrap();
+        let mut marker = "tui:not-idle:stalled".to_string();
+
+        // The clear fails. The marker must survive, or nothing knows the row is
+        // still dirty — this is the leak the Idle retry exists for.
+        db.conn()
+            .execute("ALTER TABLE instances RENAME TO instances_hidden", [])
+            .unwrap();
+        release_gate_context(&db, "nova", &mut marker);
+        assert_eq!(
+            marker, "tui:not-idle:stalled",
+            "a failed clear keeps the marker"
+        );
+
+        // Next idle iteration: same call, and now it lands.
+        db.conn()
+            .execute("ALTER TABLE instances_hidden RENAME TO instances", [])
+            .unwrap();
+        release_gate_context(&db, "nova", &mut marker);
+        assert!(marker.is_empty(), "the retry drops the marker once cleared");
+        let (_, context) = db.get_status("nova").unwrap().unwrap();
+        assert_eq!(context, "");
+
+        // Ownership still holds on the retry path: a hook took the row while the
+        // marker was being carried, so the retry must leave it alone.
+        db.set_gate_status("nova", "tui:not-idle:stalled", "gate blocked 60s")
+            .unwrap();
+        let mut stale = "tui:not-idle:stalled".to_string();
+        db.set_status("nova", ST_ACTIVE, "tool:Bash").unwrap();
+        release_gate_context(&db, "nova", &mut stale);
+        assert!(stale.is_empty(), "the row is a hook's now; we own nothing");
+        let (status, context) = db.get_status("nova").unwrap().unwrap();
+        assert_eq!(status, ST_ACTIVE);
+        assert_eq!(context, "tool:Bash");
+
+        drop(db); // tempdir cleans up behind it
     }
 }

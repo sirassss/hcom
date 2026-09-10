@@ -416,13 +416,18 @@ fn marketplace_source() -> String {
 
 /// URL of the remote the checkout's branch tracks, falling back to `origin`.
 fn checkout_remote_url(root: &Path) -> Option<String> {
-    let branch = git_output(root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let remote = git_output(
-        root,
-        &["config", "--get", &format!("branch.{branch}.remote")],
-    )
-    .unwrap_or_else(|| "origin".to_string());
-    let url = git_output(root, &["remote", "get-url", &remote])?;
+    let remote = git_output(root, &["rev-parse", "--abbrev-ref", "HEAD"]).and_then(|branch| {
+        git_output(
+            root,
+            &["config", "--get", &format!("branch.{branch}.remote")],
+        )
+    });
+    // `.` means the branch tracks another local branch, not a named remote.
+    // A stale tracking configuration must not hide a usable origin either.
+    let url = remote
+        .filter(|remote| remote != ".")
+        .and_then(|remote| git_output(root, &["remote", "get-url", &remote]))
+        .or_else(|| git_output(root, &["remote", "get-url", "origin"]))?;
     Some(normalize_git_url(&url))
 }
 
@@ -1549,5 +1554,77 @@ mod tests {
             super::normalize_git_url("git@github.com:sirassss/hcom.git\n"),
             "https://github.com/sirassss/hcom"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn checkout_remote_url_falls_back_to_origin_when_tracking_remote_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hooks_dir = root.join("empty-hooks");
+        std::fs::create_dir(&hooks_dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&[
+            "-c",
+            "user.name=Review Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            &format!("core.hooksPath={}", hooks_dir.display()),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ]);
+        run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/fork.git",
+        ]);
+        run_git(&["checkout", "-b", "feature", "--track", "main"]);
+        assert_eq!(
+            super::git_output(root, &["config", "--get", "branch.feature.remote"]).as_deref(),
+            Some(".")
+        );
+        let origin = Some("https://github.com/example/fork".to_string());
+        assert_eq!(super::checkout_remote_url(root), origin);
+
+        run_git(&["config", "branch.feature.remote", "missing"]);
+        assert_eq!(super::checkout_remote_url(root), origin);
+        run_git(&["config", "--unset", "branch.feature.remote"]);
+        assert_eq!(super::checkout_remote_url(root), origin);
+
+        run_git(&[
+            "remote",
+            "add",
+            "tracked",
+            "git@github.com:example/tracked.git",
+        ]);
+        run_git(&["config", "branch.feature.remote", "tracked"]);
+        assert_eq!(
+            super::checkout_remote_url(root),
+            Some("https://github.com/example/tracked".to_string())
+        );
+
+        run_git(&["checkout", "--detach"]);
+        assert_eq!(super::checkout_remote_url(root), origin);
+        run_git(&["remote", "remove", "origin"]);
+        assert_eq!(super::checkout_remote_url(root), None);
     }
 }

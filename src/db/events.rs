@@ -301,6 +301,29 @@ impl HcomDb {
         Ok(())
     }
 
+    /// A delivery gate that has stayed blocked long enough for a coordinator
+    /// to care. Deliberately not `emit_launch_blocked_event`: that one
+    /// hardcodes the action `launch_blocked`, and its `context` parameter does
+    /// not change it, so reusing it would report a launch failure for an agent
+    /// that launched fine. Status stays untouched — see the delivery loop.
+    pub(crate) fn emit_delivery_blocked_event(
+        &self,
+        name: &str,
+        status: &str,
+        reason: &str,
+        blocked_secs: u64,
+    ) -> Result<()> {
+        self.emit_launch_lifecycle_event(
+            name,
+            "delivery_blocked",
+            status,
+            "delivery_blocked",
+            Some(reason),
+            Some(&format!("gate blocked {blocked_secs}s continuously")),
+        )?;
+        Ok(())
+    }
+
     /// Check if all instances in a launch batch are ready; send notification if so.
     pub fn check_batch_completion(&self, launcher: &str, batch_id: &str) -> Result<()> {
         // Find the launch event for this batch
@@ -761,6 +784,36 @@ mod tests {
         )
         .unwrap();
         assert!(db.has_direct_unread("luna_reviewer_1"));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn delivery_blocked_event_carries_its_own_action() {
+        use crate::shared::ST_ACTIVE;
+        let (db, db_path) = setup_full_test_db();
+
+        db.emit_delivery_blocked_event("nova", ST_ACTIVE, "not_idle", 63)
+            .unwrap();
+
+        let events = db.get_events_since(0, Some("life"), Some("nova")).unwrap();
+        let blocked: Vec<_> = events
+            .iter()
+            .filter(|e| e["data"]["action"] == "delivery_blocked")
+            .collect();
+        assert_eq!(blocked.len(), 1, "one block, one event: {events:?}");
+        let data = &blocked[0]["data"];
+        // `emit_launch_blocked_event` hardcodes "launch_blocked" and its `context`
+        // argument does not change that — a coordinator would read a launch
+        // failure for an agent that launched fine.
+        assert_eq!(data["reason"], "not_idle");
+        // The observed status, not a constant: a not_idle block is an ACTIVE
+        // instance, and the event must not claim otherwise.
+        assert_eq!(data["status"], ST_ACTIVE);
+        assert!(
+            data["detail"].as_str().unwrap().contains("63"),
+            "the duration is the whole point of the event: {data}"
+        );
 
         cleanup_test_db(db_path);
     }

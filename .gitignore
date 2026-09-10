@@ -2,3 +2,6 @@
 /bin/
 /.hcom/
 /node_modules/
+
+# code-graph tool cache
+.codegraph/
