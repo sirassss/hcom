@@ -3,6 +3,7 @@ pub mod app;
 pub mod commands;
 pub mod data;
 pub mod db;
+pub mod filter;
 pub mod inline;
 pub mod input;
 pub mod model;
@@ -69,7 +70,7 @@ fn prepare_vertical_viewport(app: &mut App) {
     app.ui.switch_viewport = false;
     app.ui.view_mode = ViewMode::Vertical;
     app.source.set_timeline_limit(5000);
-    app.ui.eject_filter = None;
+    app.reload_data_force();
     app.ui.msg_scroll = 0;
 }
 
@@ -77,8 +78,11 @@ fn prepare_inline_viewport(app: &mut App) {
     app.ui.switch_viewport = false;
     app.ui.view_mode = ViewMode::Inline;
     app.source.set_timeline_limit(200);
-    app.ui.eject_filter = None;
+    app.reload_data_force();
     app.ui.msg_scroll = 0;
+    // A different tier/filter may have been selected in vertical mode. Replace
+    // any queued inline snapshot using the freshly loaded inline window.
+    app.ui.trigger_inline_replay();
 }
 
 /// Main event loop. Separated from run() so cleanup always runs regardless
@@ -118,8 +122,8 @@ fn run_app(app: &mut App, viewport_height: u16, in_alt_screen: &mut bool) -> Res
                     app.ui.needs_clear_replay = true;
                     app.ejector.begin_replay(
                         &app.data,
-                        &app.ui.eject_filter,
-                        &app.ui.search_filter,
+                        app.ui.msg_tier,
+                        &app.ui.msg_filter,
                         ReplayReason::Resize,
                     );
                     continue;
@@ -183,8 +187,7 @@ fn run_inner(viewport_height: u16) -> Result<()> {
     // HCOM_TUI_FULLSCREEN=1 starts directly in alternate screen (fullscreen) mode,
     // bypassing inline viewport which requires cursor position queries.
     if std::env::var("HCOM_TUI_FULLSCREEN").as_deref() == Ok("1") {
-        app.ui.view_mode = self::model::ViewMode::Vertical;
-        app.source.set_timeline_limit(5000);
+        prepare_vertical_viewport(&mut app);
     }
 
     let mut in_alt_screen = false;
@@ -233,7 +236,9 @@ mod tests {
 
     impl DataSource for DummySource {
         fn load(&mut self) -> DataState {
-            self.snapshot.clone()
+            let mut snapshot = self.snapshot.clone();
+            snapshot.timeline_limit = self.timeline_limit.get();
+            snapshot
         }
 
         fn load_if_changed(&mut self) -> Option<DataState> {
@@ -279,6 +284,7 @@ mod tests {
         assert_eq!(app.ui.msg_scroll, 0);
         assert!(!app.ui.switch_viewport);
         assert_eq!(limit.get(), 5000);
+        assert_eq!(app.data.timeline_limit, 5000);
     }
 
     #[test]
@@ -288,6 +294,8 @@ mod tests {
         app.ui.view_mode = ViewMode::Vertical;
         app.ui.msg_scroll = 7;
         app.ui.switch_viewport = true;
+        app.ui.msg_tier = crate::tui::filter::MsgTier::Verbose;
+        app.ui.msg_filter = crate::tui::filter::MsgFilter::parse("from:nova");
 
         render_once(&mut app);
         prepare_inline_viewport(&mut app);
@@ -296,6 +304,74 @@ mod tests {
         assert_eq!(app.ui.msg_scroll, 0);
         assert!(!app.ui.switch_viewport);
         assert_eq!(limit.get(), 200);
+        assert_eq!(app.data.timeline_limit, 200);
+        assert_eq!(app.ui.msg_tier, crate::tui::filter::MsgTier::Verbose);
+        assert_eq!(app.ui.msg_filter.from.as_deref(), Some("nova"));
+        assert!(app.ui.inline_filter_changed, "replace the old inline replay");
+        assert!(!app.ui.needs_resize);
+        assert!(!app.ui.needs_clear_replay);
+    }
+
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render::render(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn vertical_header_and_footer_show_scope_tier_and_chips() {
+        let limit = Rc::new(Cell::new(0));
+        let mut app = make_test_app(limit);
+        app.data.agents = vec![crate::tui::test_helpers::make_test_agent("nova", 60.0)];
+        app.ui.view_mode = ViewMode::Vertical;
+        app.ui.msg_tier = crate::tui::filter::MsgTier::Normal;
+        app.ui.msg_filter = crate::tui::filter::MsgFilter::parse("tag:review to:bigboss");
+
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("recent (limit"), "scope missing:\n{out}");
+        assert!(out.contains("normal"), "tier chip missing:\n{out}");
+        assert!(out.contains("tag:review"), "tag chip missing:\n{out}");
+        assert!(out.contains("to:bigboss"), "to chip missing:\n{out}");
+        // Footer advertises the v tier shortcut.
+        assert!(
+            out.contains("tier:normal"),
+            "footer tier hint missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inline_status_keeps_count_visible_with_long_unicode_filter() {
+        let mut app = make_test_app(Rc::new(Cell::new(0)));
+        app.ui.view_mode = ViewMode::Inline;
+        app.data.agents = vec![crate::tui::test_helpers::make_test_agent("nova", 60.0)];
+        app.ui.msg_filter.text = "界".repeat(80);
+
+        for width in [60, 80] {
+            let out = render_to_string(&mut app, width, 24);
+            assert!(out.contains("[0/0]"), "count clipped at {width}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn help_popup_documents_new_filter_keys() {
+        let limit = Rc::new(Cell::new(0));
+        let mut app = make_test_app(limit);
+        app.data.agents = vec![crate::tui::test_helpers::make_test_agent("nova", 60.0)];
+        app.ui.help_open = true;
+
+        let out = render_to_string(&mut app, 80, 40);
+        assert!(out.contains("compact / normal / verbose"), "\n{out}");
+        assert!(out.contains("to:<bigboss>"), "\n{out}");
+        assert!(out.contains("recent window"), "\n{out}");
     }
 }
 

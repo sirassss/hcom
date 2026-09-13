@@ -148,6 +148,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
+    ("bigboss", "preferences.bigboss"),
     ("auto_trust_workspace", "launch.auto_trust_workspace"),
     ("title_mode", "terminal.title_mode"),
 ];
@@ -186,6 +187,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("auto_approve", "HCOM_AUTO_APPROVE"),
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
+    ("bigboss", "HCOM_BIGBOSS"),
     ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
     ("title_mode", "HCOM_TITLE_MODE"),
 ];
@@ -298,6 +300,10 @@ pub struct HcomConfig {
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
+    /// TUI coordinator name for the `B` shortcut. Default `"bigboss"`; empty
+    /// resets to the default. Tagged and device-qualified names are allowed;
+    /// whitespace and `"*"` are rejected.
+    pub bigboss: String,
     pub auto_trust_workspace: bool,
     /// Terminal-title behavior: `"combined"` (default) shows
     /// `{icon} name - {tool's live title}`, `"label"` shows hcom's
@@ -336,6 +342,7 @@ impl Default for HcomConfig {
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
+            bigboss: "bigboss".to_string(),
             auto_trust_workspace: true,
             title_mode: "combined".to_string(),
         }
@@ -348,6 +355,10 @@ impl HcomConfig {
         // Resolve old terminal casing (WezTerm→wezterm, Alacritty→alacritty)
         if self.terminal != "default" && self.terminal != "print" && self.terminal != "here" {
             self.terminal = normalize_terminal_case(&self.terminal);
+        }
+        // Empty coordinator name falls back to the default.
+        if self.bigboss.trim().is_empty() {
+            self.bigboss = "bigboss".to_string();
         }
     }
 
@@ -377,6 +388,16 @@ impl HcomConfig {
                     self.subagent_timeout
                 ),
             );
+        }
+
+        // Validate bigboss (already default-filled by normalize when empty).
+        if self.bigboss.chars().any(char::is_whitespace) {
+            errors.insert(
+                "bigboss".into(),
+                format!("bigboss cannot contain whitespace, got '{}'", self.bigboss),
+            );
+        } else if self.bigboss == "*" {
+            errors.insert("bigboss".into(), "bigboss cannot be '*'".into());
         }
 
         // Validate terminal
@@ -520,6 +541,7 @@ impl HcomConfig {
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
+            "bigboss" => Some(self.bigboss.clone()),
             "auto_trust_workspace" => {
                 Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
             }
@@ -573,6 +595,7 @@ impl HcomConfig {
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
+            "bigboss" => self.bigboss = value.to_string(),
             "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
             // Stored leniently; `TitleMode::from_config` maps unknown → default.
             // The CLI set path (`config_set_at_path`) validates against
@@ -691,13 +714,17 @@ impl HcomConfig {
             "codex_system_prompt",
             "auto_subscribe",
             "name_export",
+            "bigboss",
             "title_mode",
         ];
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
                 let s = val.as_string();
-                // terminal and codex_sandbox_mode: skip empty (use default)
-                if (*str_field == "terminal" || *str_field == "codex_sandbox_mode") && s.is_empty()
+                // terminal, codex_sandbox_mode and bigboss: skip empty (use default)
+                if (*str_field == "terminal"
+                    || *str_field == "codex_sandbox_mode"
+                    || *str_field == "bigboss")
+                    && s.is_empty()
                 {
                     continue;
                 }
@@ -2136,6 +2163,47 @@ mod tests {
 
         assert_eq!(config.timeout, 3600); // From file (no env override)
         assert_eq!(config.tag, "env-tag"); // Env wins over file
+    }
+
+    #[test]
+    fn bigboss_default_get_set_and_validation() {
+        let mut c = HcomConfig::default();
+        assert_eq!(c.bigboss, "bigboss");
+        assert_eq!(c.get_field("bigboss").as_deref(), Some("bigboss"));
+
+        c.set_field("bigboss", "review-luna:BOXE").unwrap();
+        assert_eq!(c.get_field("bigboss").as_deref(), Some("review-luna:BOXE"));
+        assert!(c.collect_errors().is_empty(), "tagged device name is valid");
+
+        // Empty resets to the default via normalize.
+        c.set_field("bigboss", "").unwrap();
+        assert!(c.collect_errors().is_empty());
+        assert_eq!(c.bigboss, "bigboss");
+
+        // Whitespace and "*" are rejected.
+        c.set_field("bigboss", "big boss").unwrap();
+        assert!(c.collect_errors().contains_key("bigboss"));
+        c.bigboss = "*".to_string();
+        assert!(c.collect_errors().contains_key("bigboss"));
+    }
+
+    #[test]
+    fn bigboss_env_overrides_toml_and_empty_falls_back() {
+        let mut file_config = HashMap::new();
+        file_config.insert(
+            "bigboss".to_string(),
+            TomlFieldValue::Str("file-lead".to_string()),
+        );
+        let mut env = HashMap::new();
+        env.insert("HCOM_BIGBOSS".to_string(), "env-lead".to_string());
+        let c = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        assert_eq!(c.bigboss, "env-lead");
+
+        // An empty env value is skipped so the default stands.
+        let mut env2 = HashMap::new();
+        env2.insert("HCOM_BIGBOSS".to_string(), String::new());
+        let c2 = HcomConfig::load_from_sources(&HashMap::new(), Some(&env2)).unwrap();
+        assert_eq!(c2.bigboss, "bigboss");
     }
 
     #[test]

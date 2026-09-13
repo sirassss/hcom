@@ -1,5 +1,4 @@
 use crate::tui::app::DataState;
-use crate::tui::model::{Event, Message};
 
 /// Data provider for the TUI.
 pub trait DataSource {
@@ -16,10 +15,6 @@ pub trait DataSource {
     }
     /// Set the default timeline event limit (overridden by HCOM_TUI_TIMELINE_LIMIT env).
     fn set_timeline_limit(&mut self, _limit: usize) {}
-    /// FTS search across all events.
-    fn search_timeline(&mut self, _query: &str, _limit: usize) -> (Vec<Message>, Vec<Event>) {
-        (vec![], vec![])
-    }
 }
 
 /// Create the DB-backed DataSource.

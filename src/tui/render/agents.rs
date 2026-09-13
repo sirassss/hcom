@@ -165,7 +165,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     for i in scroll..end {
         let agent = &app.data.agents[i];
         let is_cursor = app.ui.cursor == i;
-        let is_selected = app.ui.selected.contains(&agent.name);
+        let is_selected = app.ui.msg_filter.agents.contains(&agent.name);
 
         if lines.len() >= max_visible {
             break;
@@ -212,7 +212,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             .enumerate()
             .map(|(i, ragent)| {
                 let ic = matches!(ct, CursorTarget::RemoteAgent(idx) if idx == i);
-                let is = app.ui.selected.contains(&ragent.display_name());
+                let is = app.ui.msg_filter.agents.contains(&ragent.display_name());
                 vec![remote_agent_line(
                     ragent,
                     ic,
@@ -239,7 +239,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             .enumerate()
             .map(|(i, agent)| {
                 let ic = matches!(ct, CursorTarget::StoppedAgent(idx) if idx == i);
-                let is = app.ui.selected.contains(&agent.name);
+                let is = app.ui.msg_filter.agents.contains(&agent.name);
                 let mut item = vec![stopped_agent_line(
                     agent, ic, is, width, multi_tool, name_width,
                 )];
@@ -729,7 +729,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
     // Live agents
     for (i, agent) in app.data.agents.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
-        let is_selected = app.ui.selected.contains(&agent.name);
+        let is_selected = app.ui.msg_filter.agents.contains(&agent.name);
         let icon = agent_icon(agent, app.ui.tick);
         let name = agent.display_name();
         let indicator = tab_indicator_color(agent);
@@ -763,7 +763,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
         if app.ui.remote_expanded {
             for (i, ragent) in app.data.remote_agents.iter().enumerate() {
                 let is_cursor = app.ui.cursor == offset + i;
-                let is_selected = app.ui.selected.contains(&ragent.display_name());
+                let is_selected = app.ui.msg_filter.agents.contains(&ragent.display_name());
                 let icon = agent_icon(ragent, app.ui.tick);
                 let indicator = tab_indicator_color(ragent);
                 tabs.push(TabEntry {
@@ -966,8 +966,8 @@ fn compute_tab_scroll(
 
 fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, width: usize) {
     let w = width as u16;
-    let is_selected =
-        app.ui.selected.contains(&agent.name) || app.ui.selected.contains(&agent.display_name());
+    let is_selected = app.ui.msg_filter.agents.contains(&agent.name)
+        || app.ui.msg_filter.agents.contains(&agent.display_name());
 
     // Line 1: icon name · tool · age · context                 created Xm
     let icon = agent_icon(agent, app.ui.tick);

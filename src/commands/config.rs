@@ -155,6 +155,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_BIGBOSS",
+        "TUI coordinator name for the B filter shortcut (default: bigboss)",
+        "string",
+    ),
+    (
         "HCOM_TITLE_MODE",
         "Terminal title mode (combined | label | off)",
         "string",
@@ -227,6 +232,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "timeout" => Some("preferences.timeout"),
         "auto_approve" => Some("preferences.auto_approve"),
         "name_export" => Some("preferences.name_export"),
+        "bigboss" => Some("preferences.bigboss"),
         _ => None,
     }
 }
@@ -382,6 +388,15 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
         ));
     }
 
+    if field_name == "bigboss" && !value.is_empty() {
+        if value.chars().any(char::is_whitespace) {
+            return Err(format!("bigboss cannot contain whitespace. Got '{value}'"));
+        }
+        if value == "*" {
+            return Err("bigboss cannot be '*'".to_string());
+        }
+    }
+
     if let Some(dotted_path) = toml_path_for_key(&field_name) {
         set_nested_toml(&mut doc, dotted_path, value);
     } else {
@@ -450,6 +465,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_AUTO_APPROVE" => "true",
         "HCOM_AUTO_TRUST_WORKSPACE" => "true",
         "HCOM_TITLE_MODE" => "combined",
+        "HCOM_BIGBOSS" => "bigboss",
         _ => "",
     };
     (default.to_string(), "default")
@@ -2431,6 +2447,29 @@ mod tests {
             parsed["launch"]["pi"]["args"].as_str(),
             Some("--model safe-model")
         );
+    }
+
+    #[test]
+    fn bigboss_maps_to_preferences_and_rejects_bad_values() {
+        assert_eq!(normalize_key("bigboss"), "HCOM_BIGBOSS");
+        assert_eq!(toml_path_for_key("bigboss"), Some("preferences.bigboss"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Normalised CLI spelling writes preferences.bigboss.
+        config_set_at_path(&path, "HCOM_BIGBOSS", "lead-agent:CRAY").unwrap();
+        let parsed: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            parsed["preferences"]["bigboss"].as_str(),
+            Some("lead-agent:CRAY")
+        );
+
+        assert!(config_set_at_path(&path, "HCOM_BIGBOSS", "two words").is_err());
+        assert!(config_set_at_path(&path, "HCOM_BIGBOSS", "*").is_err());
+
+        // CONFIG_KEYS advertises the key so `config --info` can describe it.
+        assert!(CONFIG_KEYS.iter().any(|(k, _, _)| *k == "HCOM_BIGBOSS"));
     }
 
     #[test]

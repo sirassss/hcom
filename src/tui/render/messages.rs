@@ -1,20 +1,22 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-use crate::tui::app::App;
+use crate::tui::app::{App, DataState};
+use crate::tui::filter::{self, FeedItem};
 use crate::tui::model::*;
 use crate::tui::render::text::{fmt_agent, highlight_spans, render_body};
 use crate::tui::theme::{Theme, palette};
 
-/// Build agent name → last_event_id map for read-receipt waterline checks.
-fn build_waterlines(app: &App) -> HashMap<String, u64> {
-    app.data
-        .agents
+/// Read-receipt waterlines keyed by device-qualified display identity, so a
+/// `✓` lookup on a resolved recipient name matches local and remote agents
+/// the same way. Shared by the vertical pane and inline replay.
+pub(crate) fn build_waterlines(data: &DataState) -> HashMap<String, u64> {
+    data.agents
         .iter()
-        .chain(app.data.remote_agents.iter())
-        .filter_map(|a| a.last_event_id.map(|id| (a.name.clone(), id)))
+        .chain(data.remote_agents.iter())
+        .filter_map(|a| a.last_event_id.map(|id| (a.display_name(), id)))
         .collect()
 }
 
@@ -23,82 +25,49 @@ const DISPLAY_LIMIT: usize = 5000; // vertical mode loads up to 5000 from DB
 use super::truncate_display;
 
 pub fn render_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
-    if app.ui.show_events {
-        let agents = if app.ui.selected.is_empty() {
-            None
-        } else {
-            Some(&app.ui.selected)
-        };
-        render_events_timeline(frame, area, app, agents)
-    } else if let Some(ref cr) = app.ui.command_result {
-        render_command_output(frame, area, &cr.output, app.ui.msg_scroll)
-    } else if !app.ui.selected.is_empty() {
-        render_agent_feed(frame, area, app, &app.ui.selected)
-    } else {
-        render_all_messages(frame, area, app)
+    if let Some(ref cr) = app.ui.command_result {
+        return render_command_output(frame, area, &cr.output, app.ui.msg_scroll);
     }
-}
 
-// ── Events timeline: all events + messages merged ────────────────────
-
-fn render_events_timeline(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    agents: Option<&BTreeSet<String>>,
-) -> usize {
-    let mut items: Vec<FeedItem> = Vec::new();
-    for ev in &app.data.events {
-        if agents.is_none_or(|a| a.contains(&ev.agent)) {
-            items.push(FeedItem::Ev(ev));
-        }
-    }
-    for msg in &app.data.messages {
-        if agents.is_none_or(|a| {
-            a.contains(&msg.sender)
-                || msg.recipients.iter().any(|r| a.contains(r))
-                || (msg.recipients.is_empty() && !msg.is_system())
-        }) {
-            items.push(FeedItem::Msg(msg));
-        }
-    }
-    items.sort_by(|a, b| a.time().total_cmp(&b.time()));
-
-    // Keep only the most recent items up to the display limit
+    // One shared collect/filter path for the whole pane.
+    let mut items = filter::collect_items(&app.data, app.ui.msg_tier, &app.ui.msg_filter);
+    // Newest DISPLAY_LIMIT after filtering; counts stay uncapped.
     if items.len() > DISPLAY_LIMIT {
         items.drain(..items.len() - DISPLAY_LIMIT);
     }
 
-    // Filter by search query if present
-    let query = app.active_search_query();
-    if let Some(q) = query {
-        items.retain(|item| match item {
-            FeedItem::Ev(ev) => event_matches(ev, q),
-            FeedItem::Msg(msg) => msg_matches(msg, q),
-        });
-    }
-
     if items.is_empty() {
-        let msg = if query.is_some() {
-            "  No matches"
-        } else {
-            "  No events yet"
-        };
         let empty = vec![
             Line::raw(""),
-            Line::from(Span::styled(msg, Style::default().fg(palette::FG_DIM))),
+            Line::from(Span::styled(
+                empty_state_label(app),
+                Style::default().fg(palette::FG_DIM),
+            )),
         ];
         frame.render_widget(Paragraph::new(empty), area);
         return 0;
     }
 
+    let query = app.active_search_query();
     let resolve_name = |name: &str| app.data.resolve_display_name(name);
-    let wl = build_waterlines(app);
+    let wl = build_waterlines(&app.data);
+    let cursor_agent = cursor_agent_name(app);
+    let verbose = app.ui.msg_tier == filter::MsgTier::Verbose;
+
     let mut lines: Vec<Line> = Vec::new();
     let mut prev_group: Option<(String, String)> = None;
-    for item in &items {
-        match item {
-            FeedItem::Ev(ev) => {
+    for row in group_lifecycle(&items) {
+        match row {
+            Row::LifecycleRun { agent, time, count } => {
+                prev_group = None;
+                lines.push(lifecycle_run_line(
+                    &resolve_name(&agent),
+                    count,
+                    &format_time(time),
+                    area.width,
+                ));
+            }
+            Row::Item(FeedItem::Ev(ev)) => {
                 let time_str = format_time(ev.time);
                 let same = prev_group
                     .as_ref()
@@ -113,18 +82,26 @@ fn render_events_timeline(
                     query,
                     &resolve_name,
                 ));
-                push_sub_lines(&mut lines, ev);
+                // Tool details are one line; lifecycle sub-lines only in Verbose.
+                if verbose && matches!(ev.kind, EventKind::Activity(_)) {
+                    push_sub_lines(&mut lines, ev, query);
+                }
             }
-            FeedItem::Msg(msg) => {
+            Row::Item(FeedItem::Msg(msg)) => {
                 prev_group = None;
-                push_feed_message(
-                    &mut lines,
-                    msg,
-                    area.width as usize,
-                    query,
-                    &resolve_name,
-                    Some(&wl),
-                );
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                let mut ml = format_message(msg, area.width, query, &resolve_name, Some(&wl));
+                // Blue │ margin for messages involving the cursor agent.
+                if involves_agent(app, msg, cursor_agent.as_deref())
+                    && let Some(first) = ml.first_mut()
+                    && let Some(s0) = first.spans.first_mut()
+                {
+                    *s0 = Span::styled(" \u{2502}", Style::default().fg(palette::BLUE));
+                }
+                lines.extend(ml);
+                lines.push(Line::raw(""));
             }
         }
     }
@@ -132,21 +109,38 @@ fn render_events_timeline(
     render_scrolled(frame, area, lines, app.ui.msg_scroll)
 }
 
-// ── Shared feed rendering helpers ───────────────────────────────────
-
-enum FeedItem<'a> {
-    Ev(&'a Event),
-    Msg(&'a Message),
-}
-
-impl<'a> FeedItem<'a> {
-    fn time(&self) -> f64 {
-        match self {
-            FeedItem::Ev(e) => e.time,
-            FeedItem::Msg(m) => m.time,
-        }
+/// Empty-pane wording, matching the inline replay separator (spec §1).
+fn empty_state_label(app: &App) -> &'static str {
+    use crate::tui::filter::MsgTier;
+    if !app.ui.msg_filter.is_empty() {
+        "  No matches in recent window"
+    } else if app.ui.msg_tier == MsgTier::Compact {
+        "  No messages in recent window"
+    } else {
+        "  No activity in recent window"
     }
 }
+
+/// Name of the agent under the cursor (local base, remote display, stopped
+/// base), used only for the blue involvement margin.
+fn cursor_agent_name(app: &App) -> Option<String> {
+    match app.cursor_target() {
+        CursorTarget::Agent(idx) => Some(app.data.agents[idx].name.clone()),
+        CursorTarget::RemoteAgent(idx) => Some(app.data.remote_agents[idx].display_name()),
+        CursorTarget::StoppedAgent(idx) => Some(app.data.stopped_agents[idx].name.clone()),
+        _ => None,
+    }
+}
+
+/// Identity-resolved, like the roster filter condition (spec §4): a message
+/// addressed to `review-tomo` marks the cursor row for agent `tomo`.
+fn involves_agent(app: &App, msg: &Message, name: Option<&str>) -> bool {
+    name.is_some_and(|n| {
+        app.same_agent(&msg.sender, n) || msg.recipients.iter().any(|r| app.same_agent(r, n))
+    })
+}
+
+// ── Shared feed rendering helpers ───────────────────────────────────
 
 /// Render a single event (tool or activity) as a Line with right-aligned time.
 pub(crate) fn event_line(
@@ -191,9 +185,12 @@ pub(crate) fn event_line(
             ));
             let prefix_w: usize = spans.iter().map(|s| s.width()).sum();
             let margin = 2usize;
-            // Truncate detail to fit; time shown only if room remains
+            // Take the first detail line only, shorten a long absolute path for
+            // file tools, then clip to the columns that remain.
             let full_avail = (width as usize).saturating_sub(prefix_w + margin);
-            let detail_text = truncate_display(&ev.detail, full_avail);
+            let first_line = ev.detail.lines().next().unwrap_or("");
+            let shortened = shorten_tool_detail(&ev.tool, first_line);
+            let detail_text = truncate_display(&shortened, full_avail);
             spans.extend(highlight_spans(
                 vec![Span::styled(detail_text, Style::default().fg(palette::FG))],
                 query,
@@ -254,16 +251,114 @@ pub(crate) fn event_line(
     }
 }
 
+// ── Lifecycle run collapsing ───────────────────────────────────────
+
+/// One row of feed output: a real item, or a collapsed lifecycle run.
+pub(crate) enum Row<'a> {
+    Item(&'a FeedItem<'a>),
+    LifecycleRun {
+        agent: String,
+        time: f64,
+        count: usize,
+    },
+}
+
+/// Absolute-minute bucket for a timestamp (`floor(time / 60)`), not the
+/// repeated `HH:MM` label — two different dates with the same clock time do
+/// not merge.
+fn minute_bucket(t: f64) -> i64 {
+    (t / 60.0).floor() as i64
+}
+
+/// Collapse a run of 3+ consecutive lifecycle events sharing an owner and an
+/// absolute minute into one summary row. Runs of 1–2 stay as plain items. A
+/// message, tool event, different agent or minute breaks the run. Grouping
+/// happens after filtering/sorting and before any line-budget chunking.
+pub(crate) fn group_lifecycle<'a>(items: &'a [FeedItem<'a>]) -> Vec<Row<'a>> {
+    let is_life =
+        |it: &FeedItem| matches!(it, FeedItem::Ev(e) if matches!(e.kind, EventKind::Activity(_)));
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        if is_life(&items[i]) {
+            let FeedItem::Ev(head) = &items[i] else {
+                unreachable!()
+            };
+            let bucket = minute_bucket(head.time);
+            let mut j = i + 1;
+            while j < items.len() {
+                match &items[j] {
+                    FeedItem::Ev(e)
+                        if matches!(e.kind, EventKind::Activity(_))
+                            && e.agent == head.agent
+                            && minute_bucket(e.time) == bucket =>
+                    {
+                        j += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if j - i >= 3 {
+                rows.push(Row::LifecycleRun {
+                    agent: head.agent.clone(),
+                    time: head.time,
+                    count: j - i,
+                });
+            } else {
+                rows.extend(items[i..j].iter().map(Row::Item));
+            }
+            i = j;
+        } else {
+            rows.push(Row::Item(&items[i]));
+            i += 1;
+        }
+    }
+    rows
+}
+
+/// `agent  · N status changes ·` with a right-aligned dim time.
+pub(crate) fn lifecycle_run_line(
+    agent_display: &str,
+    count: usize,
+    time_str: &str,
+    width: u16,
+) -> Line<'static> {
+    let agent_col_w = unicode_width::UnicodeWidthStr::width(agent_display).max(4) + 1;
+    let right = format!(" {}  ", time_str);
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            fmt_agent(agent_display, agent_col_w),
+            Style::default().fg(palette::FG_DIM),
+        ),
+        Span::styled(
+            format!("\u{00b7} {} status changes \u{00b7}", count),
+            Theme::dim(),
+        ),
+    ];
+    let left_w: usize = spans.iter().map(|s| s.width()).sum();
+    let right_w = unicode_width::UnicodeWidthStr::width(right.as_str());
+    let pad = (width as usize).saturating_sub(left_w + right_w);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(right, Theme::dim()));
+    Line::from(spans)
+}
+
 /// Push sub_lines (stopped snapshot details etc.) as indented dim lines.
 /// The last sub_line starting with "hcom " is styled as an actionable command.
-fn push_sub_lines(lines: &mut Vec<Line<'static>>, ev: &Event) {
+/// Sub-lines are searchable (spec §3), so the hit is highlighted here too —
+/// the inline replay already does.
+fn push_sub_lines(lines: &mut Vec<Line<'static>>, ev: &Event, query: Option<&str>) {
     for sub in &ev.sub_lines {
         let style = if sub.starts_with("hcom ") {
             Style::default().fg(palette::CYAN)
         } else {
             Style::default().fg(palette::FG_DIM)
         };
-        lines.push(Line::from(Span::styled(format!("        {}", sub), style)));
+        lines.push(Line::from(highlight_spans(
+            vec![Span::styled(format!("        {}", sub), style)],
+            query,
+        )));
     }
 }
 
@@ -293,232 +388,6 @@ pub(crate) fn format_message(
     lines
 }
 
-/// Render a message (header + body) into a line buffer with surrounding blanks.
-fn push_feed_message(
-    lines: &mut Vec<Line<'static>>,
-    msg: &Message,
-    width: usize,
-    query: Option<&str>,
-    resolve_name: &dyn Fn(&str) -> String,
-    waterlines: Option<&HashMap<String, u64>>,
-) {
-    if !lines.is_empty() {
-        lines.push(Line::raw(""));
-    }
-    lines.extend(format_message(
-        msg,
-        width as u16,
-        query,
-        resolve_name,
-        waterlines,
-    ));
-    lines.push(Line::raw(""));
-}
-
-// ── Agent feed: merged tool events + messages ──────────────────────
-
-fn render_agent_feed(frame: &mut Frame, area: Rect, app: &App, agents: &BTreeSet<String>) -> usize {
-    let resolve_name = |name: &str| app.data.resolve_display_name(name);
-    // Collect relevant items
-    let mut items: Vec<FeedItem> = Vec::new();
-
-    for ev in &app.data.events {
-        if agents.contains(&ev.agent) {
-            items.push(FeedItem::Ev(ev));
-        }
-    }
-
-    for msg in &app.data.messages {
-        if agents.contains(&msg.sender)
-            || msg.recipients.iter().any(|r| agents.contains(r))
-            || (msg.recipients.is_empty() && !msg.is_system())
-        // broadcasts, not lifecycle noise
-        {
-            items.push(FeedItem::Msg(msg));
-        }
-    }
-
-    // Merge-sort by time. DataState vecs are pre-sorted so timsort is O(n).
-    items.sort_by(|a, b| a.time().total_cmp(&b.time()));
-
-    // Keep only the most recent items up to the display limit
-    if items.len() > DISPLAY_LIMIT {
-        items.drain(..items.len() - DISPLAY_LIMIT);
-    }
-
-    let search_query = app.active_search_query();
-
-    if let Some(query) = search_query {
-        items.retain(|item| match item {
-            FeedItem::Ev(ev) => event_matches(ev, query),
-            FeedItem::Msg(msg) => msg_matches(msg, query),
-        });
-    }
-
-    if items.is_empty() {
-        let msg = if search_query.is_some() {
-            "  No matches"
-        } else {
-            "  No activity yet"
-        };
-        let empty = vec![
-            Line::raw(""),
-            Line::from(Span::styled(msg, Style::default().fg(palette::FG_DIM))),
-        ];
-        frame.render_widget(Paragraph::new(empty), area);
-        return 0;
-    }
-
-    let show_agent_name = agents.len() > 1;
-    let wl = build_waterlines(app);
-    let mut lines: Vec<Line> = Vec::new();
-
-    let mut prev_group: Option<(String, String)> = None;
-    for item in &items {
-        match item {
-            FeedItem::Ev(ev) => {
-                let time_str = format_time(ev.time);
-                let same = prev_group
-                    .as_ref()
-                    .is_some_and(|(a, t)| a == &ev.agent && t == &time_str);
-                prev_group = Some((ev.agent.clone(), time_str.clone()));
-                lines.push(event_line(
-                    ev,
-                    &time_str,
-                    same,
-                    show_agent_name,
-                    area.width,
-                    search_query,
-                    &resolve_name,
-                ));
-                push_sub_lines(&mut lines, ev);
-            }
-            FeedItem::Msg(msg) => {
-                prev_group = None;
-                push_feed_message(
-                    &mut lines,
-                    msg,
-                    area.width as usize,
-                    search_query,
-                    &resolve_name,
-                    Some(&wl),
-                );
-            }
-        }
-    }
-
-    render_scrolled(frame, area, lines, app.ui.msg_scroll)
-}
-
-// ── All messages view ──────────────────────────────────────────────
-
-fn render_all_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
-    let resolve_name = |name: &str| app.data.resolve_display_name(name);
-
-    // Use FTS search results when available (vertical mode with active query).
-    // search_results messages are already filtered and sorted ascending.
-    let (msgs, is_fts_search): (Vec<&Message>, bool) =
-        if let Some((ref search_msgs, _)) = app.data.search_results {
-            let start = search_msgs.len().saturating_sub(DISPLAY_LIMIT);
-            (search_msgs[start..].iter().collect(), true)
-        } else {
-            let v = app
-                .data
-                .messages
-                .iter()
-                .rev()
-                .take(DISPLAY_LIMIT)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            (v, false)
-        };
-
-    if msgs.is_empty() {
-        let label = if is_fts_search {
-            "  No matches"
-        } else {
-            "  No messages yet"
-        };
-        let empty = vec![
-            Line::raw(""),
-            Line::from(Span::styled(label, Style::default().fg(palette::FG_DIM))),
-        ];
-        frame.render_widget(Paragraph::new(empty), area);
-        return 0;
-    }
-
-    // search_query drives highlight spans; filtering is skipped for FTS results.
-    let search_query = app.active_search_query();
-
-    // Selected agent name for highlighting related messages
-    let remote_name_buf: String;
-    let selected_agent = match app.cursor_target() {
-        CursorTarget::Agent(idx) => Some(app.data.agents[idx].name.as_str()),
-        CursorTarget::RemoteAgent(idx) => {
-            remote_name_buf = app.data.remote_agents[idx].display_name();
-            Some(remote_name_buf.as_str())
-        }
-        CursorTarget::StoppedAgent(idx) => Some(app.data.stopped_agents[idx].name.as_str()),
-        _ => None,
-    };
-
-    let wl = build_waterlines(app);
-    let mut lines: Vec<Line> = Vec::new();
-
-    for msg in &msgs {
-        if !is_fts_search
-            && let Some(query) = search_query
-            && !msg_matches(msg, query)
-        {
-            continue;
-        }
-
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
-
-        // Check if this message involves the selected agent
-        let involves_selected = selected_agent
-            .is_some_and(|name| msg.sender == name || msg.recipients.iter().any(|r| r == name));
-
-        // Left margin: dot marker for messages involving selected agent
-        let margin: Span = if involves_selected {
-            Span::styled(" \u{2502}", Style::default().fg(palette::BLUE))
-        } else {
-            Span::raw("  ")
-        };
-
-        // Header: sender -> recipients + time
-        let mut header_spans: Vec<Span> = vec![margin.clone()];
-        push_msg_header(
-            &mut header_spans,
-            msg,
-            search_query,
-            &resolve_name,
-            Some(&wl),
-        );
-
-        // Right-align time (with 2-space trailing margin matching left)
-        let left_width: usize = header_spans.iter().map(|s| s.width()).sum();
-        let time_str = format!(" {}  ", format_time(msg.time));
-        let time_w = Span::raw(&time_str).width();
-        let pad = (area.width as usize).saturating_sub(left_width + time_w);
-        header_spans.push(Span::raw(" ".repeat(pad)));
-        header_spans.push(Span::styled(time_str, Theme::dim()));
-
-        lines.push(Line::from(header_spans));
-
-        // Body (skip for system messages since body is in header)
-        if !msg.is_system() {
-            lines.extend(render_body(&msg.body, area.width as usize, search_query));
-        }
-    }
-
-    render_scrolled(frame, area, lines, app.ui.msg_scroll)
-}
-
 fn push_msg_header(
     spans: &mut Vec<Span<'static>>,
     msg: &Message,
@@ -544,26 +413,38 @@ fn push_msg_header(
         ));
         spans.push(Span::styled(" \u{2192} ", Theme::dim()));
 
-        if msg.recipients.is_empty() {
+        if msg.scope == MessageScope::Broadcast {
             spans.push(Span::styled("all", Theme::dim()));
+        } else if msg.recipients.is_empty() {
+            // Malformed Mentions row with no recipients — never relabel as "all".
+            spans.push(Span::styled("?", Theme::dim()));
         } else {
-            for (i, r) in msg.recipients.iter().enumerate() {
+            // First two resolved names as their own spans (each keeps its ✓ and
+            // highlight), then a `+N` for the rest.
+            let shown = msg.recipients.len().min(2);
+            for (i, r) in msg.recipients.iter().take(shown).enumerate() {
                 if i > 0 {
                     spans.push(Span::styled(", ", Theme::dim()));
                 }
+                let display = resolve_name(r);
                 spans.extend(highlight_spans(
                     vec![Span::styled(
-                        resolve_name(r),
+                        display.clone(),
                         Style::default().fg(palette::FG),
                     )],
                     query,
                 ));
-                if let Some(wl) = waterlines {
-                    let has_read = wl.get(r).is_some_and(|&w| w >= msg.event_id);
-                    if has_read {
-                        spans.push(Span::styled(" \u{2713}", Theme::delivery()));
-                    }
+                if let Some(wl) = waterlines
+                    && wl.get(&display).is_some_and(|&w| w >= msg.event_id)
+                {
+                    spans.push(Span::styled(" \u{2713}", Theme::delivery()));
                 }
+            }
+            if msg.recipients.len() > shown {
+                spans.push(Span::styled(
+                    format!(" +{}", msg.recipients.len() - shown),
+                    Theme::dim(),
+                ));
             }
         }
 
@@ -590,20 +471,33 @@ fn push_msg_header(
     }
 }
 
-fn matches_search(query: &str, text: &str) -> bool {
-    text.to_lowercase().contains(&query.to_lowercase())
-}
-
-fn msg_matches(msg: &Message, query: &str) -> bool {
-    matches_search(query, &msg.body)
-        || matches_search(query, &msg.sender)
-        || msg.recipients.iter().any(|r| matches_search(query, r))
-}
-
-fn event_matches(ev: &Event, query: &str) -> bool {
-    matches_search(query, &ev.tool)
-        || matches_search(query, &ev.detail)
-        || matches_search(query, &ev.agent)
+/// Shorten a long absolute path to `…/parent/file` for file-oriented tools.
+/// A Bash/shell command is left alone even when it starts with `/`.
+fn shorten_tool_detail(tool: &str, detail: &str) -> String {
+    const FILE_TOOLS: &[&str] = &[
+        "Read",
+        "Edit",
+        "Write",
+        "write_file",
+        "apply_patch",
+        "replace",
+        "NotebookEdit",
+    ];
+    if !FILE_TOOLS.contains(&tool)
+        || !detail.starts_with('/')
+        || detail.contains(char::is_whitespace)
+    {
+        return detail.to_string();
+    }
+    let parts: Vec<&str> = detail.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return detail.to_string();
+    }
+    format!(
+        "\u{2026}/{}/{}",
+        parts[parts.len() - 2],
+        parts[parts.len() - 1]
+    )
 }
 
 /// Resolve tool name to display color.
@@ -618,113 +512,26 @@ fn tool_color(tool: &str) -> Color {
     }
 }
 
-fn search_counts(app: &App) -> (usize, usize) {
-    let query = match app.active_search_query() {
-        Some(q) => q,
-        None => return (0, 0),
-    };
-
-    if !app.ui.selected.is_empty() {
-        let mut total = 0usize;
-        let mut matched = 0usize;
-
-        for ev in &app.data.events {
-            if app.ui.selected.contains(&ev.agent) {
-                total += 1;
-                if event_matches(ev, query) {
-                    matched += 1;
-                }
-            }
-        }
-        for msg in &app.data.messages {
-            if app.ui.selected.contains(&msg.sender)
-                || msg.recipients.iter().any(|r| app.ui.selected.contains(r))
-                || (msg.recipients.is_empty() && !msg.is_system())
-            {
-                total += 1;
-                if msg_matches(msg, query) {
-                    matched += 1;
-                }
-            }
-        }
-        (matched, total)
-    } else {
-        let total = app.data.messages.len();
-        let matched = app
-            .data
-            .messages
-            .iter()
-            .filter(|m| msg_matches(m, query))
-            .count();
-        (matched, total)
-    }
-}
-
-/// Counts for events timeline: (search_matched, total) respecting agent selection.
-/// When no search query, matched == total.
-fn events_search_counts(app: &App) -> (usize, usize) {
-    let agents = if app.ui.selected.is_empty() {
-        None
-    } else {
-        Some(&app.ui.selected)
-    };
-    let agent_ev = |e: &&Event| agents.is_none_or(|a| a.contains(&e.agent));
-    let agent_msg = |m: &&Message| {
-        agents.is_none_or(|a| {
-            a.contains(&m.sender)
-                || m.recipients.iter().any(|r| a.contains(r))
-                || (m.recipients.is_empty() && !m.is_system())
-        })
-    };
-    let total = (app.data.events.iter().filter(agent_ev).count()
-        + app.data.messages.iter().filter(agent_msg).count())
-    .min(DISPLAY_LIMIT);
-    let query = match app.active_search_query() {
-        Some(q) => q,
-        None => return (total, total),
-    };
-    let matched = app
-        .data
-        .events
-        .iter()
-        .filter(agent_ev)
-        .filter(|e| event_matches(e, query))
-        .count()
-        + app
-            .data
-            .messages
-            .iter()
-            .filter(agent_msg)
-            .filter(|m| msg_matches(m, query))
-            .count();
-    (matched.min(total), total)
-}
-
-/// Returns a short count string like "[42]" or "[3/42]" for the panel heading and inline separator.
+/// Short count string for the panel heading and inline separator. `[42]`
+/// unfiltered, `[3/42]` with any condition active; tier-relative and computed
+/// before the display cap (spec §1). Appends ` showing N` when the vertical
+/// pane's `DISPLAY_LIMIT` actually truncates the matched set.
 pub fn display_count_str(app: &App) -> String {
-    if app.ui.show_events {
-        let (matched, total) = events_search_counts(app);
-        if app.active_search_query().is_some() {
-            format!("[{}/{}]", matched, total)
-        } else {
-            format!("[{}]", total)
-        }
-    } else if !app.ui.selected.is_empty() {
-        let (matched, total) = search_counts(app);
-        if app.active_search_query().is_some() {
-            format!("[{}/{}]", matched, total)
-        } else {
-            format!("[{}]", total)
-        }
+    let (matched, total) = filter::counts(&app.data, app.ui.msg_tier, &app.ui.msg_filter);
+    let mut s = if app.ui.msg_filter.is_empty() {
+        format!("[{}]", total)
     } else {
-        let total = app.data.messages.len().min(DISPLAY_LIMIT);
-        if app.active_search_query().is_some() {
-            let (matched, _) = search_counts(app);
-            format!("[{}/{}]", matched, total)
-        } else {
-            format!("[{}]", total)
-        }
+        format!("[{}/{}]", matched, total)
+    };
+    let shown = if app.ui.msg_filter.is_empty() {
+        total
+    } else {
+        matched
+    };
+    if shown > DISPLAY_LIMIT {
+        s.push_str(&format!(" showing {}", DISPLAY_LIMIT));
     }
+    s
 }
 
 fn render_command_output(
@@ -775,4 +582,192 @@ fn render_scrolled(
     }
 
     max_scroll
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::model::{ActivityKind, MessageScope, SenderKind};
+
+    fn mk_msg(recipients: &[&str], scope: MessageScope) -> Message {
+        Message {
+            event_id: 1,
+            sender: "bono".into(),
+            recipients: recipients.iter().map(|s| s.to_string()).collect(),
+            body: "hi".into(),
+            time: 0.0,
+            delivered: vec![],
+            scope,
+            sender_kind: SenderKind::Instance,
+            intent: None,
+            reply_to: None,
+            thread: None,
+            delivery_known: false,
+        }
+    }
+
+    fn header_text(msg: &Message) -> String {
+        let id = |s: &str| s.to_string();
+        let lines = format_message(msg, 80, None, &id, None);
+        lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn broadcast_header_says_all_and_empty_mentions_says_unknown() {
+        assert!(header_text(&mk_msg(&[], MessageScope::Broadcast)).contains("→ all"));
+        // Malformed Mentions row with no recipients must not be relabelled "all".
+        let h = header_text(&mk_msg(&[], MessageScope::Mentions));
+        assert!(h.contains("→ ?"), "got {h:?}");
+        assert!(!h.contains("all"));
+    }
+
+    #[test]
+    fn header_shows_first_two_recipients_then_plus_n() {
+        let h = header_text(&mk_msg(
+            &["ligo", "hana", "sumo", "kai"],
+            MessageScope::Mentions,
+        ));
+        assert!(h.contains("ligo"));
+        assert!(h.contains("hana"));
+        assert!(h.contains("+2"), "got {h:?}");
+        assert!(!h.contains("sumo"));
+    }
+
+    // Regression: the blue involvement margin compared raw strings, so a message
+    // addressed to `review-tomo` did not mark the cursor row for agent `tomo` —
+    // while the roster filter condition (same identity rules) did match it.
+    #[test]
+    fn blue_margin_follows_resolved_identity() {
+        let mut app = App::new();
+        let mut agent = crate::tui::test_helpers::make_test_agent("tomo", 5.0);
+        agent.tag = "review".into();
+        app.data.agents = vec![agent];
+
+        let tagged = mk_msg(&["review-tomo"], MessageScope::Mentions);
+        assert!(
+            involves_agent(&app, &tagged, Some("tomo")),
+            "tag-qualified recipient must mark its agent"
+        );
+
+        let mut from_agent = mk_msg(&["ligo"], MessageScope::Mentions);
+        from_agent.sender = "review-tomo".into();
+        assert!(involves_agent(&app, &from_agent, Some("tomo")));
+
+        let other = mk_msg(&["ligo"], MessageScope::Mentions);
+        assert!(!involves_agent(&app, &other, Some("tomo")));
+    }
+
+    fn life(id: u64, t: f64, agent: &str) -> Event {
+        Event {
+            row_id: id,
+            agent: agent.into(),
+            time: t,
+            kind: EventKind::Activity(ActivityKind::StateChange),
+            tool: String::new(),
+            detail: "x".into(),
+            sub_lines: vec![],
+        }
+    }
+
+    fn tool(id: u64, t: f64) -> Event {
+        Event {
+            row_id: id,
+            agent: "a".into(),
+            time: t,
+            kind: EventKind::Tool,
+            tool: "Bash".into(),
+            detail: "ls".into(),
+            sub_lines: vec![],
+        }
+    }
+
+    #[test]
+    fn group_lifecycle_collapses_three_and_keeps_two() {
+        let evs = [life(1, 0.0, "a"), life(2, 5.0, "a"), life(3, 10.0, "a")];
+        let items: Vec<FeedItem> = evs.iter().map(FeedItem::Ev).collect();
+        let rows = group_lifecycle(&items);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], Row::LifecycleRun { count: 3, .. }));
+
+        let two = [life(1, 0.0, "a"), life(2, 5.0, "a")];
+        let items: Vec<FeedItem> = two.iter().map(FeedItem::Ev).collect();
+        assert_eq!(group_lifecycle(&items).len(), 2);
+        assert!(
+            group_lifecycle(&items)
+                .iter()
+                .all(|r| matches!(r, Row::Item(_)))
+        );
+    }
+
+    #[test]
+    fn group_lifecycle_breaks_on_tool_agent_and_minute() {
+        // tool event in the middle breaks the run into 2 + 1
+        let evs = [
+            life(1, 0.0, "a"),
+            life(2, 5.0, "a"),
+            tool(3, 7.0),
+            life(4, 8.0, "a"),
+        ];
+        let items: Vec<FeedItem> = evs.iter().map(FeedItem::Ev).collect();
+        assert!(
+            group_lifecycle(&items)
+                .iter()
+                .all(|r| matches!(r, Row::Item(_)))
+        );
+
+        // different agent breaks
+        let evs = [life(1, 0.0, "a"), life(2, 5.0, "b"), life(3, 10.0, "a")];
+        let items: Vec<FeedItem> = evs.iter().map(FeedItem::Ev).collect();
+        assert!(
+            group_lifecycle(&items)
+                .iter()
+                .all(|r| matches!(r, Row::Item(_)))
+        );
+
+        // crossing a minute boundary breaks (same HH:MM label irrelevant)
+        let evs = [life(1, 55.0, "a"), life(2, 58.0, "a"), life(3, 61.0, "a")];
+        let items: Vec<FeedItem> = evs.iter().map(FeedItem::Ev).collect();
+        assert!(
+            group_lifecycle(&items)
+                .iter()
+                .all(|r| matches!(r, Row::Item(_)))
+        );
+    }
+
+    #[test]
+    fn shorten_tool_detail_only_touches_file_tool_paths() {
+        assert_eq!(
+            shorten_tool_detail("Edit", "/home/alam/workspaces/hcom/src/tui/db.rs"),
+            "\u{2026}/tui/db.rs"
+        );
+        // Bash command starting with '/' is left intact.
+        assert_eq!(
+            shorten_tool_detail("Bash", "/usr/bin/env python -m pytest"),
+            "/usr/bin/env python -m pytest"
+        );
+        // Short path unchanged.
+        assert_eq!(shorten_tool_detail("Read", "/etc/hosts"), "/etc/hosts");
+        // Relative path unchanged.
+        assert_eq!(
+            shorten_tool_detail("Read", "src/tui/db.rs"),
+            "src/tui/db.rs"
+        );
+    }
+
+    #[test]
+    fn lifecycle_run_line_fits_width() {
+        let l = lifecycle_run_line("agent", 4, "23:01", 40);
+        let w: usize = l.spans.iter().map(|s| s.width()).sum();
+        assert!(w <= 40, "run line width {w} exceeds 40");
+        let text: String = l
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("4 status changes"));
+    }
 }

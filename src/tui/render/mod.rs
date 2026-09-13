@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{App, Confirm, ConfirmAction};
-use crate::tui::inline::eject::filtered_counts;
+use crate::tui::filter;
 use crate::tui::model::*;
 use crate::tui::theme::{Theme, palette};
 
@@ -746,31 +746,25 @@ fn render_empty(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_messages_heading(frame: &mut Frame, area: Rect, app: &App) {
-    let selected_names = || {
-        app.ui
-            .selected
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let label = if app.ui.show_events && !app.ui.selected.is_empty() {
-        format!("events: {}", selected_names())
-    } else if app.ui.show_events {
-        "events".to_string()
-    } else if !app.ui.selected.is_empty() {
-        selected_names()
-    } else {
-        "messages".to_string()
-    };
-
+    let f = &app.ui.msg_filter;
     let count_str = messages::display_count_str(app);
 
-    let has_filter = !app.ui.selected.is_empty() || app.ui.search_filter.is_some();
-    let label_style = if has_filter {
-        Style::default().fg(palette::BLUE)
+    // Chips: tier, then identity-resolved conditions. Reserve room for the
+    // count before clipping the chip run so it never falls off the edge.
+    let chips = f.describe_with(&|n| app.data.resolve_display_name(n));
+    let label = if chips.is_empty() {
+        format!("messages \u{00b7} {}", app.ui.msg_tier.as_str())
     } else {
+        format!("{} \u{00b7} {}", app.ui.msg_tier.as_str(), chips)
+    };
+    let count_w = UnicodeWidthStr::width(count_str.as_str()) + 2;
+    let avail = (area.width as usize).saturating_sub(2 + count_w);
+    let label = truncate_display(&label, avail);
+
+    let label_style = if f.is_empty() {
         Theme::dim()
+    } else {
+        Style::default().fg(palette::BLUE)
     };
 
     let spans = vec![
@@ -801,57 +795,37 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut left = vec![Span::raw("  "), Span::styled("hcom", Theme::title())];
 
-    // Filter/count info next to title
+    // Shared scope/count contract for both viewports (spec §1). `total` counts
+    // tier-admitted loaded rows; `matched` also applies the filter. Chips carry
+    // identity-resolved agent names.
     let dim_info = Style::default().fg(palette::FG_DARK);
-    if app.ui.view_mode == ViewMode::Inline {
-        let has_agent_filter = app.ui.eject_filter.is_some();
-        let has_text_filter = app.ui.search_filter.is_some();
-        let (ev_count, msg_count) =
-            filtered_counts(&app.data, &app.ui.eject_filter, &app.ui.search_filter);
-        let matched = ev_count + msg_count;
-        let loaded = app.data.events.len() + app.data.messages.len();
-
+    let count = {
+        let f = &app.ui.msg_filter;
+        let (matched, total) = filter::counts(&app.data, app.ui.msg_tier, f);
+        let scope = format!(
+            "recent (limit {}) \u{00b7} {}",
+            app.data.timeline_limit,
+            app.ui.msg_tier.as_str()
+        );
         left.push(Span::raw("  "));
-        if has_text_filter {
-            // FTS search: searched entire DB
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(ref ef) = app.ui.eject_filter {
-                parts.push(ef.iter().cloned().collect::<Vec<_>>().join(", "));
-            }
-            if let Some(ref sf) = app.ui.search_filter {
-                parts.push(format!("/{}", sf));
-            }
-            parts.push(format!("{} found", matched));
+        if f.is_empty() {
+            left.push(Span::styled(scope, dim_info));
+            Span::styled(format!(" [{}]", total), dim_info)
+        } else {
             left.push(Span::styled(
-                format!("[{}]", parts.join(" \u{00b7} ")),
-                Style::default().fg(palette::YELLOW),
-            ));
-        } else if has_agent_filter {
-            // Agent filter: X matching out of loaded
-            let names = app
-                .ui
-                .eject_filter
-                .as_ref()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            left.push(Span::styled(
-                format!("[{} \u{00b7} {}/{}]", names, matched, loaded),
+                format!(
+                    "{} \u{00b7} {}",
+                    scope,
+                    f.describe_with(&|n| app.data.resolve_display_name(n)),
+                ),
                 Style::default().fg(palette::BLUE),
             ));
-        } else {
-            left.push(Span::styled(format!("[last {}]", loaded), dim_info));
+            Span::styled(
+                format!(" [{}/{}]", matched, total),
+                Style::default().fg(palette::BLUE),
+            )
         }
-    } else if let Some(ref filter) = app.ui.search_filter {
-        // Vertical mode: show search filter
-        left.push(Span::raw("  "));
-        left.push(Span::styled(
-            format!("/{}", filter),
-            Style::default().fg(palette::CYAN),
-        ));
-    }
+    };
 
     let mut right: Vec<Span> = Vec::new();
 
@@ -932,8 +906,16 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let left_width: usize = left.iter().map(|s| s.width()).sum();
+    // Preserve the count and status indicators before spending columns on
+    // filter chips. Long queries must not push these off the right edge.
+    let right = fit_spans(right, (area.width as usize).saturating_sub(count.width()));
     let right_width: usize = right.iter().map(|s| s.width()).sum();
+    let mut left = fit_spans(
+        left,
+        (area.width as usize).saturating_sub(count.width() + right_width),
+    );
+    left.push(count);
+    let left_width: usize = left.iter().map(|s| s.width()).sum();
     let pad = (area.width as usize).saturating_sub(left_width + right_width);
 
     let mut spans = left;
@@ -943,9 +925,9 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Whether any filter (selection, agent filter, search) is active.
+/// Whether any filter condition (tokens, free text, or roster selection) is active.
 fn has_active_filter(app: &App) -> bool {
-    !app.ui.selected.is_empty() || app.ui.eject_filter.is_some() || app.ui.search_filter.is_some()
+    !app.ui.msg_filter.is_empty()
 }
 
 /// Separator style: brighter when a filter is active to visually frame the filtered state.
@@ -1173,10 +1155,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                     let dash = Span::styled("  \u{2014}  ", Style::default().fg(palette::FG_DARK));
                     let mut spans = vec![Span::raw("  ")];
 
-                    // State prefix: selected count or search filter
-                    if !app.ui.selected.is_empty() {
+                    // State prefix: selected count or active filter
+                    if !app.ui.msg_filter.agents.is_empty() {
                         spans.push(Span::styled(
-                            format!("{} selected", app.ui.selected.len()),
+                            format!("{} selected", app.ui.msg_filter.agents.len()),
                             Style::default()
                                 .fg(palette::FG_MID)
                                 .add_modifier(Modifier::BOLD),
@@ -1185,9 +1167,9 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                         spans.push(Span::styled("esc", hk_bold));
                         spans.push(Span::styled(" clear", hl_bold));
                         spans.push(dash);
-                    } else if app.ui.search_filter.is_some() {
+                    } else if app.ui.msg_filter.has_query() {
                         spans.push(Span::styled("esc", hk_bold));
-                        spans.push(Span::styled(" clear search", hl_bold));
+                        spans.push(Span::styled(" clear filter", hl_bold));
                         spans.push(dash);
                     }
 
@@ -1216,7 +1198,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                     ]);
 
                     // Launch hint only when no selection active
-                    if app.ui.selected.is_empty() {
+                    if app.ui.msg_filter.agents.is_empty() {
                         spans.extend([gap, Span::styled("tab", hk), Span::styled(" launch", hl)]);
                     }
 
@@ -1438,6 +1420,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 // Hints are in the input bar
                 vec![
                     Span::raw("  "),
+                    Span::styled("v", key),
+                    Span::styled(format!(" tier:{} ", app.ui.msg_tier.as_str()), lbl),
+                    Span::styled("\u{00b7} ", dot),
                     Span::styled("?", key),
                     Span::styled(" help ", lbl),
                     Span::styled("\u{00b7} ", dot),
@@ -1752,12 +1737,41 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
             key("\u{2191}\u{2193} / \u{2190}\u{2192}"),
             desc("move cursor"),
         ]),
-        Line::from(vec![key("enter/space"), desc("select + filter scrollback")]),
-        Line::from(vec![key("a"), desc("select all")]),
+        Line::from(vec![
+            key("enter/space"),
+            desc("filter by agent (keeps detail)"),
+        ]),
+        Line::from(vec![key("a"), desc("filter by all agents")]),
         Line::from(vec![key("b"), desc("broadcast to all")]),
         Line::from(vec![key("ctrl+r"), desc("relay settings")]),
         Line::from(vec![key("ctrl+s"), desc("all stopped agents")]),
         Line::from(vec![key("ctrl+d"), desc("quit")]),
+        Line::raw(""),
+        section("Detail & filter"),
+        Line::from(vec![key("v"), desc("detail: compact / normal / verbose")]),
+        Line::from(vec![
+            key("/"),
+            desc("filter: text + tag: thread: to: from:"),
+        ]),
+        Line::from(vec![
+            key("B"),
+            desc("toggle to:<bigboss> coordinator filter"),
+        ]),
+        Line::from(vec![
+            key("esc"),
+            desc("clear: text \u{2192} tokens \u{2192} agents"),
+        ]),
+        Line::raw(""),
+        section("Notes"),
+        Line::from(desc("  / searches the recent window only")),
+        Line::from(desc("  (limit 200 inline / 5000 vertical,")),
+        Line::from(desc("   or HCOM_TUI_TIMELINE_LIMIT).")),
+        Line::from(desc("  Search: enter commits, esc keeps the filter.")),
+        Line::from(desc("  Agent selection is still the target for")),
+        Line::from(desc("  m / t / k / r actions.")),
+        Line::from(desc("  Inline replay is append-only \u{2014} a filter")),
+        Line::from(desc("  change adds a labelled block, old")),
+        Line::from(desc("  scrollback stays.")),
         Line::raw(""),
         section("Compose"),
         Line::from(vec![key("enter"), desc("send message")]),
@@ -1767,7 +1781,7 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
 
     let total = help_lines.len() as u16;
     // Size popup to content (+ 2 for border), clamped to terminal
-    let w = 44u16.min(area.width.saturating_sub(4));
+    let w = 52u16.min(area.width.saturating_sub(4));
     let h = (total + 2).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;

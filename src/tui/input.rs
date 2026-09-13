@@ -364,39 +364,36 @@ impl App {
                 self.ui.msg_scroll = self.ui.msg_scroll.saturating_sub(5);
             }
 
-            // SELECTION — in inline mode, auto-apply as scrollback filter
+            // DETAIL TIER
+            KeyCode::Char('v') => {
+                self.ui.msg_tier = self.ui.msg_tier.next();
+                self.ui.msg_scroll = 0;
+                self.ui.trigger_inline_replay();
+            }
+
+            // SELECTION — folds into msg_filter.agents; a set change replays
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.toggle_select_at_cursor();
-                if self.ui.view_mode == ViewMode::Inline {
-                    if self.ui.selected.is_empty() {
-                        if self.ui.eject_filter.is_some() {
-                            self.ui.eject_filter = None;
-                            self.ui.trigger_inline_replay();
-                        }
-                    } else {
-                        self.ui.eject_filter = Some(self.ui.selected.clone());
-                        self.ui.trigger_inline_replay();
-                    }
+                if self.toggle_select_at_cursor() {
+                    self.ui.msg_scroll = 0;
+                    self.ui.trigger_inline_replay();
                 }
             }
             KeyCode::Char('a') => {
+                let before = self.ui.msg_filter.agents.len();
                 for agent in &self.data.agents {
-                    self.ui.selected.insert(agent.name.clone());
+                    self.ui.msg_filter.agents.insert(agent.name.clone());
                 }
-                self.ui.msg_scroll = 0;
+                if self.ui.msg_filter.agents.len() != before {
+                    self.ui.msg_scroll = 0;
+                    self.ui.trigger_inline_replay();
+                }
             }
             KeyCode::Esc => {
-                // Cascade: overlay → search filter → selection + eject filter
+                // Cascade: overlay → free text → structured tokens → roster.
                 if self.ui.overlay.is_some() {
                     // Shouldn't reach here (overlay handles its own Esc) but be safe
                     self.cancel_overlay();
-                } else if self.ui.search_filter.is_some() {
-                    self.ui.search_filter = None;
-                    self.ui.msg_scroll = 0;
-                    self.ui.trigger_inline_replay();
-                } else if !self.ui.selected.is_empty() || self.ui.eject_filter.is_some() {
-                    self.ui.selected.clear();
-                    self.ui.eject_filter = None;
+                } else if self.clear_filter_stage() {
                     self.ui.msg_scroll = 0;
                     self.ui.trigger_inline_replay();
                 }
@@ -463,8 +460,8 @@ impl App {
                 self.ui.mode = InputMode::Compose;
                 self.ui.input.clear();
                 self.ui.input_cursor = 0;
-                if !self.ui.selected.is_empty() {
-                    for name in self.ui.selected.iter() {
+                if !self.ui.msg_filter.agents.is_empty() {
+                    for name in self.ui.msg_filter.agents.iter() {
                         self.ui.input.push_str(&format!("@{} ", name));
                     }
                 } else if let Some(name) = self.cursor_display_name() {
@@ -478,10 +475,29 @@ impl App {
                 self.ui.input.clear();
                 self.ui.input_cursor = 0;
             }
+            KeyCode::Char('B') => {
+                // Toggle `to:<coordinator>`: drop it when the current `to:`
+                // already names the coordinator (shared identity rules),
+                // otherwise set/replace it. Other conditions survive.
+                let coord = self.bigboss.clone();
+                let already = self
+                    .ui
+                    .msg_filter
+                    .to
+                    .as_deref()
+                    .is_some_and(|t| self.same_agent(t, &coord));
+                self.ui.msg_filter.to = if already { None } else { Some(coord) };
+                self.ui.msg_scroll = 0;
+                self.ui.trigger_inline_replay();
+            }
 
             // OVERLAYS
             KeyCode::Char('/') => {
-                self.ui.overlay = Some(Overlay::new(OverlayKind::Search));
+                // Prefill with the committed query; edits are a draft until Enter.
+                let mut ov = Overlay::new(OverlayKind::Search);
+                ov.input = self.ui.msg_filter.to_query();
+                ov.cursor = ov.input.len();
+                self.ui.overlay = Some(ov);
                 self.ui.msg_scroll = 0;
             }
             KeyCode::Char('!') => {
@@ -508,38 +524,25 @@ impl App {
         }
     }
 
-    /// Toggle selection on the current cursor target.
-    fn toggle_select_at_cursor(&mut self) {
-        match self.cursor_target() {
-            CursorTarget::Agent(idx) => {
-                let name = self.data.agents[idx].name.clone();
-                if !self.ui.selected.remove(&name) {
-                    self.ui.selected.insert(name);
-                }
-                self.ui.msg_scroll = 0;
-            }
+    /// Act on the current cursor target: agent rows toggle the roster filter,
+    /// group headers expand/collapse, an orphan row opens its chooser. Returns
+    /// `true` only when the `msg_filter.agents` set actually changed.
+    fn toggle_select_at_cursor(&mut self) -> bool {
+        let name = match self.cursor_target() {
+            CursorTarget::Agent(idx) => self.data.agents[idx].name.clone(),
+            CursorTarget::RemoteAgent(idx) => self.data.remote_agents[idx].display_name(),
+            CursorTarget::StoppedAgent(idx) => self.data.stopped_agents[idx].name.clone(),
             CursorTarget::RemoteHeader => {
                 self.ui.remote_expanded = !self.ui.remote_expanded;
-            }
-            CursorTarget::RemoteAgent(idx) => {
-                let name = self.data.remote_agents[idx].display_name();
-                if !self.ui.selected.remove(&name) {
-                    self.ui.selected.insert(name);
-                }
-                self.ui.msg_scroll = 0;
+                return false;
             }
             CursorTarget::StoppedHeader => {
                 self.ui.stopped_expanded = !self.ui.stopped_expanded;
-            }
-            CursorTarget::StoppedAgent(idx) => {
-                let name = self.data.stopped_agents[idx].name.clone();
-                if !self.ui.selected.remove(&name) {
-                    self.ui.selected.insert(name);
-                }
-                self.ui.msg_scroll = 0;
+                return false;
             }
             CursorTarget::OrphanHeader => {
                 self.ui.orphans_expanded = !self.ui.orphans_expanded;
+                return false;
             }
             CursorTarget::Orphan(idx) => {
                 let pid = self.data.orphans[idx].pid;
@@ -548,8 +551,36 @@ impl App {
                     ConfirmAction::OrphanAction(pid),
                     true, // default to Recover (right)
                 ));
+                return false;
             }
-            CursorTarget::None => {}
+            CursorTarget::None => return false,
+        };
+        if !self.ui.msg_filter.agents.remove(&name) {
+            self.ui.msg_filter.agents.insert(name);
+        }
+        self.ui.msg_scroll = 0;
+        true
+    }
+
+    /// Clear the first non-empty filter stage (free text → structured tokens →
+    /// roster selection), skipping empty stages. Returns whether anything
+    /// changed. The tier is never touched.
+    fn clear_filter_stage(&mut self) -> bool {
+        let f = &mut self.ui.msg_filter;
+        if !f.text.is_empty() {
+            f.text.clear();
+            true
+        } else if f.has_tokens() {
+            f.tag = None;
+            f.thread = None;
+            f.to = None;
+            f.from = None;
+            true
+        } else if !f.agents.is_empty() {
+            f.agents.clear();
+            true
+        } else {
+            false
         }
     }
 
@@ -565,10 +596,12 @@ impl App {
 
     /// Resolve selectable target names by action capability.
     fn resolve_action_targets(&self, can_apply: impl Fn(&Agent) -> bool) -> Vec<String> {
-        if !self.ui.selected.is_empty() {
+        if !self.ui.msg_filter.agents.is_empty() {
             return self
                 .all_agents()
-                .filter(|agent| can_apply(agent) && self.ui.selected.contains(&agent.action_name()))
+                .filter(|agent| {
+                    can_apply(agent) && self.ui.msg_filter.agents.contains(&agent.action_name())
+                })
                 .map(Agent::action_name)
                 .collect();
         }
@@ -617,7 +650,7 @@ impl App {
     }
 
     pub(crate) fn cursor_action_availability(&self) -> ActionAvailability {
-        if !self.ui.selected.is_empty() {
+        if !self.ui.msg_filter.agents.is_empty() {
             return ActionAvailability {
                 kill: !self.resolve_kill_targets().is_empty(),
                 fork: !self.resolve_fork_targets().is_empty(),
@@ -757,11 +790,10 @@ impl App {
 
         match overlay.kind {
             OverlayKind::Search => {
-                self.ui.search_filter = if overlay.input.is_empty() {
-                    None
-                } else {
-                    Some(overlay.input)
-                };
+                // Parse + commit; the roster selection survives a re-parse.
+                let agents = std::mem::take(&mut self.ui.msg_filter.agents);
+                self.ui.msg_filter = crate::tui::filter::MsgFilter::parse(&overlay.input);
+                self.ui.msg_filter.agents = agents;
                 self.ui.msg_scroll = 0;
                 self.ui.trigger_inline_replay();
             }
@@ -822,19 +854,10 @@ impl App {
     }
 
     fn cancel_overlay(&mut self) {
-        let overlay = match self.ui.overlay.take() {
-            Some(o) => o,
-            None => return,
-        };
-
-        if overlay.kind == OverlayKind::Search {
-            let had_search = self.ui.search_filter.is_some();
-            self.ui.search_filter = None;
-            self.ui.msg_scroll = 0;
-            if had_search {
-                self.ui.trigger_inline_replay();
-            }
-        }
+        // Search: the draft is discarded and the committed filter is left
+        // untouched — an intentional change from the old cancel-clears
+        // behaviour. Other overlays have nothing to roll back.
+        self.ui.overlay = None;
     }
 
     // ── Command palette suggestions ─────────────────────────────
@@ -844,9 +867,9 @@ impl App {
 
         // Collect targeted agent action names: selected agents, or cursor agent if none selected.
         let mut targeted: Vec<&Agent> = Vec::new();
-        if !self.ui.selected.is_empty() {
+        if !self.ui.msg_filter.agents.is_empty() {
             for agent in self.all_agents() {
-                if self.ui.selected.contains(&agent.action_name()) {
+                if self.ui.msg_filter.agents.contains(&agent.action_name()) {
                     targeted.push(agent);
                 }
             }
@@ -1309,11 +1332,11 @@ mod tests {
         app.data.orphans.clear();
         app.ui.mode = InputMode::Navigate;
         app.ui.overlay = None;
-        app.ui.search_filter = None;
+        app.ui.msg_filter = crate::tui::filter::MsgFilter::default();
+        app.ui.msg_tier = crate::tui::filter::MsgTier::default();
         app.ui.input.clear();
         app.ui.input_cursor = 0;
         app.ui.cursor = 0;
-        app.ui.selected.clear();
         app
     }
 
@@ -1326,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn search_overlay_enter_sets_filter_and_inline_replay_flags() {
+    fn search_overlay_enter_commits_parsed_filter_and_replay_flags() {
         let mut app = test_app();
         key(&mut app, KeyCode::Char('/'));
         key(&mut app, KeyCode::Char('n'));
@@ -1335,25 +1358,137 @@ mod tests {
 
         assert_eq!(app.ui.mode, InputMode::Navigate);
         assert!(app.ui.overlay.is_none());
-        assert_eq!(app.ui.search_filter.as_deref(), Some("no"));
+        assert_eq!(app.ui.msg_filter.text, "no");
         assert!(app.ui.inline_filter_changed);
-        // needs_clear_replay is false — search commit uses needs_resize instead
         assert!(!app.ui.needs_clear_replay);
+        assert!(!app.ui.needs_resize, "filter replay must preserve scrollback");
     }
 
     #[test]
-    fn search_overlay_escape_clears_existing_filter() {
+    fn search_overlay_prefills_committed_query_and_preserves_agents_on_commit() {
         let mut app = test_app();
-        app.ui.search_filter = Some("old".into());
+        app.ui.msg_filter = crate::tui::filter::MsgFilter::parse("from:ligo hi");
+        app.ui.msg_filter.agents.insert("nova".into());
 
         key(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.ui.overlay.as_ref().unwrap().input, "from:ligo hi");
+
+        // Commit unchanged: structured field + text survive, and so does the
+        // roster selection that was never in the overlay string.
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.msg_filter.from.as_deref(), Some("ligo"));
+        assert_eq!(app.ui.msg_filter.text, "hi");
+        assert!(app.ui.msg_filter.agents.contains("nova"));
+    }
+
+    #[test]
+    fn search_overlay_escape_keeps_committed_filter() {
+        let mut app = test_app();
+        app.ui.msg_filter = crate::tui::filter::MsgFilter::parse("keep me");
+
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Char('x')); // draft edit
         key(&mut app, KeyCode::Esc);
 
+        // Draft discarded; the committed filter is untouched (changed semantics).
         assert!(app.ui.overlay.is_none());
-        assert!(app.ui.search_filter.is_none());
-        assert!(app.ui.inline_filter_changed);
-        // needs_clear_replay is false — search cancel uses needs_resize instead
-        assert!(!app.ui.needs_clear_replay);
+        assert_eq!(app.ui.msg_filter.text, "keep me");
+    }
+
+    #[test]
+    fn v_cycles_detail_tier_and_flags_replay() {
+        use crate::tui::filter::MsgTier;
+        let mut app = test_app();
+        assert_eq!(app.ui.msg_tier, MsgTier::Compact);
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.ui.msg_tier, MsgTier::Normal);
+        assert!(app.ui.inline_filter_changed || app.ui.view_mode != ViewMode::Inline);
+        assert!(!app.ui.needs_resize, "tier replay must preserve scrollback");
+        key(&mut app, KeyCode::Char('v'));
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.ui.msg_tier, MsgTier::Compact);
+    }
+
+    #[test]
+    fn esc_cascade_clears_text_then_tokens_then_agents_without_touching_tier() {
+        use crate::tui::filter::MsgTier;
+        let mut app = test_app();
+        app.ui.msg_tier = MsgTier::Verbose;
+        app.ui.msg_filter = crate::tui::filter::MsgFilter::parse("tag:review free text");
+        app.ui.msg_filter.agents.insert("nova".into());
+
+        key(&mut app, KeyCode::Esc); // stage 1: free text
+        assert_eq!(app.ui.msg_filter.text, "");
+        assert_eq!(app.ui.msg_filter.tag.as_deref(), Some("review"));
+
+        key(&mut app, KeyCode::Esc); // stage 2: structured tokens
+        assert_eq!(app.ui.msg_filter.tag, None);
+        assert!(app.ui.msg_filter.agents.contains("nova"));
+
+        key(&mut app, KeyCode::Esc); // stage 3: roster selection
+        assert!(app.ui.msg_filter.agents.is_empty());
+
+        assert_eq!(app.ui.msg_tier, MsgTier::Verbose); // never cleared
+    }
+
+    #[test]
+    fn a_adds_all_local_agents_to_the_filter() {
+        let mut app = test_app();
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.ui.msg_filter.agents.contains("nova"));
+        assert!(app.ui.msg_filter.agents.contains("luna"));
+    }
+
+    #[test]
+    fn shift_b_toggles_the_coordinator_and_preserves_other_conditions() {
+        let mut app = test_app();
+        app.bigboss = "bigboss".into();
+        app.ui.msg_filter =
+            crate::tui::filter::MsgFilter::parse("tag:review thread:t from:ligo hi");
+        app.ui.msg_filter.agents.insert("nova".into());
+
+        key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.ui.msg_filter.to.as_deref(), Some("bigboss"));
+        // other conditions untouched
+        assert_eq!(app.ui.msg_filter.tag.as_deref(), Some("review"));
+        assert_eq!(app.ui.msg_filter.thread.as_deref(), Some("t"));
+        assert_eq!(app.ui.msg_filter.from.as_deref(), Some("ligo"));
+        assert_eq!(app.ui.msg_filter.text, "hi");
+        assert!(app.ui.msg_filter.agents.contains("nova"));
+
+        // second press removes it (identifies the same coordinator)
+        key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.ui.msg_filter.to, None);
+    }
+
+    #[test]
+    fn shift_b_replaces_a_different_to_target() {
+        let mut app = test_app();
+        app.bigboss = "chief".into();
+        app.ui.msg_filter.to = Some("someone-else".into());
+
+        key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.ui.msg_filter.to.as_deref(), Some("chief"));
+    }
+
+    #[test]
+    fn shift_b_is_literal_in_compose_and_search() {
+        let mut app = test_app();
+        app.bigboss = "chief".into();
+
+        // Compose: 'B' is text, no filter change.
+        key(&mut app, KeyCode::Char('m'));
+        key(&mut app, KeyCode::Char('B'));
+        assert!(app.ui.input.contains('B'));
+        assert_eq!(app.ui.msg_filter.to, None);
+
+        // Search overlay: 'B' edits the draft, no commit.
+        let mut app = test_app();
+        app.bigboss = "chief".into();
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.ui.overlay.as_ref().unwrap().input, "B");
+        assert_eq!(app.ui.msg_filter.to, None);
     }
 
     #[test]
@@ -1382,8 +1517,8 @@ mod tests {
     #[test]
     fn message_key_prefills_mentions_for_selected_agents() {
         let mut app = test_app();
-        app.ui.selected.insert("luna".into());
-        app.ui.selected.insert("nova".into());
+        app.ui.msg_filter.agents.insert("luna".into());
+        app.ui.msg_filter.agents.insert("nova".into());
 
         key(&mut app, KeyCode::Char('m'));
 
@@ -1490,7 +1625,7 @@ mod tests {
         let mut remote = make_agent("nova");
         remote.device_name = Some("BOXE".into());
         app.data.remote_agents = vec![remote];
-        app.ui.selected.insert("nova".into());
+        app.ui.msg_filter.agents.insert("nova".into());
 
         assert_eq!(app.resolve_kill_targets(), vec!["nova"]);
         assert_eq!(app.resolve_tag_targets(), vec!["nova"]);

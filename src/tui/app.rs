@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::io::Stdout;
 use std::time::Duration;
 
@@ -9,6 +8,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::tui::data::{self, DataSource};
+use crate::tui::filter::{MsgFilter, MsgTier};
 use crate::tui::inline::eject::Ejector;
 use crate::tui::model::*;
 use crate::tui::render;
@@ -21,6 +21,9 @@ pub struct App {
     pub ejector: Ejector,
     pub(crate) source: Box<dyn DataSource>,
     pub(crate) rpc_client: Option<RpcClient>,
+    /// Coordinator name for the `B` filter shortcut. Loaded once from
+    /// `HcomConfig` at startup; fixtures use a deterministic `"bigboss"`.
+    pub(crate) bigboss: String,
 }
 
 impl Default for App {
@@ -34,16 +37,23 @@ impl App {
         let mut source = data::create_data_source();
         let data = source.load();
         let rpc_client = Some(RpcClient::start());
+        // Configuration errors fall back to the built-in default rather than
+        // blocking TUI startup.
+        let bigboss = crate::config::HcomConfig::load(None)
+            .map(|c| c.bigboss)
+            .unwrap_or_else(|_| "bigboss".to_string());
 
         Self {
             data,
             source,
             rpc_client,
+            bigboss,
             ejector: Ejector::new(),
             ui: UiState {
                 cursor: 0,
                 cursor_name: None,
-                selected: BTreeSet::new(),
+                msg_tier: MsgTier::default(),
+                msg_filter: MsgFilter::default(),
                 input: String::new(),
                 input_cursor: 0,
                 input_scroll: 0,
@@ -54,7 +64,6 @@ impl App {
                 switch_viewport: false,
                 msg_scroll: 0,
                 scroll_max: 0,
-                search_filter: None,
                 help_open: false,
                 help_scroll: 0,
                 confirm: None,
@@ -67,9 +76,7 @@ impl App {
                 remote_expanded: false,
                 stopped_expanded: false,
                 show_all_stopped: false,
-                show_events: false,
                 orphans_expanded: false,
-                eject_filter: None,
                 inline_filter_changed: false,
                 needs_resize: false,
                 needs_clear_replay: false,
@@ -80,15 +87,20 @@ impl App {
         }
     }
 
-    /// Active search query: overlay live input or persisted filter.
+    /// Committed free-text filter, used for all highlighting. Search-overlay
+    /// edits are a draft and do not highlight until committed.
     pub fn active_search_query(&self) -> Option<&str> {
-        if let Some(ref overlay) = self.ui.overlay
-            && overlay.kind == OverlayKind::Search
-            && !overlay.input.is_empty()
-        {
-            return Some(overlay.input.as_str());
-        }
-        self.ui.search_filter.as_deref()
+        let text = self.ui.msg_filter.text.as_str();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Whether two names refer to the same agent under the shared identity
+    /// rules (device-qualified resolution, case-insensitive), also matching two
+    /// unknown names that differ only by case.
+    pub(crate) fn same_agent(&self, a: &str, b: &str) -> bool {
+        self.data
+            .resolve_display_name(a)
+            .eq_ignore_ascii_case(&self.data.resolve_display_name(b))
     }
 
     pub fn backend_error(&self) -> Option<String> {
@@ -237,11 +249,10 @@ impl App {
                     crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
                     if self.ui.inline_filter_changed {
                         self.ui.inline_filter_changed = false;
-                        self.update_search();
                         self.ejector.begin_replay(
                             &self.data,
-                            &self.ui.eject_filter,
-                            &self.ui.search_filter,
+                            self.ui.msg_tier,
+                            &self.ui.msg_filter,
                             crate::tui::inline::eject::ReplayReason::FilterChange,
                         );
                     }
@@ -255,8 +266,8 @@ impl App {
                     }
                     self.ejector.eject_new(
                         &self.data,
-                        &self.ui.eject_filter,
-                        &self.ui.search_filter,
+                        self.ui.msg_tier,
+                        &self.ui.msg_filter,
                         terminal,
                     )?;
                 }
@@ -409,7 +420,8 @@ mod tests {
             ui: UiState {
                 cursor: 0,
                 cursor_name: None,
-                selected: BTreeSet::new(),
+                msg_tier: MsgTier::default(),
+                msg_filter: MsgFilter::default(),
                 input: String::new(),
                 input_cursor: 0,
                 input_scroll: 0,
@@ -432,7 +444,6 @@ mod tests {
                 switch_viewport: false,
                 msg_scroll: 0,
                 scroll_max: 0,
-                search_filter: None,
                 help_open: false,
                 help_scroll: 0,
                 confirm: None,
@@ -445,9 +456,7 @@ mod tests {
                 remote_expanded: false,
                 stopped_expanded: false,
                 show_all_stopped: false,
-                show_events: false,
                 orphans_expanded: false,
-                eject_filter: None,
                 inline_filter_changed: false,
                 needs_resize: false,
                 needs_clear_replay: false,
@@ -458,6 +467,7 @@ mod tests {
             ejector: Ejector::new(),
             source: Box::new(NullSource),
             rpc_client: None,
+            bigboss: "bigboss".to_string(),
         }
     }
 

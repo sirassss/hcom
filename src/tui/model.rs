@@ -351,6 +351,14 @@ pub struct Message {
     pub sender_kind: SenderKind,
     pub intent: Option<String>,
     pub reply_to: Option<u64>,
+    /// Thread id from the message JSON. `None` when absent, null, or non-string.
+    #[allow(dead_code)] // consumed by MsgFilter in task 2
+    pub thread: Option<String>,
+    /// True exactly when `delivered_to` was a JSON array (including an empty
+    /// array). False means unknown (absent/null/non-array); the `to:` filter
+    /// must never fall back to mentions when delivery is known-but-empty.
+    #[allow(dead_code)] // consumed by MsgFilter in task 2
+    pub delivery_known: bool,
 }
 
 impl Message {

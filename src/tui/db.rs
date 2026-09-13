@@ -138,8 +138,16 @@ impl DbDataSource {
 }
 
 impl DataSource for DbDataSource {
+    /// Switching viewports changes the window size, so the cached snapshot no
+    /// longer describes what the caller asked for. Dropping it is the dirty
+    /// flag `load_if_changed` reads, so the next `load` re-queries instead of
+    /// returning the previous viewport's rows — and its `timeline_limit`.
     fn set_timeline_limit(&mut self, limit: usize) {
+        if limit == self.timeline_limit {
+            return;
+        }
         self.timeline_limit = limit;
+        self.cached = None;
     }
 
     fn last_error(&self) -> Option<String> {
@@ -161,8 +169,11 @@ impl DataSource for DbDataSource {
             return self.cached.clone();
         }
 
-        // Fast path: DB unchanged
-        if !self.data_version_changed() {
+        // Fast path: DB unchanged *and* we still hold a snapshot that describes
+        // the current window. `cached == None` is an explicit dirty flag, so a
+        // viewport limit change reloads even when `PRAGMA data_version` is quiet
+        // (or legitimately reports 0).
+        if self.cached.is_some() && !self.data_version_changed() {
             return None;
         }
 
@@ -174,16 +185,6 @@ impl DataSource for DbDataSource {
             return data;
         }
         self.cached.clone().unwrap_or_else(DataState::empty)
-    }
-
-    fn search_timeline(&mut self, query: &str, limit: usize) -> (Vec<Message>, Vec<Event>) {
-        if self.ensure_conn().is_none() {
-            return (vec![], vec![]);
-        }
-        match &self.conn {
-            Some(conn) => load_timeline_search(conn, query, limit),
-            None => (vec![], vec![]),
-        }
     }
 }
 
@@ -232,7 +233,9 @@ fn load_all(conn: &Connection, default_limit: usize) -> DataState {
         events,
         relay_enabled,
         relay_health,
-        search_results: None,
+        // The limit that actually shaped this window, so headers don't reparse
+        // the environment.
+        timeline_limit,
     }
 }
 
@@ -821,42 +824,6 @@ fn load_timeline(conn: &Connection, limit: usize) -> (Vec<Message>, Vec<Event>) 
     parse_timeline_rows(query_timeline_rows(&mut stmt, &[&limit_param]))
 }
 
-fn load_timeline_search(
-    conn: &Connection,
-    query: &str,
-    limit: usize,
-) -> (Vec<Message>, Vec<Event>) {
-    // Strip double-quotes and wrap in quotes for FTS5 phrase search.
-    // Empty after stripping (e.g. query was all quotes) → return empty; `""` is invalid FTS5.
-    let stripped = query.replace('"', "");
-    if stripped.is_empty() {
-        return (vec![], vec![]);
-    }
-    let fts_query = format!("\"{}\"", stripped);
-    let mut stmt = match conn.prepare(
-        "SELECT e.id, e.timestamp, e.instance, e.type, e.data
-         FROM events e
-         JOIN events_fts ON events_fts.rowid = e.id
-         WHERE events_fts MATCH ?
-           AND e.type IN ('message', 'status', 'life')
-         ORDER BY e.id DESC LIMIT ?",
-    ) {
-        Ok(s) => s,
-        Err(_) => return (vec![], vec![]),
-    };
-    let limit_param = limit as i64;
-    let (mut messages, mut events) = parse_timeline_rows(query_timeline_rows(
-        &mut stmt,
-        &[&fts_query as &dyn rusqlite::types::ToSql, &limit_param],
-    ));
-
-    // Sort ascending by time (same order as load_timeline results in load_all)
-    messages.sort_by(|a, b| a.time.total_cmp(&b.time));
-    events.sort_by(|a, b| a.time.total_cmp(&b.time));
-
-    (messages, events)
-}
-
 fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
     let json: serde_json::Value = serde_json::from_str(data).ok()?;
 
@@ -901,6 +868,13 @@ fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
         .map(String::from);
     let reply_to = json.get("reply_to").and_then(|v| v.as_u64());
 
+    let thread = json
+        .get("thread")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    // Known only when `delivered_to` is actually an array (empty counts).
+    let delivery_known = json.get("delivered_to").is_some_and(|v| v.is_array());
+
     Some(Message {
         event_id: id as u64,
         sender: from,
@@ -912,6 +886,8 @@ fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
         sender_kind,
         intent,
         reply_to,
+        thread,
+        delivery_known,
     })
 }
 
@@ -1434,7 +1410,7 @@ mod tests {
         parse_status_or_life_row, parse_tool,
     };
     use crate::tui::model::{
-        ActivityKind, Agent, AgentStatus, EventKind, MessageScope, SenderKind, Tool,
+        ActivityKind, Agent, AgentStatus, EventKind, Message, MessageScope, SenderKind, Tool,
     };
     use rusqlite::Connection;
 
@@ -1469,6 +1445,77 @@ mod tests {
             "TUI open left db broad: {:?}",
             ds.last_error
         );
+    }
+
+    // Regression: a viewport switch only calls `set_timeline_limit`. If that
+    // leaves the cache in place, `load_if_changed` keeps returning `None` while
+    // the DB is quiet and the other viewport renders the previous window — and
+    // its now-wrong `timeline_limit` in the scope header.
+    #[test]
+    fn set_timeline_limit_invalidates_cached_window() {
+        use crate::tui::data::DataSource;
+        let mut ds = super::DbDataSource::new();
+        ds.cached = Some(crate::tui::app::DataState::empty());
+        ds.last_data_version = 7;
+
+        ds.set_timeline_limit(5000);
+        assert!(
+            ds.cached.is_none(),
+            "stale window kept after a viewport limit change"
+        );
+
+        // Re-setting the same limit is a no-op and must not throw away a cache.
+        ds.cached = Some(crate::tui::app::DataState::empty());
+        ds.set_timeline_limit(5000);
+        assert!(ds.cached.is_some(), "same limit must not invalidate");
+    }
+
+    // The observable half: after a limit change `load` must re-query instead of
+    // handing back the previous viewport's snapshot, even though the DB has not
+    // been written to (so `PRAGMA data_version` is unchanged).
+    #[test]
+    fn load_after_limit_change_returns_a_fresh_window() {
+        use crate::tui::data::DataSource;
+        let conn = setup_conn();
+        for (id, body) in [(1i64, "one"), (2i64, "two")] {
+            conn.execute(
+                "INSERT INTO events (id, type, instance, data, timestamp) VALUES (?, 'message', 'nova', ?, ?)",
+                rusqlite::params![
+                    id,
+                    format!(r#"{{"from":"nova","message":"{body}","scope":"broadcast"}}"#),
+                    "2026-02-18T00:09:30+00:00"
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut ds = super::DbDataSource::new();
+        // Pin the change detectors to what the connection and config actually
+        // report, so `data_version_changed()` is demonstrably false: without the
+        // cache invalidation this test would keep the stale snapshot.
+        ds.last_data_version = conn
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .map(|v| v as u64)
+            .unwrap();
+        ds.config_mtime = super::config_toml_mtime();
+        ds.conn = Some(conn);
+        assert!(
+            !ds.data_version_changed(),
+            "fixture must look unchanged to the cache"
+        );
+        // Stale snapshot from the other viewport, tagged with a limit no real
+        // load can produce.
+        let mut stale = crate::tui::app::DataState::empty();
+        stale.timeline_limit = 999;
+        ds.cached = Some(stale);
+
+        ds.set_timeline_limit(5000);
+        let data = ds.load();
+        assert_ne!(
+            data.timeline_limit, 999,
+            "load returned the previous viewport's window"
+        );
+        assert_eq!(data.messages.len(), 2, "rows must come from the DB");
     }
 
     fn setup_conn() -> Connection {
@@ -1724,6 +1771,38 @@ mod tests {
         assert_eq!(msg.delivered, vec!["nova"]);
         assert_eq!(msg.intent.as_deref(), Some("request"));
         assert_eq!(msg.reply_to, Some(42));
+        assert!(msg.delivery_known);
+    }
+
+    fn parse_msg(data: &str) -> Message {
+        parse_message_row(1, "2026-02-18T00:09:30+00:00", data).unwrap()
+    }
+
+    #[test]
+    fn parse_message_row_thread_variants() {
+        assert_eq!(
+            parse_msg(r#"{"thread":"hcom-skill"}"#).thread.as_deref(),
+            Some("hcom-skill")
+        );
+        assert_eq!(parse_msg("{}").thread, None);
+        assert_eq!(parse_msg(r#"{"thread":null}"#).thread, None);
+        assert_eq!(parse_msg(r#"{"thread":42}"#).thread, None);
+        assert_eq!(parse_msg(r#"{"thread":["a"]}"#).thread, None);
+    }
+
+    #[test]
+    fn parse_message_row_delivery_known_tracks_array_presence() {
+        assert!(!parse_msg("{}").delivery_known);
+        assert!(!parse_msg(r#"{"delivered_to":null}"#).delivery_known);
+        assert!(!parse_msg(r#"{"delivered_to":"nova"}"#).delivery_known);
+
+        let empty = parse_msg(r#"{"delivered_to":[]}"#);
+        assert!(empty.delivery_known);
+        assert!(empty.delivered.is_empty());
+
+        let populated = parse_msg(r#"{"delivered_to":["nova","ligo"]}"#);
+        assert!(populated.delivery_known);
+        assert_eq!(populated.delivered, vec!["nova", "ligo"]);
     }
 
     #[test]
