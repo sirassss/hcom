@@ -1,7 +1,7 @@
 {
   "name": "hcom",
   "version": "1.0.0",
-  "description": "hcom lifecycle hooks for Antigravity CLI",
+  "description": "hcom lifecycle hooks and agent messaging skill for Antigravity CLI",
   "author": { "name": "aannoo" },
   "homepage": "https://github.com/aannoo/hcom",
   "repository": "https://github.com/aannoo/hcom",
