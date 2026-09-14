@@ -1,0 +1,13 @@
+{
+  "name": "hcom",
+  "version": "1.0.0",
+  "description": "Multi-agent messaging skills and Codex lifecycle hooks",
+  "author": {
+    "name": "aannoo"
+  },
+  "homepage": "https://github.com/aannoo/hcom",
+  "repository": "https://github.com/aannoo/hcom",
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks-codex.json"
+}

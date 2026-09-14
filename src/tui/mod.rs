@@ -307,7 +307,10 @@ mod tests {
         assert_eq!(app.data.timeline_limit, 200);
         assert_eq!(app.ui.msg_tier, crate::tui::filter::MsgTier::Verbose);
         assert_eq!(app.ui.msg_filter.from.as_deref(), Some("nova"));
-        assert!(app.ui.inline_filter_changed, "replace the old inline replay");
+        assert!(
+            app.ui.inline_filter_changed,
+            "replace the old inline replay"
+        );
         assert!(!app.ui.needs_resize);
         assert!(!app.ui.needs_clear_replay);
     }

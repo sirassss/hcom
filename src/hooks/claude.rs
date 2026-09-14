@@ -2778,7 +2778,7 @@ pub(crate) const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
 ];
 
 /// Hook command suffixes for pattern detection.
-const CLAUDE_HOOK_COMMANDS: &[&str] = &[
+pub(crate) const CLAUDE_HOOK_COMMANDS: &[&str] = &[
     "sessionstart",
     "userpromptsubmit",
     "pre",

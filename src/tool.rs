@@ -25,6 +25,20 @@ pub enum Tool {
     Adhoc,
 }
 
+/// Message for a failed Codex removal. It reports only what was observed: the
+/// uninstall failed, and whether the legacy hook entries came out. It must not
+/// assert that the plugin is still installed — the CLI may have been missing, so
+/// its presence was never established — nor that legacy entries were removed
+/// when the remover returned false.
+fn codex_remove_failure_message(error: &str, legacy_removed: bool) -> String {
+    let legacy = if legacy_removed {
+        "the legacy hook entries were removed"
+    } else {
+        "the legacy hook entries could not be removed either"
+    };
+    format!("codex plugin uninstall failed: {error}. Separately, {legacy}.")
+}
+
 impl Tool {
     /// Ready-pattern bytes for PTY readiness detection.
     pub fn ready_pattern(&self) -> &'static [u8] {
@@ -166,6 +180,9 @@ impl Tool {
             Tool::Claude => crate::hooks::claude::remove_claude_hooks(),
             Tool::Cursor => crate::hooks::cursor::remove_cursor_hooks(),
             Tool::Antigravity => crate::hooks::antigravity::remove_antigravity_hooks(),
+            // Removes only hcom's own entries from Codex's hooks.json, leaving
+            // foreign hooks and the installed plugin alone.
+            Tool::Codex => crate::hooks::codex::remove_codex_hooks(),
             _ => false,
         }
     }
@@ -183,7 +200,23 @@ impl Tool {
                 Ok(crate::hooks::claude::remove_claude_hooks())
             }
             Tool::Gemini => Ok(crate::hooks::gemini::remove_gemini_hooks()),
-            Tool::Codex => Ok(crate::hooks::codex::remove_codex_hooks()),
+            // Both halves, and only these two: the plugin uninstall is
+            // best-effort so a missing CLI cannot stop the legacy cleanup, and
+            // nothing here touches Claude's plugin or marketplace even though
+            // both vendors install the same package.
+            Tool::Codex => {
+                // The legacy cleanup runs either way — it is the part
+                // `hooks remove` must never skip — but a failed plugin
+                // uninstall is then reported, not swallowed: exiting 0 with
+                // "Removed" while the plugin still fires is the one outcome
+                // worse than failing.
+                let uninstall = crate::hooks::plugin::uninstall_codex_plugin();
+                let removed = crate::hooks::codex::remove_codex_hooks();
+                match uninstall {
+                    Ok(()) => Ok(removed),
+                    Err(e) => Err(codex_remove_failure_message(&e, removed)),
+                }
+            }
             Tool::OpenCode => crate::hooks::opencode::remove_opencode_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
@@ -265,6 +298,24 @@ impl std::fmt::Display for Tool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The failure message may only say what was observed. A missing `codex`
+    /// binary means the plugin's presence was never established, so the message
+    /// must not claim it is still installed — and it must not claim the legacy
+    /// entries came out when they did not.
+    #[test]
+    fn codex_remove_failure_message_asserts_only_what_was_observed() {
+        let missing_cli = super::codex_remove_failure_message("codex not runnable", false);
+        assert!(!missing_cli.contains("still installed"), "{missing_cli}");
+        assert!(
+            missing_cli.contains("could not be removed either"),
+            "{missing_cli}"
+        );
+
+        let legacy_gone = super::codex_remove_failure_message("exit 1", true);
+        assert!(legacy_gone.contains("were removed"), "{legacy_gone}");
+        assert!(!legacy_gone.contains("still installed"), "{legacy_gone}");
+    }
 
     #[test]
     fn adhoc_has_no_hooks() {

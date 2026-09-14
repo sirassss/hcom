@@ -906,6 +906,10 @@ mod tests {
 
     fn make_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
         let mut env: HashMap<String, String> = std::env::vars().collect();
+        // The suite itself can run inside an hcom-launched shell. Inheriting
+        // HCOM_LAUNCHED=1 makes every ctx look launched, which silences
+        // `detect_vanilla_tool` and quietly skips the branch under test.
+        env.remove("HCOM_LAUNCHED");
         for (k, v) in tool_env {
             env.insert((*k).to_string(), (*v).to_string());
         }
@@ -916,6 +920,7 @@ mod tests {
     /// value from the shell running the tests cannot decide the outcome.
     fn make_claude_ctx(session: Option<(&str, &str)>, cwd: &str) -> HcomContext {
         let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("HCOM_LAUNCHED");
         env.remove("HCOM_CLAUDE_UNIX_SESSION_ID");
         env.remove("CLAUDE_CODE_SESSION_ID");
         env.insert("CLAUDECODE".to_string(), "1".to_string());

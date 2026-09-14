@@ -15,7 +15,7 @@ installers = ["shell", "powershell", "homebrew"]
 # don't need a separate `xz` executable just to unpack releases.
 unix-archive = ".tar.gz"
 # Local artifacts jobs to run in CI
-local-artifacts-jobs = ["./build-wheels"]
+local-artifacts-jobs = ["./build-wheels", "./payload"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew", "./publish-pypi"]
 # Post-announce jobs to run after the release is published

@@ -588,6 +588,21 @@ fn format_plugin_install_error(
     message
 }
 
+/// Whether a Codex launch should install the native hooks.
+///
+/// Only when the plugin is not the thing delivering messages. An installed
+/// plugin whose handlers Codex reports — untrusted or already duplicated
+/// included — must not be shadowed by a fresh native install. `Unverified`
+/// still installs: an unreadable inventory is not evidence that something else
+/// is delivering messages, and a session with no hooks is silent.
+fn codex_launch_needs_native_hooks(state: crate::hooks::codex::CodexPluginState) -> bool {
+    use crate::hooks::codex::CodexPluginState as S;
+    !matches!(
+        state,
+        S::Active | S::ReviewRequired | S::Duplicate | S::Disabled
+    )
+}
+
 /// Verify hooks are installed for the target tool, auto-install if needed.
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
@@ -638,6 +653,16 @@ fn ensure_hooks_installed(
         }
         LaunchTool::Codex => {
             let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
+            // Codex's hooks can now come from the plugin. Installing the native
+            // set behind a live plugin is what turned `hooks remove codex
+            // --legacy-only` into a no-op undone by the next agent launch,
+            // straight back into a double-fire.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if !codex_launch_needs_native_hooks(
+                crate::hooks::codex::codex_plugin_status(&cwd).state,
+            ) {
+                return Ok(());
+            }
             if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
                 && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
             {
@@ -2496,6 +2521,27 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::collections::BTreeMap;
+
+    /// A plugin already running hcom's Codex handlers must not be shadowed by a
+    /// fresh native install: that is how `hooks remove codex --legacy-only` got
+    /// undone by the next agent launch, back into a double-fire.
+    #[test]
+    fn codex_launch_leaves_hooks_alone_when_the_plugin_runs_them() {
+        use crate::hooks::codex::CodexPluginState as S;
+
+        for state in [S::Active, S::ReviewRequired, S::Duplicate, S::Disabled] {
+            assert!(
+                !super::codex_launch_needs_native_hooks(state),
+                "{state:?} would reinstall the legacy hooks at launch"
+            );
+        }
+        for state in [S::Missing, S::Incomplete, S::LegacyOnly, S::Unverified] {
+            assert!(
+                super::codex_launch_needs_native_hooks(state),
+                "{state:?} must still get working hooks"
+            );
+        }
+    }
 
     struct EnvVarGuard {
         saved: BTreeMap<String, Option<String>>,

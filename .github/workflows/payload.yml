@@ -1,0 +1,28 @@
+name: "Plugin payload gate"
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  payload:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Pinned like ci.yml rather than left to the runner image: Cargo.toml
+      # sets rust-version = "1.88", and a gate whose toolchain drifts with the
+      # image is not a gate.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+      # Each adapter's skills/ is generated from skills/hcom-agent-messaging.
+      # A tag whose copies drifted would publish a plugin carrying the wrong
+      # skill, and this workflow otherwise runs no tests at all. Linux is the
+      # authoritative no-symlink gate: core.symlinks=false on Windows
+      # materializes a tracked link as ordinary text.
+      - run: cargo test --locked --test plugin_payload

@@ -5,7 +5,6 @@ use std::io::Write;
 #[cfg(not(test))]
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-#[cfg(not(test))]
 use std::process::Stdio;
 use std::sync::OnceLock;
 #[cfg(not(test))]
@@ -32,7 +31,7 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 use super::common::SAFE_HCOM_COMMANDS;
 
 const HCOM_TRIGGER: &str = "<hcom>";
-const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
+pub(crate) const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
         "codex-sessionstart",
@@ -112,9 +111,23 @@ struct CodexHookTrustEntry {
 /// codex-rs/app-server-protocol/src/protocol/v2/plugin.rs:513-542); the
 /// snake_case spellings of the core protocol are accepted too.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CodexHookListEntry {
+pub(crate) struct CodexHookListEntry {
     key: Option<String>,
     command: Option<String>,
+    /// Codex's own event label for the entry. Without it a handler parked on
+    /// the wrong event is invisible to the inventory — the command alone would
+    /// still look like ours.
+    ///
+    /// Measured on codex-cli 0.154.0 (2026-09-14, `hooks/list` against a
+    /// scratch `CODEX_HOME`): the field is **lowerCamelCase** — `sessionStart`,
+    /// `preToolUse`, `postToolUse`, `userPromptSubmit`, `stop` — while the
+    /// event segment of the same entry's `key` is snake_case (`pre_tool_use`).
+    /// The two vocabularies are not interchangeable: comparing this field
+    /// against a `key` label rejects every healthy handler.
+    event_name: Option<String>,
+    /// Set when the entry came from an installed plugin, `null` for a config
+    /// layer (measured in the same probe). More direct than the `source` label.
+    plugin_id: Option<String>,
     source: Option<String>,
     source_path: Option<PathBuf>,
     enabled: bool,
@@ -894,6 +907,16 @@ fn codex_hook_event_state_label(event: &str) -> &'static str {
     }
 }
 
+/// Codex's wire spelling of an event in `hooks/list` (`HookEventName`):
+/// lowerCamelCase, unlike the snake_case label the hook `key` carries.
+fn codex_hook_event_wire_name(event: &str) -> String {
+    let mut chars = event.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 fn hcom_hook_definition_hash(event: &str, group: &Value, hook: &Value) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1035,18 +1058,54 @@ fn hook_list_str_field<'a>(hook: &'a Value, camel: &str, snake: &str) -> Option<
 }
 
 fn parse_codex_hook_list_entries(value: &Value) -> Result<Vec<CodexHookListEntry>, String> {
-    let hooks = value
-        .pointer("/result/data/0/hooks")
-        .or_else(|| value.pointer("/data/0/hooks"))
-        .or_else(|| value.get("hooks"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "codex hooks/list response did not contain hooks".to_string())?;
+    // Every group, not just `data[0]`: Codex returns one group per hook layer,
+    // so reading the first alone would drop a plugin's handlers whenever the
+    // user layer is listed first — and report "no plugin hooks" while the
+    // plugin is firing.
+    let groups = value
+        .pointer("/result/data")
+        .or_else(|| value.pointer("/data"))
+        .and_then(|v| v.as_array());
+    let hooks: Vec<&Value> = match groups {
+        Some(groups) => {
+            let mut collected = Vec::new();
+            for group in groups {
+                // A group Codex could not evaluate is not an empty group.
+                // Swallowing its `errors` would turn a failed inventory into
+                // "no hooks installed", and that answer is what decides
+                // whether hcom installs anything.
+                if let Some(errors) = group.get("errors").and_then(|v| v.as_array())
+                    && !errors.is_empty()
+                {
+                    return Err(format!(
+                        "codex hooks/list reported errors: {}",
+                        Value::Array(errors.clone())
+                    ));
+                }
+                let Some(hooks) = group.get("hooks").and_then(|v| v.as_array()) else {
+                    return Err(
+                        "codex hooks/list returned a group without a hooks array".to_string()
+                    );
+                };
+                collected.extend(hooks.iter());
+            }
+            collected
+        }
+        None => value
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "codex hooks/list response did not contain hooks".to_string())?
+            .iter()
+            .collect(),
+    };
 
     Ok(hooks
         .iter()
         .map(|hook| CodexHookListEntry {
             key: hook_list_str_field(hook, "key", "key").map(str::to_string),
             command: hook_list_str_field(hook, "command", "command").map(str::to_string),
+            event_name: hook_list_str_field(hook, "eventName", "event_name").map(str::to_string),
+            plugin_id: hook_list_str_field(hook, "pluginId", "plugin_id").map(str::to_string),
             source: hook_list_str_field(hook, "source", "source").map(str::to_string),
             source_path: hook_list_str_field(hook, "sourcePath", "source_path").map(PathBuf::from),
             // Codex only treats an explicit `false` as disabled; absent means
@@ -1135,6 +1194,533 @@ fn foreign_hooks_unlocked_by_bypass(
         .collect()
 }
 
+/// `HookSource::Plugin` — an entry contributed by an installed Codex plugin
+/// rather than by a config layer.
+const CODEX_HOOK_SOURCE_PLUGIN: &str = "plugin";
+
+/// What Codex's own hook inventory says about hcom's Codex handlers.
+///
+/// Deliberately separate from [`hook_list_entry_is_hcom_owned`]: that predicate
+/// answers "may hcom write trust state for this entry", and widening it to
+/// accept plugin entries would hand plugin hooks the invocation-wide trust
+/// bypass. This enum only describes what is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexPluginState {
+    Active,
+    ReviewRequired,
+    Disabled,
+    Duplicate,
+    LegacyOnly,
+    Discovered,
+    Incompatible,
+    Incomplete,
+    Missing,
+    Unverified,
+}
+
+impl CodexPluginState {
+    /// The spec's headlines, verbatim. None of the states reachable without a
+    /// usable inventory may render as active or as a double-fire observation.
+    pub(crate) fn headline(self) -> &'static str {
+        match self {
+            Self::Active => "installed (plugin hooks active)",
+            Self::ReviewRequired => "installed; hook review required",
+            Self::Disabled => "installed; hooks disabled",
+            Self::Duplicate => "duplicate hooks; double-fire risk",
+            Self::LegacyOnly => "installed (legacy native hooks)",
+            Self::Discovered => "plugin discovered; activation unverified",
+            Self::Incompatible => "incompatible Claude handlers",
+            Self::Incomplete => "incomplete hook set",
+            // Task 4 splits this on ClaudePresence into
+            // "not active; import from Claude required" when Claude is present.
+            // The probe belongs there, so the pure classifier stays inventory-only.
+            Self::Missing => "not installed",
+            Self::Unverified => "state unverified",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexPluginStatus {
+    pub state: CodexPluginState,
+    pub details: Vec<String>,
+}
+
+/// `(command, event label)` for every handler hcom's Codex integration installs.
+/// Both halves must match: a correct command parked on the wrong event is not a
+/// working handler, and Codex reports the event it actually bound.
+fn expected_codex_handlers() -> Vec<(Vec<String>, String)> {
+    CODEX_HOOK_COMMANDS
+        .iter()
+        .map(|(event, command, _)| {
+            (
+                handler_command_forms(command),
+                codex_hook_event_wire_name(event),
+            )
+        })
+        .collect()
+}
+
+/// Both command spellings hcom ships for one handler.
+///
+/// The native installer writes the resolved `hcom codex-stop`, while the
+/// committed plugin manifest ships the self-resolving
+/// `cmd=${HCOM:-hcom}; … exec $cmd codex-stop || exit 0` guard — a static file
+/// cannot embed an install-time path. Matching only the first form makes the
+/// shipped plugin's own handlers invisible to this classifier, which would
+/// report a live plugin as missing. Exact equality against both forms, never a
+/// substring scan for `hcom`.
+fn handler_command_forms(suffix: &str) -> Vec<String> {
+    vec![
+        build_codex_hook_command(suffix),
+        crate::hooks::claude::build_hook_entry_command(suffix),
+    ]
+}
+
+/// Claude's handlers, which Codex must never be running. Built from Claude's own
+/// registry so a handler added there cannot silently become unrecognized here.
+fn claude_handler_commands() -> HashSet<String> {
+    crate::hooks::claude::CLAUDE_HOOK_COMMANDS
+        .iter()
+        .flat_map(|suffix| handler_command_forms(suffix))
+        .collect()
+}
+
+/// Which origin an inventory entry came from, as far as the classifier cares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandlerOrigin {
+    Plugin,
+    Legacy,
+    Foreign,
+}
+
+fn handler_origin(
+    entry: &CodexHookListEntry,
+    hooks_path: &Path,
+    plugin_roots: &[PathBuf],
+) -> HandlerOrigin {
+    if entry.plugin_id.is_some() {
+        return HandlerOrigin::Plugin;
+    }
+    let from_plugin_path = entry.source_path.as_deref().is_some_and(|path| {
+        plugin_roots
+            .iter()
+            .any(|root| path_is_within(path, root.as_path()))
+    });
+    if entry.source.as_deref() == Some(CODEX_HOOK_SOURCE_PLUGIN) || from_plugin_path {
+        return HandlerOrigin::Plugin;
+    }
+    if entry.source.as_deref() == Some(CODEX_HOOK_SOURCE_USER)
+        && entry
+            .source_path
+            .as_deref()
+            .is_some_and(|path| paths_equivalent(path, hooks_path))
+    {
+        return HandlerOrigin::Legacy;
+    }
+    HandlerOrigin::Foreign
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    path.ancestors().any(|ancestor| ancestor == root)
+}
+
+/// One origin's view of the handler set.
+#[derive(Default)]
+struct OriginHandlers {
+    present: HashSet<String>,
+    /// Events whose handler this origin has *enabled*. Double-fire is about
+    /// what runs, so the overlap check uses this, not `present`.
+    enabled_events: HashSet<String>,
+    disabled: Vec<String>,
+    unreviewed: Vec<String>,
+}
+
+impl OriginHandlers {
+    fn is_complete(&self, expected: usize) -> bool {
+        self.present.len() == expected
+    }
+    fn has_any(&self) -> bool {
+        !self.present.is_empty()
+    }
+}
+
+/// Classify hcom's Codex hook activation from an inventory Codex itself
+/// returned. Pure: every input is passed in, so every spec state is reachable
+/// from a fixture.
+///
+/// `plugin_roots` are directories whose contents Codex loads as plugins; an
+/// entry rooted there is plugin-sourced even when its `source` label is absent.
+/// Their mere existence never upgrades a state beyond `Discovered` — a
+/// discovery hint cannot stand in for a missing runtime handler.
+pub(crate) fn classify_codex_plugin_hooks(
+    entries: &[CodexHookListEntry],
+    hooks_path: &Path,
+    plugin_roots: &[PathBuf],
+) -> CodexPluginStatus {
+    let expected = expected_codex_handlers();
+    let claude_commands = claude_handler_commands();
+    let mut details = Vec::new();
+    let mut incompatible = Vec::new();
+    let mut plugin = OriginHandlers::default();
+    let mut legacy = OriginHandlers::default();
+
+    for entry in entries {
+        let Some(command) = entry.command.as_deref() else {
+            continue;
+        };
+        if claude_commands.contains(command) {
+            incompatible.push(describe_hook_list_entry(entry));
+            continue;
+        }
+        let Some((forms, expected_event)) = expected
+            .iter()
+            .find(|(forms, _)| forms.iter().any(|form| form == command))
+        else {
+            continue;
+        };
+        // Identity is the canonical form, so the same handler counts once
+        // whichever spelling Codex reports it under.
+        let command = forms[0].as_str();
+        // Affirmative event identity only: an entry that does not say which
+        // event it is bound to has not shown it is bound to the right one.
+        // Codex sends `eventName` on every entry (measured); the hook key
+        // carries the same event in its own snake_case spelling, so either
+        // proves it.
+        let key_event = entry.key.as_deref().map(hcom_wire_event_for_hook_state_key);
+        let event = entry.event_name.clone().or(key_event);
+        if event.as_deref() != Some(expected_event.as_str()) {
+            details.push(format!(
+                "{command} bound to {} (expected {expected_event}) in {}",
+                event.as_deref().unwrap_or("<no event identity>"),
+                entry
+                    .source_path
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unknown source>".to_string()),
+            ));
+            continue;
+        }
+
+        let bucket = match handler_origin(entry, hooks_path, plugin_roots) {
+            HandlerOrigin::Plugin => &mut plugin,
+            HandlerOrigin::Legacy => &mut legacy,
+            // A foreign hooks file can carry hcom's exact command; it is not
+            // hcom's installation and must not complete anyone's handler set.
+            HandlerOrigin::Foreign => {
+                details.push(format!("foreign {}", describe_hook_list_entry(entry)));
+                continue;
+            }
+        };
+        bucket.present.insert(command.to_string());
+        if entry.enabled {
+            bucket.enabled_events.insert(expected_event.clone());
+        } else {
+            bucket.disabled.push(describe_hook_list_entry(entry));
+        }
+        let reviewed = entry
+            .trust_status
+            .as_deref()
+            .is_some_and(|status| CODEX_ALREADY_PERMITTED_TRUST_STATUSES.contains(&status));
+        if !reviewed {
+            bucket.unreviewed.push(describe_hook_list_entry(entry));
+        }
+    }
+
+    if !incompatible.is_empty() {
+        details.extend(incompatible);
+        return CodexPluginStatus {
+            state: CodexPluginState::Incompatible,
+            details,
+        };
+    }
+
+    let total = expected.len();
+    let plugin_complete = plugin.is_complete(total);
+    let legacy_complete = legacy.is_complete(total);
+
+    // Double-fire is per event and about what is *enabled*: one enabled legacy
+    // handler beside a complete enabled plugin set fires twice on that event,
+    // and two complete sets whose legacy half is disabled fire once. Requiring
+    // two complete sets would miss the first and misreport the second.
+    let mut double_fired: Vec<&String> = plugin
+        .enabled_events
+        .intersection(&legacy.enabled_events)
+        .collect();
+    double_fired.sort();
+
+    let state = if !double_fired.is_empty() {
+        details.push(format!(
+            "both a plugin and a legacy handler are enabled for {}; legacy lives in {}",
+            double_fired
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            hooks_path.display()
+        ));
+        CodexPluginState::Duplicate
+    } else if plugin_complete {
+        if legacy.has_any() {
+            details.push(format!(
+                "{} of hcom's legacy handlers are also installed in {} (none enabled alongside the plugin)",
+                legacy.present.len(),
+                hooks_path.display()
+            ));
+        }
+        if !plugin.disabled.is_empty() {
+            CodexPluginState::Disabled
+        } else if !plugin.unreviewed.is_empty() {
+            CodexPluginState::ReviewRequired
+        } else {
+            CodexPluginState::Active
+        }
+    } else if legacy_complete && !plugin.has_any() {
+        CodexPluginState::LegacyOnly
+    } else if plugin.has_any() || legacy.has_any() {
+        let found: HashSet<&String> = plugin.present.union(&legacy.present).collect();
+        let mut missing: Vec<&str> = expected
+            .iter()
+            .map(|(forms, _)| forms[0].as_str())
+            .filter(|command| !found.contains(&command.to_string()))
+            .collect();
+        missing.sort_unstable();
+        details.push(format!("missing handlers: {}", missing.join(", ")));
+        CodexPluginState::Incomplete
+    } else if !plugin_roots.is_empty() {
+        details.push("plugin store is populated but no handler reached the inventory".to_string());
+        CodexPluginState::Discovered
+    } else {
+        CodexPluginState::Missing
+    };
+
+    for (label, bucket) in [("plugin", &plugin), ("legacy", &legacy)] {
+        for disabled in &bucket.disabled {
+            details.push(format!("{label} handler disabled: {disabled}"));
+        }
+        for unreviewed in &bucket.unreviewed {
+            details.push(format!("{label} handler not trusted: {unreviewed}"));
+        }
+    }
+
+    CodexPluginStatus { state, details }
+}
+
+/// Directories whose contents Codex loads as plugins, restricted to those that
+/// actually exist — an empty store is not a discovery hint.
+fn codex_plugin_roots(codex_home: &Path) -> Vec<PathBuf> {
+    let plugins_root = codex_home.join("plugins");
+    CODEX_PLUGIN_STORE_DIRS
+        .iter()
+        .map(|sub| plugins_root.join(sub))
+        .filter(|dir| std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some()))
+        .collect()
+}
+
+/// Whether the Claude CLI is on this machine, which decides how Codex gets the
+/// hcom plugin: Codex can import an installed Claude plugin, and that flow is
+/// interactive, so hcom must not install anything itself when Claude is there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudePresence {
+    Present,
+    Absent,
+    /// The probe neither confirmed nor ruled Claude out (permission denied, a
+    /// non-zero exit, a hang). Nothing may be written in this state: installing
+    /// on a machine that turns out to have Claude creates the duplicate the
+    /// import route exists to avoid.
+    Indeterminate(String),
+}
+
+/// How long the Claude probe may take before it counts as indeterminate.
+const CLAUDE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+pub(crate) fn claude_presence() -> ClaudePresence {
+    let Some(binary) = crate::terminal::which_bin("claude") else {
+        return ClaudePresence::Absent;
+    };
+    let mut child = match std::process::Command::new(&binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        // Resolution succeeded but the file will not run — not evidence that
+        // Claude is absent.
+        Err(error) => return ClaudePresence::Indeterminate(format!("{binary}: {error}")),
+    };
+
+    let deadline = std::time::Instant::now() + CLAUDE_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return ClaudePresence::Present,
+            Ok(Some(status)) => {
+                return ClaudePresence::Indeterminate(format!("{binary} --version: {status}"));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return ClaudePresence::Indeterminate(format!(
+                        "{binary} --version did not answer within {}s",
+                        CLAUDE_PROBE_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return ClaudePresence::Indeterminate(format!("{binary}: {error}")),
+        }
+    }
+}
+
+/// What `hcom hooks add codex` accomplished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodexAddOutcome {
+    /// Codex's own inventory already shows the complete handler set running.
+    AlreadyActive,
+    /// Nothing was installed and the user must do something. Exit 2.
+    ActionRequired(String),
+    /// A CLI install reported success but the inventory has not confirmed the
+    /// handlers yet. Exit 2 — install success is not activation.
+    InstalledUnverified(String),
+}
+
+/// Decide what `hooks add codex` should do, given what Codex reports and
+/// whether Claude is around. Pure, so every branch is reachable from a fixture.
+pub(crate) fn plan_codex_add(
+    status: &CodexPluginStatus,
+    claude: &ClaudePresence,
+    claude_plugin_installed: bool,
+) -> Result<CodexAddOutcome, CodexAddPlan> {
+    let detail = |extra: &str| {
+        let mut text = extra.to_string();
+        for line in &status.details {
+            text.push_str("\n  ");
+            text.push_str(line);
+        }
+        text
+    };
+
+    match status.state {
+        CodexPluginState::Active => Ok(CodexAddOutcome::AlreadyActive),
+        // Never strip Codex's legacy entries as a side effect of `add`: unlike
+        // Claude's, they are the only thing firing until the plugin is trusted.
+        CodexPluginState::Duplicate => Ok(CodexAddOutcome::ActionRequired(detail(
+            "plugin and legacy hooks are both active. Once the plugin is trusted, run: \
+             hcom hooks remove codex --legacy-only",
+        ))),
+        CodexPluginState::ReviewRequired => Ok(CodexAddOutcome::ActionRequired(detail(
+            "open Codex and review/trust hcom's hooks, then: hcom hooks status",
+        ))),
+        CodexPluginState::Disabled => Ok(CodexAddOutcome::ActionRequired(detail(
+            "enable hcom's hooks in Codex, then: hcom hooks status",
+        ))),
+        CodexPluginState::Incompatible => Ok(CodexAddOutcome::ActionRequired(detail(
+            "Codex is running Claude's handlers, which cannot serve Codex sessions. \
+             Reinstall the plugin so the Codex overlay is selected.",
+        ))),
+        CodexPluginState::Unverified => Ok(CodexAddOutcome::ActionRequired(detail(
+            "Codex's hook inventory is unavailable, so nothing was installed.",
+        ))),
+        CodexPluginState::LegacyOnly => Ok(CodexAddOutcome::ActionRequired(detail(
+            "hcom's native Codex hooks are in place and working. To migrate to the plugin, \
+             install it first and remove the legacy entries only once it is trusted: \
+             hcom hooks remove codex --legacy-only",
+        ))),
+        CodexPluginState::Missing | CodexPluginState::Incomplete | CodexPluginState::Discovered => {
+            match claude {
+                ClaudePresence::Present => {
+                    let mut text = String::new();
+                    if !claude_plugin_installed {
+                        text.push_str("first: hcom hooks add claude\nthen: ");
+                    }
+                    text.push_str(
+                        "in Codex run /import, pick the hcom plugin and its skill (not the \
+                         standalone hcom skill), restart Codex, review the hooks, then: \
+                         hcom hooks status",
+                    );
+                    Ok(CodexAddOutcome::ActionRequired(detail(&text)))
+                }
+                ClaudePresence::Indeterminate(why) => {
+                    Ok(CodexAddOutcome::ActionRequired(detail(&format!(
+                        "could not determine whether Claude is installed ({why}), so nothing was installed. Re-run once `claude --version` answers."
+                    ))))
+                }
+                ClaudePresence::Absent => Err(CodexAddPlan::InstallNatively),
+            }
+        }
+    }
+}
+
+/// The one branch of [`plan_codex_add`] that has to touch the machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodexAddPlan {
+    InstallNatively,
+}
+
+/// `hcom hooks add codex`: consume Codex's own inventory, then either report
+/// what the user must do or run the plugin install.
+pub(crate) fn add_codex_plugin() -> Result<CodexAddOutcome, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let status = codex_plugin_status(&cwd);
+    let plan = plan_codex_add(
+        &status,
+        &claude_presence(),
+        crate::hooks::plugin::verify_claude_plugin_installed(),
+    );
+    match plan {
+        Ok(outcome) => Ok(outcome),
+        Err(CodexAddPlan::InstallNatively) => {
+            crate::hooks::plugin::install_codex_plugin()?;
+            // Install success is not activation: ask Codex again.
+            match codex_plugin_status(&cwd).state {
+                CodexPluginState::Active => Ok(CodexAddOutcome::AlreadyActive),
+                state => Ok(CodexAddOutcome::InstalledUnverified(format!(
+                    "plugin installed; Codex reports: {}. Restart Codex, review the hooks, \
+                     then: hcom hooks status",
+                    state.headline()
+                ))),
+            }
+        }
+    }
+}
+
+/// Fetch Codex's hook inventory and classify it. A failed or timed-out fetch is
+/// `Unverified`, never "not installed": the discovery hints below it are not
+/// evidence of what is running.
+pub(crate) fn codex_plugin_status(cwd: &Path) -> CodexPluginStatus {
+    let codex_home = codex_config_dir();
+    // No Codex on this machine is "not installed", not "unverified": the
+    // unverified state means hcom could not read an inventory Codex would
+    // otherwise have, and its remediation tells the user to run a binary that
+    // is not there.
+    if crate::terminal::which_bin("codex").is_none() {
+        return CodexPluginStatus {
+            state: CodexPluginState::Missing,
+            details: vec!["no codex executable on PATH".to_string()],
+        };
+    }
+    match fetch_codex_hook_list(cwd, &codex_home) {
+        Ok(entries) => classify_codex_plugin_hooks(
+            &entries,
+            &get_codex_hooks_path(),
+            &codex_plugin_roots(&codex_home),
+        ),
+        Err(error) => {
+            let mut details = vec![format!("codex hooks/list unavailable: {error}")];
+            let roots = codex_plugin_roots(&codex_home);
+            for root in roots {
+                details.push(format!("plugin store populated: {}", root.display()));
+            }
+            details.push("run `codex app-server` once, then `hcom hooks status`".to_string());
+            CodexPluginStatus {
+                state: CodexPluginState::Unverified,
+                details,
+            }
+        }
+    }
+}
+
 fn hcom_trust_entries_from_hook_list(
     entries: &[CodexHookListEntry],
     hooks_path: &Path,
@@ -1211,6 +1797,8 @@ fn test_hook_list_from_hooks_json(hooks_path: &Path) -> Result<Vec<CodexHookList
         .enumerate()
         .map(|(index, key)| CodexHookListEntry {
             command: Some(hcom_command_for_hook_state_key(&key)),
+            event_name: Some(hcom_wire_event_for_hook_state_key(&key)),
+            plugin_id: None,
             key: Some(key),
             source: Some(CODEX_HOOK_SOURCE_USER.to_string()),
             source_path: Some(hooks_path.to_path_buf()),
@@ -2038,6 +2626,21 @@ fn hcom_command_for_hook_state_key(key: &str) -> String {
         }
     }
     key.to_string()
+}
+
+/// Codex's wire event name for the hook a key names. The key's event segment is
+/// snake_case while the `eventName` field is lowerCamelCase, so this translates
+/// through the registry instead of reusing the key text.
+fn hcom_wire_event_for_hook_state_key(key: &str) -> String {
+    let mut parts = key.rsplitn(4, ':');
+    let _handler_index = parts.next();
+    let _group_index = parts.next();
+    let label = parts.next().unwrap_or("unknown");
+    CODEX_HOOK_COMMANDS
+        .iter()
+        .find(|(event, _, _)| codex_hook_event_state_label(event) == label)
+        .map(|(event, _, _)| codex_hook_event_wire_name(event))
+        .unwrap_or_else(|| label.to_string())
 }
 
 fn verify_hcom_hook_keys_trusted_for_version(
@@ -2965,6 +3568,547 @@ mod tests {
                 .get("statusMessage")
                 .is_none()
         );
+    }
+
+    // ── Codex plugin activation classifier ──────────────────────────────────
+
+    const PLUGIN_ROOT: &str = "/codex-home/plugins/cache/hcom";
+
+    /// One inventory entry. `origin` picks the source/sourcePath pair, so a
+    /// fixture cannot accidentally claim plugin origin with a user path.
+    fn entry(
+        command: &str,
+        event: &str,
+        origin: &str,
+        hooks_path: &Path,
+        enabled: bool,
+        trust: Option<&str>,
+    ) -> CodexHookListEntry {
+        let (source, source_path) = match origin {
+            "plugin" => (
+                Some(CODEX_HOOK_SOURCE_PLUGIN.to_string()),
+                Some(PathBuf::from(PLUGIN_ROOT).join("hooks/hooks-codex.json")),
+            ),
+            "legacy" => (
+                Some(CODEX_HOOK_SOURCE_USER.to_string()),
+                Some(hooks_path.to_path_buf()),
+            ),
+            "project" => (
+                Some("project".to_string()),
+                Some(PathBuf::from("/repo/.codex/hooks.json")),
+            ),
+            other => panic!("unknown origin {other}"),
+        };
+        CodexHookListEntry {
+            key: Some(format!(
+                "{}:{event}:0:0",
+                source_path.as_ref().unwrap().display()
+            )),
+            command: Some(command.to_string()),
+            event_name: Some(event.to_string()),
+            plugin_id: (origin == "plugin").then(|| "hcom".to_string()),
+            source,
+            source_path,
+            enabled,
+            trust_status: trust.map(str::to_string),
+            current_hash: Some("sha256:fixture".to_string()),
+        }
+    }
+
+    /// The full correct handler set from one origin.
+    fn full_set(
+        origin: &str,
+        hooks_path: &Path,
+        enabled: bool,
+        trust: Option<&str>,
+    ) -> Vec<CodexHookListEntry> {
+        expected_codex_handlers()
+            .into_iter()
+            .map(|(forms, event)| entry(&forms[0], &event, origin, hooks_path, enabled, trust))
+            .collect()
+    }
+
+    fn classify(entries: &[CodexHookListEntry], roots: &[PathBuf]) -> CodexPluginStatus {
+        classify_codex_plugin_hooks(entries, Path::new("/codex-home/hooks.json"), roots)
+    }
+
+    fn plugin_roots() -> Vec<PathBuf> {
+        vec![PathBuf::from("/codex-home/plugins/cache")]
+    }
+
+    #[test]
+    fn classifier_covers_every_observable_state() {
+        let hooks_path = Path::new("/codex-home/hooks.json");
+        let complete_plugin = full_set("plugin", hooks_path, true, Some("trusted"));
+        let complete_legacy = full_set("legacy", hooks_path, true, Some("trusted"));
+
+        let mut duplicate = complete_plugin.clone();
+        duplicate.extend(complete_legacy.clone());
+
+        let mut disabled = complete_plugin.clone();
+        disabled[0].enabled = false;
+
+        let untrusted = full_set("plugin", hooks_path, true, Some("untrusted"));
+        let unknown_trust = full_set("plugin", hooks_path, true, Some("something-new"));
+
+        // Missing PostToolUse.
+        let incomplete: Vec<_> = complete_plugin
+            .iter()
+            .filter(|e| !e.command.as_deref().unwrap().ends_with("codex-posttooluse"))
+            .cloned()
+            .collect();
+
+        // Codex reading Claude's hooks.json out of the shared package.
+        let claude_handlers: Vec<_> = claude_handler_commands()
+            .into_iter()
+            .map(|command| {
+                entry(
+                    &command,
+                    "sessionStart",
+                    "plugin",
+                    hooks_path,
+                    true,
+                    Some("trusted"),
+                )
+            })
+            .collect();
+
+        // A repo shipping hcom's exact command completes nobody's set.
+        let foreign: Vec<_> = expected_codex_handlers()
+            .into_iter()
+            .map(|(forms, event)| {
+                entry(
+                    &forms[0],
+                    &event,
+                    "project",
+                    hooks_path,
+                    true,
+                    Some("trusted"),
+                )
+            })
+            .collect();
+
+        let cases: Vec<(
+            &str,
+            Vec<CodexHookListEntry>,
+            Vec<PathBuf>,
+            CodexPluginState,
+        )> = vec![
+            (
+                "complete plugin set",
+                complete_plugin.clone(),
+                plugin_roots(),
+                CodexPluginState::Active,
+            ),
+            (
+                "plugin and legacy",
+                duplicate,
+                plugin_roots(),
+                CodexPluginState::Duplicate,
+            ),
+            (
+                "one handler disabled",
+                disabled,
+                plugin_roots(),
+                CodexPluginState::Disabled,
+            ),
+            (
+                "untrusted",
+                untrusted,
+                plugin_roots(),
+                CodexPluginState::ReviewRequired,
+            ),
+            (
+                "unknown trust status",
+                unknown_trust,
+                plugin_roots(),
+                CodexPluginState::ReviewRequired,
+            ),
+            (
+                "legacy only",
+                complete_legacy,
+                Vec::new(),
+                CodexPluginState::LegacyOnly,
+            ),
+            (
+                "missing PostToolUse",
+                incomplete,
+                plugin_roots(),
+                CodexPluginState::Incomplete,
+            ),
+            (
+                "claude handlers",
+                claude_handlers,
+                plugin_roots(),
+                CodexPluginState::Incompatible,
+            ),
+            (
+                "foreign project hooks",
+                foreign,
+                Vec::new(),
+                CodexPluginState::Missing,
+            ),
+            (
+                "plugin store only",
+                Vec::new(),
+                plugin_roots(),
+                CodexPluginState::Discovered,
+            ),
+            (
+                "nothing at all",
+                Vec::new(),
+                Vec::new(),
+                CodexPluginState::Missing,
+            ),
+        ];
+
+        for (label, entries, roots, expected) in cases {
+            assert_eq!(classify(&entries, &roots).state, expected, "{label}");
+        }
+    }
+
+    /// A discovery hint never stands in for a runtime handler: the same empty
+    /// inventory is `Discovered` with a populated store and `Missing` without,
+    /// and neither ever reaches an active state.
+    #[test]
+    fn a_populated_plugin_store_never_reaches_an_active_state() {
+        let status = classify(&[], &plugin_roots());
+        assert_eq!(status.state, CodexPluginState::Discovered);
+        assert!(!status.state.headline().contains("active"));
+    }
+
+    /// The correct command bound to the wrong event is not a working handler.
+    #[test]
+    fn a_handler_on_the_wrong_event_does_not_complete_the_set() {
+        let hooks_path = Path::new("/codex-home/hooks.json");
+        let mut entries = full_set("plugin", hooks_path, true, Some("trusted"));
+        entries[0].event_name = Some("postCompact".to_string());
+
+        let status = classify(&entries, &plugin_roots());
+        assert_eq!(status.state, CodexPluginState::Incomplete);
+        assert!(
+            status.details.iter().any(|d| d.contains("expected")),
+            "no wrong-event detail in {:?}",
+            status.details
+        );
+    }
+
+    /// Task 3 must not widen hcom's ownership predicate: a plugin-sourced entry
+    /// is never eligible for trust-state writes or the invocation-wide bypass.
+    #[test]
+    fn plugin_entries_are_not_hcom_owned_user_hooks() {
+        let hooks_path = Path::new("/codex-home/hooks.json");
+        let expected = expected_hcom_hook_commands();
+        for entry in full_set("plugin", hooks_path, true, Some("trusted")) {
+            assert!(!hook_list_entry_is_hcom_owned(
+                &entry, &expected, hooks_path
+            ));
+        }
+    }
+
+    /// Codex returns one group per hook layer; reading only the first would
+    /// drop a plugin's handlers and report the plugin as missing.
+    #[test]
+    fn parser_reads_every_returned_hook_group() {
+        let response = serde_json::json!({
+            "result": { "data": [
+                { "hooks": [{ "key": "a", "command": "hcom codex-stop", "eventName": "stop" }] },
+                { "hooks": [{ "key": "b", "command": "hcom codex-sessionstart", "eventName": "sessionStart" }] },
+            ]}
+        });
+        let entries = parse_codex_hook_list_entries(&response).unwrap();
+        assert_eq!(entries.len(), 2, "second group dropped: {entries:?}");
+        assert_eq!(entries[1].event_name.as_deref(), Some("sessionStart"));
+    }
+
+    /// movu (Codex) found this: the committed overlay ships the self-resolving
+    /// guard, not the resolved `hcom codex-stop`, so a classifier matching only
+    /// the resolved form sees none of the plugin's own handlers and reports a
+    /// live plugin as missing. Built from the manifest hcom actually ships.
+    #[test]
+    fn the_shipped_overlay_commands_are_recognized() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../plugin/hcom/hooks/hooks-codex.json")).unwrap();
+        let hooks_path = Path::new("/codex-home/hooks.json");
+
+        let entries: Vec<CodexHookListEntry> = CODEX_HOOK_COMMANDS
+            .iter()
+            .map(|(event, _, _)| {
+                let command = manifest["hooks"][event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap();
+                entry(
+                    command,
+                    &codex_hook_event_wire_name(event),
+                    "plugin",
+                    hooks_path,
+                    true,
+                    Some("trusted"),
+                )
+            })
+            .collect();
+
+        let status = classify_codex_plugin_hooks(&entries, hooks_path, &plugin_roots());
+        assert_eq!(
+            status.state,
+            CodexPluginState::Active,
+            "shipped overlay commands unrecognized: {:?}",
+            status.details
+        );
+    }
+
+    /// An entry that never says which event it is bound to has not shown it is
+    /// bound to the right one.
+    #[test]
+    fn a_handler_without_event_identity_does_not_count() {
+        let hooks_path = Path::new("/codex-home/hooks.json");
+        let mut entries = full_set("plugin", hooks_path, true, Some("trusted"));
+        entries[0].event_name = None;
+        entries[0].key = None;
+
+        assert_eq!(
+            classify(&entries, &plugin_roots()).state,
+            CodexPluginState::Incomplete
+        );
+    }
+
+    /// Double-fire is per event and about what is enabled — not about two
+    /// complete sets. One enabled legacy handler beside a complete plugin set
+    /// fires twice; a complete but fully disabled legacy set fires once.
+    #[test]
+    fn duplicate_tracks_enabled_overlap_not_two_complete_sets() {
+        let hooks_path = Path::new("/codex-home/hooks.json");
+
+        let mut one_legacy = full_set("plugin", hooks_path, true, Some("trusted"));
+        one_legacy.push(full_set("legacy", hooks_path, true, Some("trusted")).remove(0));
+        assert_eq!(
+            classify(&one_legacy, &plugin_roots()).state,
+            CodexPluginState::Duplicate,
+            "a single enabled legacy handler still double-fires"
+        );
+
+        let mut disabled_legacy = full_set("plugin", hooks_path, true, Some("trusted"));
+        disabled_legacy.extend(full_set("legacy", hooks_path, false, Some("trusted")));
+        assert_eq!(
+            classify(&disabled_legacy, &plugin_roots()).state,
+            CodexPluginState::Active,
+            "a disabled legacy set does not fire"
+        );
+    }
+
+    /// A group Codex could not evaluate is not an empty group: swallowing it
+    /// turns a failed inventory into "nothing installed", which is what decides
+    /// whether hcom installs.
+    #[test]
+    fn a_group_error_or_malformed_group_is_not_an_empty_inventory() {
+        let with_errors = serde_json::json!({
+            "result": { "data": [{ "hooks": [], "errors": ["config parse failed"] }] }
+        });
+        assert!(
+            parse_codex_hook_list_entries(&with_errors)
+                .unwrap_err()
+                .contains("reported errors")
+        );
+
+        let malformed = serde_json::json!({ "result": { "data": [{ "hooks": "nope" }] } });
+        assert!(
+            parse_codex_hook_list_entries(&malformed)
+                .unwrap_err()
+                .contains("without a hooks array")
+        );
+    }
+
+    /// Pinned to a real `hooks/list` response: codex-cli 0.154.0, `CODEX_HOME`
+    /// in a scratch dir carrying hcom's five hooks (2026-09-14). This is where
+    /// the wire vocabulary is measured rather than assumed — `eventName` is
+    /// lowerCamelCase while the same entry's `key` segment is snake_case, so a
+    /// classifier comparing the two would call a healthy install incomplete.
+    #[test]
+    fn a_measured_inventory_classifies_as_the_legacy_native_install() {
+        let hooks_path = Path::new("/tmp/scratch-codex/hooks.json");
+        let measured = serde_json::json!({ "result": { "data": [{
+            "cwd": "/work",
+            "hooks": [
+                { "key": "/tmp/scratch-codex/hooks.json:pre_tool_use:0:0", "eventName": "preToolUse",
+                  "command": "hcom codex-pretooluse", "matcher": "Bash", "sourcePath": "/tmp/scratch-codex/hooks.json",
+                  "source": "user", "pluginId": null, "enabled": true, "isManaged": false, "trustStatus": "trusted" },
+                { "key": "/tmp/scratch-codex/hooks.json:post_tool_use:0:0", "eventName": "postToolUse",
+                  "command": "hcom codex-posttooluse", "matcher": "Bash", "sourcePath": "/tmp/scratch-codex/hooks.json",
+                  "source": "user", "pluginId": null, "enabled": true, "isManaged": false, "trustStatus": "trusted" },
+                { "key": "/tmp/scratch-codex/hooks.json:session_start:0:0", "eventName": "sessionStart",
+                  "command": "hcom codex-sessionstart", "matcher": "startup|resume|clear", "sourcePath": "/tmp/scratch-codex/hooks.json",
+                  "source": "user", "pluginId": null, "enabled": true, "isManaged": false, "trustStatus": "trusted" },
+                { "key": "/tmp/scratch-codex/hooks.json:user_prompt_submit:0:0", "eventName": "userPromptSubmit",
+                  "command": "hcom codex-userpromptsubmit", "matcher": null, "sourcePath": "/tmp/scratch-codex/hooks.json",
+                  "source": "user", "pluginId": null, "enabled": true, "isManaged": false, "trustStatus": "trusted" },
+                { "key": "/tmp/scratch-codex/hooks.json:stop:0:0", "eventName": "stop",
+                  "command": "hcom codex-stop", "matcher": null, "sourcePath": "/tmp/scratch-codex/hooks.json",
+                  "source": "user", "pluginId": null, "enabled": true, "isManaged": false, "trustStatus": "trusted" }
+            ],
+            "warnings": [], "errors": []
+        }]}});
+
+        let entries = parse_codex_hook_list_entries(&measured).unwrap();
+        assert_eq!(entries.len(), 5);
+        let status = classify_codex_plugin_hooks(&entries, hooks_path, &[]);
+        assert_eq!(
+            status.state,
+            CodexPluginState::LegacyOnly,
+            "measured inventory misclassified: {:?}",
+            status.details
+        );
+    }
+
+    // ── Task 4: add/remove routing ──────────────────────────────────────────
+
+    fn status_of(state: CodexPluginState) -> CodexPluginStatus {
+        CodexPluginStatus {
+            state,
+            details: vec!["detail".to_string()],
+        }
+    }
+
+    #[test]
+    fn add_routes_every_state_without_installing_on_its_own() {
+        use ClaudePresence::*;
+
+        let present = Present;
+        let absent = Absent;
+        let unknown = Indeterminate("permission denied".to_string());
+
+        // Nothing but a complete, trusted, enabled set counts as done.
+        assert_eq!(
+            plan_codex_add(&status_of(CodexPluginState::Active), &absent, false),
+            Ok(CodexAddOutcome::AlreadyActive)
+        );
+
+        // Every state that needs the user says so, and installs nothing.
+        for state in [
+            CodexPluginState::Duplicate,
+            CodexPluginState::ReviewRequired,
+            CodexPluginState::Disabled,
+            CodexPluginState::Incompatible,
+            CodexPluginState::Unverified,
+            CodexPluginState::LegacyOnly,
+        ] {
+            let outcome = plan_codex_add(&status_of(state), &absent, false);
+            assert!(
+                matches!(outcome, Ok(CodexAddOutcome::ActionRequired(_))),
+                "{state:?} did not stop for the user: {outcome:?}"
+            );
+        }
+
+        // Duplicate must point at the legacy-only removal, never a plain
+        // remove (which would take the plugin down too).
+        let Ok(CodexAddOutcome::ActionRequired(text)) =
+            plan_codex_add(&status_of(CodexPluginState::Duplicate), &absent, false)
+        else {
+            panic!("duplicate must be action-required");
+        };
+        assert!(text.contains("--legacy-only"), "{text}");
+
+        // An unusable inventory installs nothing, whatever Claude's state is.
+        for claude in [&present, &absent, &unknown] {
+            assert!(
+                matches!(
+                    plan_codex_add(&status_of(CodexPluginState::Unverified), claude, false),
+                    Ok(CodexAddOutcome::ActionRequired(_))
+                ),
+                "unverified installed anyway with claude {claude:?}"
+            );
+        }
+
+        // Claude present: import guidance, and the prerequisite only when
+        // Claude's own plugin is not installed yet.
+        let Ok(CodexAddOutcome::ActionRequired(text)) =
+            plan_codex_add(&status_of(CodexPluginState::Missing), &present, false)
+        else {
+            panic!("claude present must be action-required");
+        };
+        assert!(text.contains("/import"), "{text}");
+        assert!(text.contains("hcom hooks add claude"), "{text}");
+        let Ok(CodexAddOutcome::ActionRequired(text)) =
+            plan_codex_add(&status_of(CodexPluginState::Missing), &present, true)
+        else {
+            panic!("claude present must be action-required");
+        };
+        assert!(!text.contains("hcom hooks add claude"), "{text}");
+
+        // Indeterminate never writes.
+        assert!(matches!(
+            plan_codex_add(&status_of(CodexPluginState::Missing), &unknown, false),
+            Ok(CodexAddOutcome::ActionRequired(_))
+        ));
+
+        // Only a confirmed absence reaches the installer.
+        for state in [
+            CodexPluginState::Missing,
+            CodexPluginState::Incomplete,
+            CodexPluginState::Discovered,
+        ] {
+            assert_eq!(
+                plan_codex_add(&status_of(state), &absent, false),
+                Err(CodexAddPlan::InstallNatively),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// The probe must distinguish "no Claude here" from "Claude did not
+    /// answer": only the first may install, and a wrong answer creates the
+    /// duplicate the import route exists to avoid.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn claude_presence_separates_absence_from_an_unusable_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::var_os("PATH");
+        let original_home = std::env::var_os("HOME");
+        let restore = |key: &str, value: &Option<std::ffi::OsString>| match value {
+            Some(path) => unsafe { std::env::set_var(key, path) },
+            None => unsafe { std::env::remove_var(key) },
+        };
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        // `which_bin` also probes well-known install locations under $HOME, so
+        // an isolated PATH alone would still find this machine's real Claude.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        assert_eq!(claude_presence(), ClaudePresence::Absent, "empty PATH");
+
+        let fake = dir.path().join("claude");
+        let write = |body: &str| {
+            std::fs::write(&fake, body).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        write("#!/bin/sh\nexit 0\n");
+        assert_eq!(claude_presence(), ClaudePresence::Present);
+
+        write("#!/bin/sh\nexit 3\n");
+        assert!(
+            matches!(claude_presence(), ClaudePresence::Indeterminate(_)),
+            "a non-zero exit is not proof Claude is absent"
+        );
+
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            matches!(claude_presence(), ClaudePresence::Indeterminate(_)),
+            "an unrunnable binary is not proof Claude is absent"
+        );
+
+        restore("PATH", &original);
+        restore("HOME", &original_home);
+    }
+
+    /// A malformed response is unverified, never "not installed".
+    #[test]
+    fn a_schema_error_is_not_a_verdict_about_installation() {
+        let error =
+            parse_codex_hook_list_entries(&serde_json::json!({ "result": {} })).unwrap_err();
+        assert!(error.contains("did not contain hooks"), "{error}");
+        assert_eq!(CodexPluginState::Unverified.headline(), "state unverified");
     }
 
     // ── GHSA-pwv3-8r7h-p373: hook identity must be source-scoped ────────────

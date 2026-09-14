@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd codex-sessionstart || exit 0"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd codex-userpromptsubmit || exit 0"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd codex-pretooluse || exit 0"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd codex-posttooluse || exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd codex-stop || exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

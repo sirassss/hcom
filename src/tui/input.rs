@@ -1361,7 +1361,10 @@ mod tests {
         assert_eq!(app.ui.msg_filter.text, "no");
         assert!(app.ui.inline_filter_changed);
         assert!(!app.ui.needs_clear_replay);
-        assert!(!app.ui.needs_resize, "filter replay must preserve scrollback");
+        assert!(
+            !app.ui.needs_resize,
+            "filter replay must preserve scrollback"
+        );
     }
 
     #[test]

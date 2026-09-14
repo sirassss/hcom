@@ -155,6 +155,24 @@ pub(crate) fn plugin_status_line(tool: &str, plugin: bool, legacy: bool) -> Stri
     }
 }
 
+fn agy_skill_payload_status_line(payload: Result<(), String>) -> String {
+    match payload {
+        Ok(()) => String::new(),
+        Err(reason) => format!(
+            "antigravity: hooks present; messaging skill payload is missing or incomplete \
+             ({reason}). Run: hcom hooks add antigravity to reinstall the complete plugin."
+        ),
+    }
+}
+
+fn plugin_add_can_short_circuit(
+    tool: Tool,
+    hooks_installed: bool,
+    agy_payload_complete: bool,
+) -> bool {
+    hooks_installed && (tool != Tool::Antigravity || agy_payload_complete)
+}
+
 /// Whether tool's legacy (pre-plugin) hook entries are still present.
 /// Only meaningful for tools that `hooks_ship_as_plugin()`.
 pub(crate) fn legacy_hooks_present(tool: Tool) -> bool {
@@ -167,6 +185,42 @@ pub(crate) fn legacy_hooks_present(tool: Tool) -> bool {
 }
 
 /// Show hook installation status for all tools.
+/// Render a Codex hook status as the lines `hooks status` prints. Separated
+/// from the printing so the states that must never read as "active" can be
+/// asserted in a unit test.
+fn codex_status_lines(
+    status: &crate::hooks::codex::CodexPluginStatus,
+    hooks_path: &str,
+    claude: &crate::hooks::codex::ClaudePresence,
+) -> Vec<String> {
+    use crate::hooks::codex::CodexPluginState;
+
+    let mut lines = vec![match status.state {
+        // Only the states that actually observed hcom's legacy file name it.
+        CodexPluginState::LegacyOnly | CodexPluginState::Duplicate => {
+            format!("codex:  {} ({hooks_path})", status.state.headline())
+        }
+        // The spec splits "no hooks" in two, on whether Codex can import an
+        // installed Claude plugin. Only a confirmed presence changes the
+        // headline: a probe that could not answer leaves "not installed"
+        // standing and says why.
+        CodexPluginState::Missing => match claude {
+            crate::hooks::codex::ClaudePresence::Present => {
+                "codex:  not active; import from Claude required".to_string()
+            }
+            _ => format!("codex:  {}", status.state.headline()),
+        },
+        _ => format!("codex:  {}", status.state.headline()),
+    }];
+    if let crate::hooks::codex::ClaudePresence::Indeterminate(why) = claude
+        && status.state == CodexPluginState::Missing
+    {
+        lines.push(format!("  could not check for Claude: {why}"));
+    }
+    lines.extend(status.details.iter().map(|detail| format!("  {detail}")));
+    lines
+}
+
 fn cmd_hooks_status() -> i32 {
     let status = get_tool_status();
     for (tool, installed, path) in &status {
@@ -194,6 +248,14 @@ fn cmd_hooks_status() -> i32 {
                 println!("  {advice}");
             }
             if tool == Tool::Antigravity && *installed {
+                let payload = agy_skill_payload_status_line(
+                    crate::hooks::plugin::verify_plugin_skill_payload(
+                        &crate::hooks::plugin::agy_plugin_dir(),
+                    ),
+                );
+                if !payload.is_empty() {
+                    println!("  {payload}");
+                }
                 use crate::hooks::plugin::AgyHooks;
                 match crate::hooks::plugin::agy_hook_state() {
                     // Our own manifest. The import entry says `claude-code`
@@ -224,6 +286,25 @@ fn cmd_hooks_status() -> i32 {
                             .display()
                     ),
                 }
+            }
+        } else if tool == Tool::Codex {
+            // Codex's own inventory is the only authority on what is firing:
+            // a legacy hooks.json on disk says nothing about a plugin's
+            // handlers, and vice versa. `installed` is deliberately unused here.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // `path` here is Codex's config.toml; hcom's legacy hook entries
+            // live in hooks.json beside it, and that is the file the legacy
+            // states are about.
+            let hooks_file = crate::hooks::codex::get_codex_hooks_path();
+            let codex_status = crate::hooks::codex::codex_plugin_status(&cwd);
+            // Probe Claude only when the answer can change what is printed.
+            let claude = if codex_status.state == crate::hooks::codex::CodexPluginState::Missing {
+                crate::hooks::codex::claude_presence()
+            } else {
+                crate::hooks::codex::ClaudePresence::Absent
+            };
+            for line in codex_status_lines(&codex_status, &hooks_file.to_string_lossy(), &claude) {
+                println!("{line}");
             }
         } else if *installed {
             println!("{}:  installed    ({path})", tool.spec().label);
@@ -261,11 +342,37 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         Already,
         Added,
         LegacyStripped,
+        /// Nothing was installed, or an install is not yet confirmed running.
+        /// Exit 2, so a dotfiles installer can tell "you must act" apart from
+        /// both success and failure.
+        Pending(String),
         Failed(Option<String>),
     }
     let mut results: Vec<(Tool, AddResult)> = Vec::new();
     for tool in &tools {
-        if tool.verify_hooks_installed(include_permissions) {
+        // Codex routes on its own hook inventory, not on a file check: the
+        // legacy file says nothing about a plugin's handlers, and nothing here
+        // may strip the legacy entries, which are the only thing firing until
+        // the user trusts the plugin.
+        if *tool == Tool::Codex {
+            let outcome = match crate::hooks::codex::add_codex_plugin() {
+                Ok(crate::hooks::codex::CodexAddOutcome::AlreadyActive) => AddResult::Already,
+                Ok(crate::hooks::codex::CodexAddOutcome::ActionRequired(text))
+                | Ok(crate::hooks::codex::CodexAddOutcome::InstalledUnverified(text)) => {
+                    AddResult::Pending(text)
+                }
+                Err(error) => AddResult::Failed(Some(error)),
+            };
+            results.push((*tool, outcome));
+            continue;
+        }
+        let hooks_installed = tool.verify_hooks_installed(include_permissions);
+        let agy_payload_complete = *tool != Tool::Antigravity
+            || crate::hooks::plugin::verify_plugin_skill_payload(
+                &crate::hooks::plugin::agy_plugin_dir(),
+            )
+            .is_ok();
+        if plugin_add_can_short_circuit(*tool, hooks_installed, agy_payload_complete) {
             // Plugin present but the legacy entries survived — a machine that
             // installed the plugin by hand, or a config synced from another
             // host. Both sets fire. Finishing the migration is the whole job of
@@ -299,7 +406,8 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
     // Report results
     let post_status = get_tool_status();
     let mut added_count = 0;
-    let mut fail_count = 0;
+    let mut fail_count: usize = 0;
+    let mut pending_count: usize = 0;
     for (tool, outcome) in &results {
         let path = post_status
             .iter()
@@ -325,6 +433,13 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 println!("Added {name} hooks  {location}");
                 added_count += 1;
             }
+            AddResult::Pending(text) => {
+                println!("{name}: action required");
+                for line in text.lines() {
+                    println!("  {line}");
+                }
+                pending_count += 1;
+            }
             AddResult::Failed(Some(e)) => {
                 eprintln!("Failed to add {name} hooks: {e}");
                 fail_count += 1;
@@ -345,7 +460,21 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         }
     }
 
-    if fail_count > 0 { 1 } else { 0 }
+    add_exit_code(fail_count, pending_count)
+}
+
+/// `hooks add` exit contract, frozen here because the dotfiles installer reads
+/// it: 1 = something failed, 2 = nothing failed but the user must act, 0 =
+/// done. An error outranks a pending outcome, so `add all` that failed
+/// somewhere never reports as merely "needs your attention".
+fn add_exit_code(fail_count: usize, pending_count: usize) -> i32 {
+    if fail_count > 0 {
+        1
+    } else if pending_count > 0 {
+        2
+    } else {
+        0
+    }
 }
 
 /// Remove hooks for specified tool(s). Called from both `hcom hooks remove` and `hcom reset hooks`.
@@ -467,6 +596,85 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
 mod tests {
     use super::*;
 
+    /// No state reachable without a usable inventory may read as active or as
+    /// an observation that both hook sets are firing.
+    #[test]
+    fn add_exit_code_puts_failure_above_pending() {
+        assert_eq!(super::add_exit_code(0, 0), 0);
+        assert_eq!(super::add_exit_code(0, 2), 2);
+        assert_eq!(super::add_exit_code(1, 0), 1);
+        assert_eq!(
+            super::add_exit_code(1, 3),
+            1,
+            "a failure must not report as pending"
+        );
+    }
+
+    /// Codex is routed explicitly in `cmd_hooks_add`, not through the
+    /// plugin-tool fast path — that path strips the legacy entries, and
+    /// Codex's are the only hooks firing until the user trusts the plugin.
+    #[test]
+    fn codex_never_reaches_the_automatic_legacy_strip() {
+        assert!(
+            !Tool::Codex.hooks_ship_as_plugin(),
+            "Codex in the plugin fast path would strip its legacy hooks on `hooks add`"
+        );
+    }
+
+    #[test]
+    fn codex_states_without_evidence_never_claim_hooks_are_firing() {
+        use crate::hooks::codex::{CodexPluginState, CodexPluginStatus};
+
+        for state in [
+            CodexPluginState::Unverified,
+            CodexPluginState::Discovered,
+            CodexPluginState::Missing,
+            CodexPluginState::Incomplete,
+            CodexPluginState::Incompatible,
+        ] {
+            let status = CodexPluginStatus {
+                state,
+                details: vec!["plugin store populated: /codex-home/plugins/cache".to_string()],
+            };
+            let rendered = super::codex_status_lines(
+                &status,
+                "/codex-home/hooks.json",
+                &crate::hooks::codex::ClaudePresence::Absent,
+            )
+            .join("\n");
+            assert!(
+                !rendered.contains("hooks active") && !rendered.contains("both are firing"),
+                "{state:?} rendered as an activation claim: {rendered}"
+            );
+            // The legacy path is evidence of nothing in these states, so it
+            // must not appear next to the headline.
+            assert!(
+                !rendered.lines().next().unwrap().contains("hooks.json"),
+                "{state:?} named the legacy file without observing it: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_duplicate_names_the_legacy_file_to_remove() {
+        use crate::hooks::codex::{CodexPluginState, CodexPluginStatus};
+
+        let rendered = super::codex_status_lines(
+            &CodexPluginStatus {
+                state: CodexPluginState::Duplicate,
+                details: Vec::new(),
+            },
+            "/codex-home/hooks.json",
+            &crate::hooks::codex::ClaudePresence::Absent,
+        )
+        .join("\n");
+        assert!(
+            rendered.contains("duplicate hooks; double-fire risk"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/codex-home/hooks.json"), "{rendered}");
+    }
+
     #[test]
     fn status_flags_plugin_and_legacy_coexisting() {
         let line =
@@ -477,6 +685,30 @@ mod tests {
         // advice — it takes the plugin down too, leaving no hooks at all.
         assert!(line.contains("hcom hooks add claude"), "{line}");
         assert!(!line.contains("hooks remove"), "{line}");
+    }
+
+    #[test]
+    fn agy_hooks_without_skill_payload_require_reinstall() {
+        assert!(
+            !super::plugin_add_can_short_circuit(Tool::Antigravity, true, false),
+            "hook presence alone must not bypass AGY repair"
+        );
+        let line = super::agy_skill_payload_status_line(Err(
+            "missing skill payload skills/hcom-agent-messaging/SKILL.md".to_string(),
+        ));
+        assert!(line.contains("hooks present"), "{line}");
+        assert!(line.contains("skill payload"), "{line}");
+        assert!(line.contains("hcom hooks add antigravity"), "{line}");
+    }
+
+    #[test]
+    fn complete_agy_payload_can_use_the_installed_shortcut() {
+        assert!(super::plugin_add_can_short_circuit(
+            Tool::Antigravity,
+            true,
+            true
+        ));
+        assert!(super::agy_skill_payload_status_line(Ok(())).is_empty());
     }
 
     /// Cursor cannot take the same advice: its verifier only proves a

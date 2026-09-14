@@ -17,6 +17,18 @@
 //! | Descriptor read | `.claude-plugin/plugin.json` | `.cursor-plugin/plugin.json` | `.claude-plugin/plugin.json` |
 //! | Enabled marker | `enabledPlugins` in settings.json | not measured | `import_manifest.json` |
 //!
+//! Codex is not in that table. Measured read-only on codex-cli 0.154.0
+//! (2026-09-14): the binary carries `.codex-plugin/plugin.json` alongside
+//! `.claude-plugin/plugin.json` and `.cursor-plugin/plugin.json`, so the
+//! overlay descriptor directory is the right one, and `skills/` is its default
+//! skill root. It also carries a `hooks/hooks.json` literal, so whether the
+//! manifest's `hooks` key actually overrides that convention is **unverified**
+//! — no install/import probe was run, and `codex plugin` exposes no `validate`.
+//! If the convention wins, Codex would read Claude's `hooks/hooks.json` and get
+//! Claude handlers; that is the `Incompatible` state Task 3 classifies, and
+//! Task 6 is where import is exercised. The committed overlay payload is pinned
+//! against `CODEX_HOOK_COMMANDS` by unit test only.
+//!
 //! Three consequences the design has to absorb:
 //!
 //! 1. **Antigravity reads the same `hooks/hooks.json` Claude does**, ignores a
@@ -55,9 +67,17 @@ use std::path::{Path, PathBuf};
 /// Plugin name as every tool addresses it.
 pub(crate) const PLUGIN_NAME: &str = "hcom";
 
-/// Marketplace-qualified id in Claude's `enabledPlugins`: `<plugin>@<marketplace>`.
+/// Marketplace-qualified id, `<plugin>@<marketplace>`: what Claude records in
+/// `enabledPlugins` and what both `claude plugin install` and `codex plugin add`
+/// take as their selector.
+///
 /// Both halves are `hcom` because `.claude-plugin/marketplace.json` names the
-/// marketplace `hcom` and the plugin inside it `hcom`.
+/// marketplace `hcom` and the plugin inside it `hcom` — and Codex resolves the
+/// same file: its binary carries `.claude-plugin/marketplace.json` and
+/// `.cursor-plugin/marketplace.json` literals and **no** `.codex-plugin`
+/// variant (measured, codex-cli 0.154.0). So there is nothing Codex-specific to
+/// add for the marketplace descriptor, and the name is shared rather than
+/// Claude's alone despite what this constant is called.
 pub(crate) const CLAUDE_PLUGIN_ID: &str = "hcom@hcom";
 
 /// Marketplace name alone, as it appears in `extraKnownMarketplaces`.
@@ -91,6 +111,59 @@ pub(crate) fn agy_plugin_dir() -> PathBuf {
 /// root reports `hooks: skipped (not found)`, and a `hooks` key in
 /// `gemini-extension.json` is ignored.
 pub(crate) const AGY_HOOKS_RELATIVE: &str = "hooks/hooks.json";
+
+/// Canonical messaging-skill payload every staged plugin must carry.
+///
+/// Keep this explicit: checking only `SKILL.md` let an apparently installed
+/// plugin fail as soon as the skill followed one of its bundled references.
+const PLUGIN_SKILL_FILES: &[&str] = &[
+    "SKILL.md",
+    "references/cross-tool.md",
+    "references/gotchas.md",
+    "references/patterns.md",
+    "references/script-template.md",
+    "references/scripts/basic-messaging.sh",
+    "references/scripts/cascade-pipeline.sh",
+    "references/scripts/codex-worker.sh",
+    "references/scripts/cross-tool-duo.sh",
+    "references/scripts/ensemble-consensus.sh",
+    "references/scripts/review-loop.sh",
+];
+
+/// Verify a staged or installed plugin has the complete canonical skill and
+/// that none of its required files resolves outside the artifact root.
+///
+/// This is deliberately separate from [`verify_agy_plugin_installed`], whose
+/// compatibility contract is only "the AGY hook file is present".
+pub(crate) fn verify_plugin_skill_payload(root: &Path) -> Result<(), String> {
+    let artifact_root = root
+        .canonicalize()
+        .map_err(|e| format!("plugin artifact {} is not readable: {e}", root.display()))?;
+    let skill_root = root.join("skills").join("hcom-agent-messaging");
+
+    for relative in PLUGIN_SKILL_FILES {
+        let path = skill_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("missing skill payload {}: {e}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "skill payload {} must be a regular file inside the plugin artifact",
+                path.display()
+            ));
+        }
+        let resolved = path
+            .canonicalize()
+            .map_err(|e| format!("skill payload {} is not readable: {e}", path.display()))?;
+        if !resolved.starts_with(&artifact_root) {
+            return Err(format!(
+                "skill payload {} resolves outside plugin artifact {}",
+                path.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Antigravity's record of imported plugins.
 pub(crate) fn agy_import_manifest() -> PathBuf {
@@ -393,20 +466,57 @@ fn run_tool_cli(program: &str, args: &[&str]) -> Result<(), String> {
     ))
 }
 
+/// Build a self-contained plugin artifact without relying on the target CLI
+/// to dereference the repository's canonical-skill link.
+fn stage_plugin_artifact(
+    source_root: &Path,
+    adapter: &str,
+) -> Result<(tempfile::TempDir, PathBuf), String> {
+    let staging = tempfile::tempdir()
+        .map_err(|e| format!("could not create plugin staging directory: {e}"))?;
+    let destination = staging.path().join(adapter);
+    super::plugin_stage::materialize_plugin_artifact(source_root, adapter, &destination)?;
+    verify_plugin_skill_payload(&destination)
+        .map_err(|e| format!("staged plugin payload is incomplete: {e}"))?;
+    Ok((staging, destination))
+}
+
+fn install_agy_plugin_from_root<I, V, S>(
+    root: &Path,
+    install: I,
+    verify: V,
+    strip: S,
+) -> Result<(), String>
+where
+    I: FnOnce(&Path) -> Result<(), String>,
+    V: FnOnce() -> bool,
+    S: FnOnce() -> bool,
+{
+    let (_staging, source) = stage_plugin_artifact(root, "hcom-agy")?;
+    install_then_strip(|| install(&source), verify, strip)
+}
+
 /// Upstream's published repository: the fallback `marketplace_source` returns
 /// for both Claude and Cursor installs when no fork remote can be resolved.
 pub(crate) const HCOM_REPOSITORY_URL: &str = "https://github.com/aannoo/hcom";
 
 /// Marketplace source: the git remote the checkout's current branch tracks.
 ///
-/// A developer's work lives on a fork, and that fork is what Claude and Cursor
-/// must index — Claude has no branch flag, so the fork's default branch has to
-/// carry the work. Handing Claude the `dev_root` *path* instead (what this used
-/// to do) re-points the marketplace at a local directory and undoes that.
+/// The owner runs their own fork and consumes it as a git marketplace, so every
+/// vendor indexes that fork rather than upstream or a local directory. A local
+/// path would be fresher, but it is not what the other machines and the other
+/// vendors can reach, and Cursor cannot take one at all.
+///
+/// Whatever this returns has to be fetchable: an SSH remote configured through a
+/// `~/.ssh/config` host alias is normalized to the alias's real hostname by
+/// [`normalize_git_url`], because the alias itself is not a DNS name.
+///
+/// Note this URL carries no ref, so a vendor resolves the fork's **default
+/// branch**. Work on another branch is invisible to an install until it lands
+/// there.
+///
 /// Antigravity does not call this: `agy plugin install` takes a directory only.
 fn marketplace_source() -> String {
-    // `paths::db_path()` is a free function, so nothing has to be threaded
-    // through to reach dev_root here.
     let db_path = crate::paths::db_path();
     let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) else {
         return HCOM_REPOSITORY_URL.to_string();
@@ -446,16 +556,51 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// `git@host:owner/repo.git` → `https://host/owner/repo`. Neither Claude nor
-/// Cursor accepts an SSH remote as a marketplace source.
+/// `git@host:owner/repo.git` → `https://host/owner/repo`, resolving SSH host
+/// aliases. Neither Claude nor Cursor accepts an SSH remote as a marketplace
+/// source, and a `~/.ssh/config` alias is not a DNS name — a fork cloned through
+/// one would otherwise produce a URL that resolves nowhere, the same failure as
+/// handing Cursor a path.
 fn normalize_git_url(url: &str) -> String {
+    normalize_git_url_with(url, resolve_ssh_hostname)
+}
+
+/// Testable half: `resolve` maps an SSH host alias to its real hostname.
+fn normalize_git_url_with(url: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
     let url = url.trim().trim_end_matches(".git");
     if let Some(rest) = url.strip_prefix("git@")
         && let Some((host, path)) = rest.split_once(':')
     {
+        let host = resolve(host).unwrap_or_else(|| host.to_string());
+        return format!("https://{host}/{path}");
+    }
+    // `ssh://[user@]host/owner/repo` is the other remote form git writes, and a
+    // marketplace takes no ssh scheme either.
+    if let Some(rest) = url.strip_prefix("ssh://")
+        && let Some((authority, path)) = rest.split_once('/')
+    {
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = resolve(host).unwrap_or_else(|| host.to_string());
         return format!("https://{host}/{path}");
     }
     url.to_string()
+}
+
+/// Ask ssh for the effective `HostName` of a host pattern. `ssh -G` prints the
+/// resolved configuration and connects to nothing.
+fn resolve_ssh_hostname(host: &str) -> Option<String> {
+    let out = std::process::Command::new("ssh")
+        .args(["-G", host])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("hostname "))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 pub(crate) fn install_claude_plugin() -> Result<(), String> {
@@ -517,17 +662,23 @@ pub(crate) fn install_cursor_plugin() -> Result<(), String> {
 pub(crate) fn install_agy_plugin() -> Result<(), String> {
     let db_path = crate::paths::db_path();
     let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) else {
-        return Err(
-            "agy plugin install needs a local checkout of hcom (agy rejects a URL here). \
-             Clone the repo, then run by hand: agy plugin install <repo>/plugin/hcom-agy"
-                .to_string(),
-        );
+        let command = if cfg!(windows) {
+            "$env:HCOM_DEV_ROOT = '<repo>'; hcom hooks add antigravity"
+        } else {
+            "HCOM_DEV_ROOT='<repo>' hcom hooks add antigravity"
+        };
+        return Err(format!(
+            "Antigravity plugin installation needs a local checkout of hcom because agy \
+             rejects a URL. Clone the repo, then run: {command}"
+        ));
     };
-    let source = root.join("plugin").join("hcom-agy");
-    let source = source.to_string_lossy().to_string();
-    install_then_strip(
-        || run_tool_cli("agy", &["plugin", "install", &source]),
-        verify_agy_plugin_installed,
+    install_agy_plugin_from_root(
+        &root,
+        |source| {
+            let source = source.to_string_lossy();
+            run_tool_cli("agy", &["plugin", "install", &source])
+        },
+        || verify_agy_plugin_installed() && verify_plugin_skill_payload(&agy_plugin_dir()).is_ok(),
         crate::hooks::antigravity::remove_antigravity_hooks,
     )
 }
@@ -535,6 +686,30 @@ pub(crate) fn install_agy_plugin() -> Result<(), String> {
 /// Commands hcom runs to remove the Claude plugin: uninstall it, then drop the
 /// marketplace registration too — otherwise `claude plugin marketplace list`
 /// keeps showing it after `hcom hooks remove claude`.
+/// Codex: add the marketplace, then install the plugin from it.
+///
+/// `codex plugin marketplace add` takes "a local path, owner/repo[@ref], HTTPS
+/// Git URL, or SSH Git URL" (0.154.0 `--help`), so it uses the same source
+/// policy Claude does — a developer's Codex indexes the fork their checkout
+/// tracks rather than upstream.
+///
+/// Unlike Claude's install, **this never strips the legacy hook entries.**
+/// Codex's hooks require an explicit trust step hcom cannot perform, so the
+/// native entries are the only thing firing until the user reviews the plugin.
+/// They go on an explicit `hcom hooks remove codex --legacy-only`.
+pub(crate) fn install_codex_plugin() -> Result<(), String> {
+    let source = marketplace_source();
+    run_tool_cli("codex", &["plugin", "marketplace", "add", &source])?;
+    run_tool_cli("codex", &["plugin", "add", CLAUDE_PLUGIN_ID])
+}
+
+/// Uninstall the Codex plugin. Deliberately does **not** touch Claude's plugin
+/// or Claude's marketplace registration: one shared package, but each vendor
+/// installs and removes its own copy.
+pub(crate) fn uninstall_codex_plugin() -> Result<(), String> {
+    run_tool_cli("codex", &["plugin", "remove", CLAUDE_PLUGIN_ID])
+}
+
 fn claude_uninstall_commands() -> [(&'static str, Vec<&'static str>); 2] {
     [
         ("claude", vec!["plugin", "uninstall", CLAUDE_PLUGIN_ID]),
@@ -632,6 +807,222 @@ mod tests {
         crate::config::Config::reset();
         crate::config::Config::init();
         (dir, home, guard)
+    }
+
+    fn write_complete_skill_payload(root: &std::path::Path) {
+        let skill = root.join("skills").join("hcom-agent-messaging");
+        for relative in super::PLUGIN_SKILL_FILES {
+            let path = skill.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("fixture for {relative}\n")).unwrap();
+        }
+    }
+
+    fn write_stage_source(root: &std::path::Path) {
+        write_complete_skill_payload(root);
+        let adapter = root.join("plugin/hcom-agy");
+        std::fs::create_dir_all(adapter.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(adapter.join("hooks")).unwrap();
+        std::fs::write(
+            adapter.join(".claude-plugin/plugin.json"),
+            r#"{"name":"hcom","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(adapter.join("hooks/hooks.json"), r#"{"hooks":{}}"#).unwrap();
+    }
+
+    fn relative_files(root: &std::path::Path) -> Vec<String> {
+        fn visit(root: &std::path::Path, current: &std::path::Path, files: &mut Vec<String>) {
+            for entry in std::fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/"),
+                    );
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn review_regression_production_staging_needs_no_external_shell_tools() {
+        let source = tempfile::tempdir().unwrap();
+        write_stage_source(source.path());
+
+        let (_staging, artifact) = super::stage_plugin_artifact(source.path(), "hcom-agy")
+            .expect("native staging must not require scripts/stage-plugin.sh or sh");
+
+        assert!(artifact.join(".claude-plugin/plugin.json").is_file());
+        assert!(artifact.join("hooks/hooks.json").is_file());
+        assert!(super::verify_plugin_skill_payload(&artifact).is_ok());
+    }
+
+    #[test]
+    fn review_regression_agy_install_runner_receives_the_complete_staged_artifact() {
+        let source = tempfile::tempdir().unwrap();
+        write_stage_source(source.path());
+        let inspected = std::cell::Cell::new(false);
+
+        super::install_agy_plugin_from_root(
+            source.path(),
+            |artifact| {
+                assert!(artifact.join(".claude-plugin/plugin.json").is_file());
+                assert!(artifact.join("hooks/hooks.json").is_file());
+                assert!(super::verify_plugin_skill_payload(artifact).is_ok());
+                assert!(
+                    !artifact
+                        .canonicalize()
+                        .unwrap()
+                        .starts_with(source.path().canonicalize().unwrap()),
+                    "install runner received a path inside the source checkout"
+                );
+                inspected.set(true);
+                Ok(())
+            },
+            || true,
+            || true,
+        )
+        .unwrap();
+
+        assert!(
+            inspected.get(),
+            "install runner never inspected staged source"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn review_regression_missing_checkout_guidance_routes_through_hcom_staging() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        let saved_dev_root = std::env::var_os("HCOM_DEV_ROOT");
+        unsafe { std::env::remove_var("HCOM_DEV_ROOT") };
+
+        let error = super::install_agy_plugin().unwrap_err();
+
+        unsafe {
+            match saved_dev_root {
+                Some(value) => std::env::set_var("HCOM_DEV_ROOT", value),
+                None => std::env::remove_var("HCOM_DEV_ROOT"),
+            }
+        }
+        assert!(
+            error.contains("HCOM_DEV_ROOT"),
+            "unexpected guidance: {error}"
+        );
+        assert!(
+            error.contains("hcom hooks add antigravity"),
+            "unexpected guidance: {error}"
+        );
+        assert!(
+            error.contains("'<repo>'"),
+            "checkout path is not quoted: {error}"
+        );
+        assert!(
+            !error.contains("agy plugin install <repo>/plugin/hcom-agy"),
+            "guidance bypassed staging: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_staging_rejects_skill_links_outside_the_source_tree() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().unwrap();
+        write_stage_source(source.path());
+        let external = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(external.path(), "outside source tree\n").unwrap();
+        let linked = source
+            .path()
+            .join("skills/hcom-agent-messaging/references/cross-tool.md");
+        std::fs::remove_file(&linked).unwrap();
+        symlink(external.path(), &linked).unwrap();
+
+        let error = super::stage_plugin_artifact(source.path(), "hcom-agy").unwrap_err();
+
+        assert!(
+            error.contains("outside"),
+            "outside-source link must be rejected explicitly: {error}"
+        );
+    }
+
+    #[test]
+    fn plugin_skill_payload_rejects_hooks_only() {
+        let fixture = tempfile::tempdir().unwrap();
+        let hooks = fixture.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("hooks.json"), "{}").unwrap();
+
+        let error = super::verify_plugin_skill_payload(fixture.path()).unwrap_err();
+        assert!(error.contains("SKILL.md"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn plugin_skill_payload_rejects_skill_without_references() {
+        let fixture = tempfile::tempdir().unwrap();
+        let skill = fixture.path().join("skills/hcom-agent-messaging");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "fixture").unwrap();
+
+        let error = super::verify_plugin_skill_payload(fixture.path()).unwrap_err();
+        assert!(
+            error.contains("references/cross-tool.md"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_skill_payload_rejects_external_skill_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let artifact = fixture.path().join("artifact");
+        let external = fixture.path().join("external");
+        std::fs::create_dir_all(&artifact).unwrap();
+        write_complete_skill_payload(&external);
+        symlink(external.join("skills"), artifact.join("skills")).unwrap();
+
+        let error = super::verify_plugin_skill_payload(&artifact).unwrap_err();
+        assert!(
+            error.contains("outside plugin artifact"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn plugin_skill_payload_accepts_complete_artifact() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_complete_skill_payload(fixture.path());
+
+        assert!(super::verify_plugin_skill_payload(fixture.path()).is_ok());
+    }
+
+    #[test]
+    fn plugin_skill_payload_inventory_matches_every_canonical_file() {
+        let canonical =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/hcom-agent-messaging");
+        let actual = relative_files(&canonical);
+        let mut verified = super::PLUGIN_SKILL_FILES
+            .iter()
+            .map(|relative| (*relative).to_string())
+            .collect::<Vec<_>>();
+        verified.sort();
+
+        assert_eq!(
+            verified, actual,
+            "verify_plugin_skill_payload inventory must cover every canonical skill file"
+        );
     }
 
     #[test]
@@ -1173,10 +1564,11 @@ mod tests {
         assert_eq!(d["skills"], "./skills/");
     }
 
-    /// `plugin/hcom/skills` is a symlink to the repo-root `skills/`, so the
-    /// declared path resolves. Checked here because a broken symlink turns the
-    /// descriptor above into a promise the package cannot keep, and git records
-    /// symlinks as ordinary blobs that are easy to clobber.
+    /// `plugin/hcom/skills` is a committed directory, so the declared path
+    /// resolves. It used to be a symlink to the repo-root `skills/`; Codex's
+    /// installer skipped that link and shipped a package with hooks and no
+    /// skill, so every adapter now carries real files generated by
+    /// `scripts/sync-plugin-skills.sh` (see `tests/plugin_payload.rs`).
     #[test]
     fn cursor_declared_skills_path_resolves() {
         let skills = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1189,6 +1581,185 @@ mod tests {
             "hcom-agent-messaging missing under {}",
             skills.display()
         );
+    }
+
+    const CODEX_MANIFEST: &str = include_str!("../../plugin/hcom/hooks/hooks-codex.json");
+    const CODEX_DESCRIPTOR: &str = include_str!("../../plugin/hcom/.codex-plugin/plugin.json");
+
+    /// Drives off `CODEX_HOOK_COMMANDS` — the same table the native installer
+    /// builds its hook JSON from — so an event, subcommand or matcher change on
+    /// the writer side fails here instead of silently diverging from the
+    /// committed overlay. Commands use the self-resolving guard, not
+    /// `build_codex_hook_command`: that one embeds `get_hcom_prefix()` resolved
+    /// at install time, and a committed manifest is a static file (same reason
+    /// spelled out for Cursor above). Native Codex hook JSON carries no
+    /// timeouts, so the overlay carries none either.
+    #[test]
+    fn codex_manifest_covers_every_configured_event() {
+        let root: Value = serde_json::from_str(CODEX_MANIFEST).unwrap();
+        let hooks = root["hooks"].as_object().expect("hooks object");
+
+        for (event, suffix, matcher) in crate::hooks::codex::CODEX_HOOK_COMMANDS {
+            let groups = hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("missing event {event}"));
+            let expected_command = crate::hooks::claude::build_hook_entry_command(suffix);
+            let group = groups
+                .iter()
+                .find(|g| {
+                    g["hooks"]
+                        .as_array()
+                        .is_some_and(|inner| inner.iter().any(|h| h["command"] == expected_command))
+                })
+                .unwrap_or_else(|| panic!("no hcom command for {event} -> {suffix}"));
+
+            assert_eq!(
+                group.get("matcher").and_then(Value::as_str),
+                *matcher,
+                "{event} matcher"
+            );
+            let hook = group["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["command"] == expected_command)
+                .unwrap();
+            assert_eq!(hook["type"], "command", "{event} hook type");
+            assert!(
+                hook.get("timeout").is_none(),
+                "{event} must match the native payload, which sets no timeout"
+            );
+        }
+
+        // Anything beyond the table would ship a handler Codex never fires, or
+        // a Claude-only event (SessionEnd, PostToolUseFailure) that the native
+        // integration deliberately omits.
+        assert_eq!(
+            hooks.len(),
+            crate::hooks::codex::CODEX_HOOK_COMMANDS.len(),
+            "manifest has events the table does not: {:?}",
+            hooks.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A command parked on the wrong event must fail the contract above; this
+    /// pins that the check is event-scoped, not a whole-file substring scan.
+    #[test]
+    fn codex_manifest_check_rejects_a_command_on_the_wrong_event() {
+        let mut root: Value = serde_json::from_str(CODEX_MANIFEST).unwrap();
+        let stop = root["hooks"]["Stop"].take();
+        root["hooks"]["UserPromptSubmit"] = stop;
+
+        let expected = crate::hooks::claude::build_hook_entry_command("codex-userpromptsubmit");
+        assert!(
+            !root["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g["hooks"]
+                    .as_array()
+                    .is_some_and(|inner| inner.iter().any(|h| h["command"] == expected))),
+            "swapped event still satisfied its own command"
+        );
+    }
+
+    /// An SSH host alias is not a DNS name. `git@myalias:owner/repo.git` must
+    /// become the alias's real host, or Cursor gets a marketplace URL that
+    /// resolves nowhere — the same class of failure as handing it a path.
+    #[test]
+    fn an_ssh_host_alias_resolves_to_its_real_hostname() {
+        assert_eq!(
+            super::normalize_git_url_with("git@myalias:owner/repo.git", |host| {
+                assert_eq!(host, "myalias");
+                Some("github.com".to_string())
+            }),
+            "https://github.com/owner/repo"
+        );
+        // Unresolvable alias: keep what git gave us rather than inventing a host.
+        assert_eq!(
+            super::normalize_git_url_with("git@myalias:owner/repo.git", |_| None),
+            "https://myalias/owner/repo"
+        );
+        assert_eq!(
+            super::normalize_git_url_with("git@github.com:owner/repo.git", |_| Some(
+                "github.com".to_string()
+            )),
+            "https://github.com/owner/repo"
+        );
+        // Already HTTPS: untouched, and no host resolution attempted.
+        assert_eq!(
+            super::normalize_git_url_with("https://github.com/owner/repo.git", |_| panic!(
+                "must not resolve a host for an https remote"
+            )),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    /// The marketplace is the owner's fork on GitHub, reached through whatever
+    /// remote the branch tracks — including an SSH remote behind a
+    /// `~/.ssh/config` alias, which must come out as the alias's real host.
+    /// A local path is never substituted: Cursor cannot install from one, and
+    /// the other machines cannot reach this one's filesystem.
+    #[test]
+    fn the_marketplace_url_is_a_fetchable_fork_url() {
+        for remote in [
+            "git@myalias:owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ] {
+            let url = super::normalize_git_url_with(remote, |_| Some("github.com".to_string()));
+            assert!(
+                url.starts_with("https://github.com/"),
+                "{remote} normalized to {url}, which no vendor can fetch"
+            );
+            assert!(!url.contains("myalias"), "{url} still names the ssh alias");
+        }
+    }
+
+    /// The selector both Claude and Codex install by must name the marketplace
+    /// that `.claude-plugin/marketplace.json` actually declares, and the plugin
+    /// inside it. A rename there silently breaks `codex plugin add`.
+    #[test]
+    fn the_plugin_selector_matches_the_committed_marketplace() {
+        let marketplace: Value =
+            serde_json::from_str(include_str!("../../.claude-plugin/marketplace.json")).unwrap();
+        let (plugin, market) = super::CLAUDE_PLUGIN_ID.split_once('@').unwrap();
+        assert_eq!(marketplace["name"], market);
+        assert_eq!(super::CLAUDE_MARKETPLACE, market);
+        let entries = marketplace["plugins"].as_array().unwrap();
+        let entry = entries
+            .iter()
+            .find(|p| p["name"] == plugin)
+            .unwrap_or_else(|| panic!("marketplace declares no plugin named {plugin}"));
+        // Codex, Claude and Cursor all install the same package directory.
+        assert_eq!(entry["source"], "./plugin/hcom");
+    }
+
+    /// Codex, like Cursor, resolves nothing by convention: an undeclared
+    /// component is simply absent.
+    #[test]
+    fn codex_descriptor_points_at_its_own_hook_file() {
+        let d: Value = serde_json::from_str(CODEX_DESCRIPTOR).unwrap();
+        assert_eq!(d["name"], super::PLUGIN_NAME);
+        assert_eq!(d["hooks"], "./hooks/hooks-codex.json");
+        assert_eq!(d["skills"], "./skills/");
+    }
+
+    /// One package, one version: Claude reads `.claude-plugin/`, Cursor
+    /// `.cursor-plugin/` and Codex `.codex-plugin/` out of the same directory,
+    /// so a drifting version would report three different releases of one
+    /// install.
+    #[test]
+    fn shared_package_descriptors_agree_on_name_and_version() {
+        let claude: Value =
+            serde_json::from_str(include_str!("../../plugin/hcom/.claude-plugin/plugin.json"))
+                .unwrap();
+        for other in [CURSOR_DESCRIPTOR, CODEX_DESCRIPTOR] {
+            let d: Value = serde_json::from_str(other).unwrap();
+            assert_eq!(d["name"], claude["name"]);
+            assert_eq!(d["version"], claude["version"]);
+        }
     }
 
     const AGY_MANIFEST: &str = include_str!("../../plugin/hcom-agy/hooks/hooks.json");
@@ -1532,6 +2103,32 @@ mod tests {
     fn normalize_git_url_rewrites_an_ssh_remote() {
         assert_eq!(
             super::normalize_git_url("git@github.com:sirassss/hcom.git"),
+            "https://github.com/sirassss/hcom"
+        );
+    }
+
+    #[test]
+    fn normalize_git_url_rewrites_an_ssh_scheme_remote() {
+        assert_eq!(
+            super::normalize_git_url("ssh://git@github.com/sirassss/hcom.git"),
+            "https://github.com/sirassss/hcom"
+        );
+        assert_eq!(
+            super::normalize_git_url("ssh://github.com/sirassss/hcom"),
+            "https://github.com/sirassss/hcom"
+        );
+    }
+
+    /// Both SSH forms carry a host alias, so both must resolve it.
+    #[test]
+    fn normalize_git_url_resolves_an_alias_in_either_ssh_form() {
+        let resolve = |host: &str| (host == "sirassss").then(|| "github.com".to_string());
+        assert_eq!(
+            super::normalize_git_url_with("git@sirassss:sirassss/hcom.git", resolve),
+            "https://github.com/sirassss/hcom"
+        );
+        assert_eq!(
+            super::normalize_git_url_with("ssh://git@sirassss/sirassss/hcom.git", resolve),
             "https://github.com/sirassss/hcom"
         );
     }
