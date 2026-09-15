@@ -1,6 +1,6 @@
 # hcom hooks as tool plugins — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Ship hcom's Claude, Cursor, and Antigravity hooks inside the hcom plugin instead of writing them into shared global config, and stop installing anything as a side effect of launching an agent.
 
@@ -59,7 +59,7 @@
 
 This is a spike. The spec deliberately leaves three facts unmeasured because guessing them would bake a wrong constant into every later task. Measure first, then write the constants down.
 
-- [ ] **Step 1: Build a throwaway plugin and install it into each tool**
+- [x] **Step 1: Build a throwaway plugin and install it into each tool**
 
 ```bash
 cd /tmp/claude-1000/*/scratchpad 2>/dev/null || cd /tmp
@@ -79,7 +79,7 @@ printf '{"version":1,"hooks":{}}' > hooks/hooks-cursor.json
 printf '{"hooks":{}}' > hooks.json
 ```
 
-- [ ] **Step 2: Record what each tool does with it**
+- [x] **Step 2: Record what each tool does with it**
 
 Run each, and keep the output — it is the input to Step 3:
 
@@ -100,7 +100,7 @@ Answer these three questions from the output:
 2. **Where does Antigravity expect `hooks.json`** — plugin root, or `hooks/hooks.json`?
 3. **Does Cursor find `.cursor-plugin/plugin.json` when the marketplace source points at a repo whose plugin lives in a subdirectory** (`./plugin/hcom`)? If not, the manifest belongs at repo root.
 
-- [ ] **Step 3: Write the measurements down as constants**
+- [x] **Step 3: Write the measurements down as constants**
 
 Create `src/hooks/plugin.rs`. Replace each `MEASURED:` comment with what Step 2 showed — the values below are the expected shape, not an answer:
 
@@ -142,12 +142,12 @@ Register it in `src/hooks/mod.rs` next to the other tool modules:
 pub mod plugin;
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [x] **Step 4: Verify it compiles**
 
 Run: `cargo build --locked`
 Expected: builds clean. Dead-code warnings for the unused constants are fine at this stage.
 
-- [ ] **Step 5: Clean up the probe**
+- [x] **Step 5: Clean up the probe**
 
 ```bash
 agy plugin uninstall hcomprobe 2>/dev/null || true
@@ -155,7 +155,7 @@ cursor-agent plugin marketplace remove hcomprobe 2>/dev/null || true
 claude plugin marketplace remove hcomprobe 2>/dev/null || true
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/hooks/plugin.rs src/hooks/mod.rs
@@ -179,7 +179,7 @@ If a tool's CLI is unavailable on this machine, stop and report BLOCKED with whi
 
 The manifest is a committed file, not generated at install time, so it shows up in diffs. The test's job is to stop it drifting from `CLAUDE_HOOK_CONFIGS`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `src/hooks/plugin.rs`:
 
@@ -248,12 +248,12 @@ mod tests {
 pub(crate) const CLAUDE_HOOK_CONFIGS: &[(&str, &str, &str, Option<u64>)] = &[
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked plugin::tests::claude_manifest -- --test-threads=1`
 Expected: FAIL — the file does not exist, so `include_str!` breaks the build.
 
-- [ ] **Step 3: Write the manifest**
+- [x] **Step 3: Write the manifest**
 
 Create `plugin/hcom/hooks/hooks.json`. One group per event, matcher only where the table has one, `timeout` copied from the table where present. This is the full set from `CLAUDE_HOOK_CONFIGS` — all thirteen events:
 
@@ -303,12 +303,12 @@ Create `plugin/hcom/hooks/hooks.json`. One group per event, matcher only where t
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked plugin::tests::claude_manifest -- --test-threads=1`
 Expected: PASS, both tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add plugin/hcom/hooks/hooks.json src/hooks/plugin.rs src/hooks/claude.rs
@@ -332,7 +332,7 @@ EOF
 
 Cursor's schema differs from Claude's in envelope, not just key case: flat array, top-level `"version": 1`, relative command path, explicit `hooks` key in the descriptor.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append inside the existing `mod tests`:
 
@@ -385,12 +385,12 @@ Append inside the existing `mod tests`:
 
 `CURSOR_HOOK_COMMANDS` is currently private. Make it `pub(crate)` in `src/hooks/cursor.rs:26`.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked plugin::tests::cursor -- --test-threads=1`
 Expected: FAIL — files missing, `include_str!` breaks the build.
 
-- [ ] **Step 3: Write the manifest and descriptor**
+- [x] **Step 3: Write the manifest and descriptor**
 
 `plugin/hcom/hooks/hooks-cursor.json` — six events, `stop` keeps the 30s timeout established by the previous change set:
 
@@ -439,12 +439,12 @@ Expected: FAIL — files missing, `include_str!` breaks the build.
 
 If Task 1 measured that Cursor needs the descriptor at repo root, put it there instead and update both `include_str!` paths in the tests to match.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked plugin::tests::cursor -- --test-threads=1`
 Expected: PASS, all three tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add plugin/hcom/hooks/hooks-cursor.json plugin/hcom/.cursor-plugin/plugin.json src/hooks/plugin.rs src/hooks/cursor.rs
@@ -472,7 +472,7 @@ EOF
 
 Antigravity's envelope matches Claude's (`matcher`, nested `hooks[]`, `type: command`) but its event vocabulary is its own, and every command must carry `ANTIGRAVITY_AGENT=1` — that env var is what routes the shared `gemini-*` handler to the Antigravity branch.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append inside `mod tests`:
 
@@ -560,12 +560,12 @@ Append inside `mod tests`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked plugin::tests::agy -- --test-threads=1`
 Expected: FAIL — files missing.
 
-- [ ] **Step 3: Write the manifest and descriptor**
+- [x] **Step 3: Write the manifest and descriptor**
 
 `plugin/hcom-agy/.claude-plugin/plugin.json` — Antigravity reads this, not `gemini-extension.json`:
 
@@ -656,7 +656,7 @@ Compare against the live `hcom-lifecycle` group written by `try_setup_antigravit
 
 Do **not** add a `gemini-extension.json`: Task 1 measured that Antigravity ignores it for hook discovery and installs fine without it. Adding one implies a discovery path that does not exist.
 
-- [ ] **Step 3b: Confirm the install actually picks up the hooks**
+- [x] **Step 3b: Confirm the install actually picks up the hooks**
 
 ```bash
 agy plugin install "$PWD/plugin/hcom-agy"
@@ -666,12 +666,12 @@ agy plugin uninstall hcom
 
 Expected: the install output says `hooks : 1 processed` (not `skipped (not found)`), and the list entry shows `"components": ["hooks"]` or `["skills","hooks"]`. If it says skipped, the file is at the wrong path — fix it here rather than discovering it in acceptance.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked plugin::tests::agy -- --test-threads=1`
 Expected: PASS, all three tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add plugin/hcom-agy src/hooks/plugin.rs
@@ -696,7 +696,7 @@ EOF
 
 Verify runs before every spawn, so it must not shell out. Two reads: the plugin exists on disk, and the tool records it as enabled.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     use crate::hooks::test_helpers::EnvGuard;
@@ -754,12 +754,12 @@ Verify runs before every spawn, so it must not shell out. Two reads: the plugin 
 
 `EnvGuard` lives in `src/hooks/mod.rs:40` and restores a fixed field list including `HOME`. Check its constructor name and adapt this call; if it has no `set_home`, use the pattern the Cursor tests already use (`cursor_test_env` in `src/hooks/cursor.rs`).
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked plugin::tests::claude_verify plugin::tests::agy_verify -- --test-threads=1`
 Expected: FAIL — `verify_claude_plugin_installed` is not defined.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `src/hooks/plugin.rs`:
 
@@ -824,12 +824,12 @@ pub(crate) fn verify_cursor_plugin_installed() -> bool {
 - Claude's cache path ends in a **version** segment (`cache/hcom/hcom/1.0.0/`), so `claude_plugin_dir()` returns the parent and `verify_claude_plugin_installed` checks it is a directory rather than looking for a fixed version.
 - Cursor's *enabled* marker could not be measured, because installing requires the interactive picker. This verifier therefore proves the marketplace checkout is present, not that the user finished the install. That is the weaker guarantee the spec accepts for Cursor, and it is why `install_cursor_plugin` does not strip legacy hooks.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked plugin::tests -- --test-threads=1`
 Expected: PASS, all manifest and verify tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/hooks/plugin.rs
@@ -852,7 +852,7 @@ EOF
 
 The ordering is the whole safety property: install → verify → strip. A failure anywhere before the strip leaves the machine exactly as it was, still working on its legacy hooks.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[test]
@@ -945,12 +945,12 @@ The ordering is the whole safety property: install → verify → strip. A failu
 
 The last two exercise `remove_claude_hooks`, which already exists. If it already has equivalent coverage, keep these anyway — the fixture here is this user's actual machine layout, and it is the case the migration must not break.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked plugin::tests::install_ -- --test-threads=1`
 Expected: FAIL — `install_then_strip` is not defined.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 **Do not gate a strip on `verify_cursor_plugin_installed` here.** An earlier draft did, and review caught it: that verifier only proves a marketplace checkout exists, and `marketplace add` — the line immediately above it — is what creates the checkout. Once the repo ships `plugin/hcom/hooks/hooks-cursor.json`, the gate passes the instant that command succeeds, so the strip would delete `~/.cursor/hooks.json` (and hcom's Cursor permissions, which `remove_cursor_hooks` also clears) while the plugin sits un-enabled in the TUI — leaving Cursor with no hooks at all, silently. Cursor's enabled marker is not readable from disk, so there is no honest signal to gate on. The Cursor path never strips.
 
@@ -1061,12 +1061,12 @@ pub(crate) fn install_agy_plugin() -> Result<(), String> {
 
 All three installers take no arguments.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked plugin::tests -- --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/hooks/plugin.rs
@@ -1087,7 +1087,7 @@ EOF
 - Modify: `src/tool.rs:82` (`verify_hooks_installed`), `src/tool.rs:114` (`try_setup_hooks`)
 - Test: `src/tool.rs` (`mod tests`)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `src/tool.rs` tests:
 
@@ -1115,12 +1115,12 @@ Add to `src/tool.rs` tests:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --locked plugin_tools_verify_through_the_plugin_path -- --test-threads=1`
 Expected: FAIL — the last assertion, because `verify_hooks_installed` still reads `settings.json`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `src/tool.rs`, replace the three arms in `verify_hooks_installed`:
 
@@ -1140,7 +1140,7 @@ and the three arms in `try_setup_hooks`:
 
 `try_setup_hooks` already returns `Result<(), String>`, and no signature change is needed: `crate::paths::db_path()` is a free function, so `marketplace_source` resolves dev_root on its own. (An earlier draft of this plan proposed threading a `db_path` parameter through `try_setup_hooks` — unnecessary, and it would have rippled to every caller.)
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 ```
@@ -1149,7 +1149,7 @@ cargo test --locked plugin::tests -- --test-threads=1
 ```
 Expected: PASS. Other tools' arms are untouched.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tool.rs
@@ -1171,7 +1171,7 @@ EOF
 
 This is the behavior change the user asked for, and the regression guard is the point of the task: nothing may install as a side effect of launching an agent.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[test]
@@ -1207,12 +1207,12 @@ This is the behavior change the user asked for, and the regression guard is the 
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked launching_never_installs_hooks launching_reports_the_install_command -- --test-threads=1`
 Expected: FAIL — `hooks_missing_warning` is undefined, and `ensure_hooks_installed` still calls `try_setup_*`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `src/launcher.rs`:
 
@@ -1264,7 +1264,7 @@ Replace the three arms in `ensure_hooks_installed`:
 
 Every other arm stays exactly as it is. Delete the now-unused `install_diag_context` calls for these three only if the compiler flags them as dead; leave the helper itself alone since other tools use it.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 ```
@@ -1273,7 +1273,7 @@ cargo test --locked launcher:: -- --test-threads=1
 ```
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/launcher.rs
@@ -1303,7 +1303,7 @@ EOF
 
 With nothing self-repairing, status is the only place a user learns they must act.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[test]
@@ -1326,12 +1326,12 @@ With nothing self-repairing, status is the only place a user learns they must ac
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked status_flags status_is_quiet -- --test-threads=1`
 Expected: FAIL — `plugin_status_line` undefined.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 /// Advice line for a plugin-based tool. Empty when the state is healthy.
@@ -1349,12 +1349,12 @@ pub(crate) fn plugin_status_line(tool: &str, plugin: bool, legacy: bool) -> Stri
 
 Wire it into the existing status output next to the current per-tool reporting, passing the plugin verifier's result and a legacy check (`get_claude_settings_path()` containing an hcom command, via the existing `is_hcom_hook_command`).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked commands::hooks -- --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/commands/hooks.rs
@@ -1375,7 +1375,7 @@ EOF
 - Modify: `README.md`
 - Modify: spec status line in `docs/superpowers/specs/2026-09-03-hcom-hooks-as-plugin-design.md`
 
-- [ ] **Step 1: Update the cross-tool reference**
+- [x] **Step 1: Update the cross-tool reference**
 
 In the Claude, Cursor, and Antigravity sections, replace the hook-install sentence with:
 
@@ -1383,7 +1383,7 @@ In the Claude, Cursor, and Antigravity sections, replace the hook-install senten
 - **Hook install**: Ships as a plugin (`hcom hooks add <tool>`), not as entries in the tool's shared config. Config files like `~/.claude/settings.json` are read by other harnesses — Cursor reads Claude's — so hooks placed there fire under agents they were never meant for. hcom never installs hooks automatically; launching an agent without them warns and falls back to ad-hoc mode.
 ```
 
-- [ ] **Step 2: Update README**
+- [x] **Step 2: Update README**
 
 In the Install section, after the install commands, add:
 
@@ -1396,11 +1396,11 @@ hcom hooks status
 ```
 ```
 
-- [ ] **Step 3: Flip the spec status**
+- [x] **Step 3: Flip the spec status**
 
 Change the spec header **Status** to: `Plan written at docs/superpowers/plans/2026-09-03-hcom-hooks-as-plugin.md`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add skills/hcom-agent-messaging/references/cross-tool.md README.md docs/superpowers/specs/2026-09-03-hcom-hooks-as-plugin-design.md
@@ -1418,7 +1418,7 @@ No failing test for markdown.
 
 **Files:** none new.
 
-- [ ] **Step 1: Full suite**
+- [x] **Step 1: Full suite**
 
 ```
 cargo test --locked -- --test-threads=1
@@ -1428,7 +1428,7 @@ cargo fmt --check
 
 Expected: all pass. `shell_env::tests::resolver_discards_stderr_without_breaking_env_resolution` is a known pre-existing environment flake and does not block.
 
-- [ ] **Step 2: Confirm the handler code never moved**
+- [x] **Step 2: Confirm the handler code never moved**
 
 ```bash
 git diff --stat main..HEAD -- src/hooks/claude.rs src/hooks/cursor.rs src/hooks/antigravity.rs src/router.rs

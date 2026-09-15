@@ -369,7 +369,7 @@ git add docs/superpowers/plans/2026-09-14-plugin-skill-migration-acceptance.md
 git commit -m "docs: record the released-route install measurement"
 ```
 
-- [ ] **Step 6: After publication, verify a real git-URL marketplace** (BLOCKED: nothing is pushed yet)
+- [x] **Step 6: After publication, verify a real git-URL marketplace** (2026-09-15: owner force-pushed `feat/siras/develop` onto `origin/main` and repointed the branch's upstream. Claude marketplace `hcom` (`https://github.com/sirassss/hcom.git`) was already git-URL based; `claude plugin marketplace update hcom` re-cloned it to `126b261`. `claude plugin update hcom@hcom` reported "already at the latest version" — plugin.json's `version` never bumped, so version-based update checks cannot see content changes. Uninstall+reinstall (`claude plugin uninstall hcom@hcom` / `install hcom@hcom`) pulled the fresh cache; `diff -r` against `skills/hcom-agent-messaging` is now byte-identical. **Finding: any future content change needs a plugin.json version bump, or consumers relying on `plugin update` alone will stay stale.**)
 
 Blocked until the owner pushes these commits to the ref vendors consume — the remote's default branch, since `marketplace_source()` carries no ref. Only then does the production route exist to measure. Ask the owner whether that has happened; do not assume it from a local commit or a feature-branch push.
 

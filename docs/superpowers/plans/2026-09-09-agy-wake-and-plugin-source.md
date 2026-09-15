@@ -1,6 +1,6 @@
 # AGY Wake and Plugin Source Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make an idle Antigravity agent wake on an hcom message, and make hook-install status tell the truth for Antigravity and Cursor.
 
@@ -36,7 +36,7 @@ Tasks 1–3 are D1 and must land in order. Tasks 4 (D2), 5–7 (D5), 8 (D4) are 
 - Modify: `src/tool.rs:322`
 - Test: `src/pty/screen.rs` (tests module, after the `// ---- Antigravity input extraction ----` block)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the tests module in `src/pty/screen.rs`:
 
@@ -90,13 +90,13 @@ fn antigravity_frame_without_status_bar_is_not_ready() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they pass already**
+- [x] **Step 2: Run the tests to verify they pass already**
 
 Run: `cargo test --lib antigravity_` (one filter — `cargo test` takes a single positional `TESTNAME`; a second one errors `unexpected argument`)
 
 Expected: PASS. These pin the behaviour of `is_ready()` against a pattern passed directly to `make_tracker`; they do not yet prove the *spec* carries that pattern. The next step is the one that fails.
 
-- [ ] **Step 3: Write the failing spec test**
+- [x] **Step 3: Write the failing spec test**
 
 Change the existing assertion at `src/tool.rs:322` from:
 
@@ -114,13 +114,13 @@ to:
         assert_eq!(Tool::Antigravity.ready_pattern(), b"Ctx ");
 ```
 
-- [ ] **Step 4: Run it to verify it fails**
+- [x] **Step 4: Run it to verify it fails**
 
 Run: `cargo test --lib antigravity_ready_pattern`
 
 Expected: FAIL — `assertion \`left == right\` failed`, left `[63, 32, 102, ...]` (`? for shortcuts`), right `[67, 116, 120, 32]` (`Ctx `).
 
-- [ ] **Step 5: Change the spec**
+- [x] **Step 5: Change the spec**
 
 In `src/integration_spec.rs`, in the `ANTIGRAVITY` block, replace line 696:
 
@@ -136,13 +136,13 @@ with:
     ready_pattern: b"Ctx ",
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test --lib antigravity`
 
 Expected: PASS, all antigravity tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/integration_spec.rs src/tool.rs src/pty/screen.rs
@@ -166,7 +166,7 @@ pattern, which took delivery end to end."
 - Modify: `src/pty/screen.rs:940-970` (`get_antigravity_input_text`)
 - Test: `src/pty/screen.rs` (tests module)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the tests module in `src/pty/screen.rs`:
 
@@ -183,13 +183,13 @@ fn antigravity_no_prompt_line_is_unknown_not_empty() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test --lib antigravity_no_prompt_line_is_unknown_not_empty`
 
 Expected: FAIL — `assertion \`left == right\` failed: left: Some(""), right: None`. The final `if self.is_ready()` fallback reports an empty prompt.
 
-- [ ] **Step 3: Make both fallbacks stop inferring emptiness**
+- [x] **Step 3: Make both fallbacks stop inferring emptiness**
 
 In `src/pty/screen.rs`, in `get_antigravity_input_text`, replace:
 
@@ -233,19 +233,19 @@ with:
         None
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib antigravity`
 
 Expected: PASS. The existing tests `antigravity_prompt_without_trailing_space`, `antigravity_dim_placeholder_with_ready_returns_empty`, `antigravity_empty_prompt_with_ready` and `antigravity_injected_text_with_ready_footer` all reach a `Some(_)`/dim branch, so none of them depend on the removed fallbacks.
 
-- [ ] **Step 5: Run the whole suite**
+- [x] **Step 5: Run the whole suite**
 
 Run: `cargo test`
 
 Expected: PASS, 0 failed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/pty/screen.rs
@@ -266,7 +266,7 @@ Tasks 1 and 2 are unit-tested, but the defect was found in a live probe and must
 
 **Files:** none.
 
-- [ ] **Step 1: Build and spawn a probe**
+- [x] **Step 1: Build and spawn a probe**
 
 ```bash
 cargo build --release
@@ -275,7 +275,7 @@ hcom agy --tag acc --go --hcom-prompt "Say exactly READY and nothing else."
 
 Expected: `Launch ready: <name> (1/1 ready, …)`. A `launch blocked: screen settled before readiness` here means Task 1 did not take effect.
 
-- [ ] **Step 2: Send a message while it is idle**
+- [x] **Step 2: Send a message while it is idle**
 
 ```bash
 hcom start --as accprobe
@@ -283,7 +283,7 @@ hcom send --name accprobe @acc-<name> --intent request -- reply with the single 
 hcom stop accprobe
 ```
 
-- [ ] **Step 3: Confirm the full delivery chain in the log**
+- [x] **Step 3: Confirm the full delivery chain in the log**
 
 ```bash
 grep '"instance":"<name>"' ~/.hcom/.tmp/logs/hcom.log | grep delivery | tail -8
@@ -291,7 +291,7 @@ grep '"instance":"<name>"' ~/.hcom/.tmp/logs/hcom.log | grep delivery | tail -8
 
 Expected, in order: `delivery.wake` → `delivery.gate_pass` → `delivery.injected` → `delivery.text_rendered` → `delivery.send_enter` → `delivery.success`. A repeating `delivery.gate_blocked: not_idle` is the old failure.
 
-- [ ] **Step 4: Confirm the agent answered**
+- [x] **Step 4: Confirm the agent answered**
 
 ```bash
 hcom transcript acc-<name> --last 2 --full
@@ -299,7 +299,7 @@ hcom transcript acc-<name> --last 2 --full
 
 Expected: the agent's reply contains `WOKE`.
 
-- [ ] **Step 5: Confirm a typed prompt is not overwritten**
+- [x] **Step 5: Confirm a typed prompt is not overwritten**
 
 In the agy pane, type `dont clobber me` without pressing Enter, then:
 
@@ -311,7 +311,7 @@ hcom stop accprobe2
 
 Expected: the typed text stays in the prompt; the log shows a gate block naming the prompt, not an inject. This is Task 2's guard in the real TUI.
 
-- [ ] **Step 6: Clean up**
+- [x] **Step 6: Clean up**
 
 ```bash
 hcom kill tag:acc
@@ -330,7 +330,7 @@ The check that replaces it reads the installed manifest, and it must answer in t
 - Modify: `src/commands/hooks.rs:163-171`
 - Test: `src/hooks/plugin.rs` (tests module, near `agy_imported_hcom_source_reads_a_foreign_import`)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the tests module in `src/hooks/plugin.rs`:
 
@@ -463,13 +463,13 @@ fn agy_hook_state_is_unverifiable_for_broken_json() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test --lib agy_hook_state`
 
 Expected: FAIL to compile — `cannot find type \`AgyHooks\`` and `cannot find function \`agy_hook_state\` in module \`super\``.
 
-- [ ] **Step 3: Add the state and the check**
+- [x] **Step 3: Add the state and the check**
 
 In `src/hooks/plugin.rs`, immediately after `agy_imported_hcom_source`, add:
 
@@ -632,13 +632,13 @@ with
 /// which is the only caller that should reach for this label. Entries look like
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib agy_hook_state`
 
 Expected: PASS, 5 tests — one per state, plus the bundled-manifest mutations. The healthy one reads the shipped manifest itself.
 
-- [ ] **Step 5: Point status at the new check**
+- [x] **Step 5: Point status at the new check**
 
 In `src/commands/hooks.rs`, replace lines 163-171:
 
@@ -691,7 +691,7 @@ with:
             }
 ```
 
-- [ ] **Step 6: Verify against the real machine**
+- [x] **Step 6: Verify against the real machine**
 
 Run: `cargo build --release && ./target/release/hcom hooks`
 
@@ -718,7 +718,7 @@ rm -rf "$probe"
 
 Expected, in order: `hook state unverifiable`; then the Foreign line — `carries SessionStart and none of hcom's handlers`, quoting the import label as a format hint (`unknown` when the scratch home has no import entry); then `none of hcom's working hooks`, with no harness named at all.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/hooks/plugin.rs src/commands/hooks.rs
@@ -743,7 +743,7 @@ unverifiable rather than silently healthy."
 - Modify: `src/hooks/plugin.rs:252-266`
 - Test: `src/hooks/plugin.rs` (tests module)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the tests module in `src/hooks/plugin.rs`:
 
@@ -779,13 +779,13 @@ fn normalize_git_url_trims_git_output_whitespace() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test --lib normalize_git_url`
 
 Expected: FAIL to compile — `cannot find function \`normalize_git_url\``.
 
-- [ ] **Step 3: Implement the resolution**
+- [x] **Step 3: Implement the resolution**
 
 First widen the import at `src/hooks/plugin.rs:53` — the new helpers take `&Path`:
 
@@ -850,13 +850,13 @@ fn normalize_git_url(url: &str) -> String {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib normalize_git_url`
 
 Expected: PASS, 3 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/hooks/plugin.rs
@@ -877,7 +877,7 @@ an SSH remote to https since neither Claude nor Cursor accepts one."
 **Files:**
 - Modify: `src/hooks/plugin.rs:301-311`
 
-- [ ] **Step 1: Use the resolved source**
+- [x] **Step 1: Use the resolved source**
 
 In `src/hooks/plugin.rs`, in `install_cursor_plugin`, replace:
 
@@ -902,7 +902,7 @@ with:
     )?;
 ```
 
-- [ ] **Step 2: Update the module doc that states the opposite**
+- [x] **Step 2: Update the module doc that states the opposite**
 
 In `src/hooks/plugin.rs`, in the doc comment above `install_cursor_plugin`, replace:
 
@@ -923,7 +923,7 @@ with:
 /// resolves.
 ```
 
-- [ ] **Step 3: Verify the build and the real command**
+- [x] **Step 3: Verify the build and the real command**
 
 ```bash
 cargo build --release
@@ -933,7 +933,7 @@ cursor-agent plugin marketplace list | grep hcom
 
 Expected: the listed hcom marketplace URL is the fork this checkout tracks, not `aannoo/hcom`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/hooks/plugin.rs
@@ -964,7 +964,7 @@ The verifier itself stays as it is — `cursor-agent plugin` exposes no enabled 
 - Modify: `src/commands/hooks.rs:150-158` (the `installed (plugin)` line)
 - Test: `src/commands/hooks.rs` (tests module)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the tests module in `src/commands/hooks.rs`. One filter reaches all of them:
 
@@ -1025,13 +1025,13 @@ fn plugin_status_line_other_tools_keep_their_wording() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test --lib plugin_status_line_`
 
 Expected: the four `cursor` tests FAIL (`(true, false)` returns `""`; both `(false, _)` states return the same flat `hooks not installed` line; `(true, true)` still says "both are firing"), `plugin_status_line_other_tools_keep_their_wording` PASSES.
 
-- [ ] **Step 3: Rewrite the Cursor arms**
+- [x] **Step 3: Rewrite the Cursor arms**
 
 In `src/commands/hooks.rs`, in `plugin_status_line`, replace the Cursor `(true, true)` arm and the two catch-alls:
 
@@ -1082,7 +1082,7 @@ with:
 
 Note the `(true, true)` arm above it — the one guarded `if tool != "cursor"` — is untouched: Claude's and Antigravity's plugin state *is* observable, so "both are firing" is accurate there.
 
-- [ ] **Step 4: Soften the headline for Cursor**
+- [x] **Step 4: Soften the headline for Cursor**
 
 In `src/commands/hooks.rs`, replace lines 153-158:
 
@@ -1113,19 +1113,19 @@ with:
             }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test --lib plugin_status_line_`
 
 Expected: PASS, 5 tests — one per Cursor state, plus the guard that the other tools' wording is unchanged.
 
-- [ ] **Step 6: Run the whole suite**
+- [x] **Step 6: Run the whole suite**
 
 Run: `cargo test`
 
 Expected: PASS, 0 failed. Any test asserting the literal `Cursor:  installed` or `Cursor:  not installed` string must be updated to the new wording, not the other way round.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/commands/hooks.rs
@@ -1153,7 +1153,7 @@ Name the remaining TUI step and the observation that settles it."
 - Modify: `src/delivery.rs` (block clock, the gate-blocked branch, every gate-clear site)
 - Test: `src/db/events.rs`, `src/db/instances.rs` and `src/delivery.rs` (tests modules)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the tests module in `src/delivery.rs`. These are behavioural — the threshold predicate alone would not have caught the two ways this feature breaks (a stalled context overwritten on the next poll, and a latch that never rearms):
 
@@ -1244,7 +1244,7 @@ fn delivery_blocked_event_carries_its_own_action() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run each on its own — `cargo test` takes a single positional filter:
 
@@ -1255,7 +1255,7 @@ cargo test --lib delivery_blocked_event_carries_its_own_action
 
 Expected: FAIL to compile — `cannot find value \`DELIVERY_BLOCKED_ESCALATE_SECS\``, `cannot find function \`should_escalate_block\``, `cannot find function \`gate_block_context\``, `cannot find type \`BlockClock\``, and no method `emit_delivery_blocked_event`.
 
-- [ ] **Step 3: Add the delivery event emitter**
+- [x] **Step 3: Add the delivery event emitter**
 
 In `src/db/events.rs`, immediately after `emit_launch_blocked_event`, add:
 
@@ -1286,7 +1286,7 @@ In `src/db/events.rs`, immediately after `emit_launch_blocked_event`, add:
 
 `status` is the caller's *observed* status, not a constant: a `not_idle` block sits on an `ST_ACTIVE` instance, and an event that hardcoded `listening` would claim a state the instance is not in — the same overclaiming D2 and Task 7 exist to stop. When the caller cannot read a status at all it passes `"unknown"`, which is also not an observation but at least does not name a state.
 
-- [ ] **Step 4: Add the threshold, the context builder and the clock**
+- [x] **Step 4: Add the threshold, the context builder and the clock**
 
 In `src/delivery.rs`, next to the other module constants near the top, add:
 
@@ -1354,7 +1354,7 @@ impl BlockClock {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib delivery_block_
@@ -1363,7 +1363,7 @@ cargo test --lib delivery_blocked_event_carries_its_own_action
 
 Expected: PASS.
 
-- [ ] **Step 6: Put the clock in the loop**
+- [x] **Step 6: Put the clock in the loop**
 
 `Instant` is `Copy`; `BlockClock` is not, so the two existing `if let Some(since) = block_since` reads would *move* it out of the option. Both must borrow.
 
@@ -1387,7 +1387,7 @@ Then:
 
 The `block_since = None` sites need no change — clearing the clock clears the latch with it, which is why the two were merged.
 
-- [ ] **Step 7: Route both context writers through the builder**
+- [x] **Step 7: Route both context writers through the builder**
 
 Both blocked-branch updaters build their own context string today, and neither knows about the threshold. Replace the hardcoded strings so the suffix appears and stays.
 
@@ -1420,7 +1420,7 @@ with:
 
 Both keep their existing `if context != last_block_context` guard and their existing `status == ST_LISTENING` guard — the suffix rides along on machinery that already works, and an instance whose status is `active` or `blocked` still keeps its hook-owned context.
 
-- [ ] **Step 8: Emit the event once per block**
+- [x] **Step 8: Emit the event once per block**
 
 In the `} else {` branch of `if gate.safe`, immediately after the `if block_since.is_none() { block_since = Some(BlockClock::start()); }` statement, add:
 
@@ -1469,7 +1469,7 @@ In the `} else {` branch of `if gate.safe`, immediately after the `if block_sinc
                         }
 ```
 
-- [ ] **Step 9: Make clearing the gate context compare-and-clear**
+- [x] **Step 9: Make clearing the gate context compare-and-clear**
 
 A stalled context lives in the database, so clearing the local clock is not enough — the row keeps saying `stalled` after the block is over. But the existing clear is `set_gate_status(name, "", "")`, which writes unconditionally, and `last_block_context` being non-empty does **not** mean the row still holds what we wrote. The interleaving that breaks it: the loop writes `tui:prompt-has-text:stalled`, a hook drains the queue and writes its own `active` / `tool:Bash` / `running tests`, then the loop reaches its cleanup with a non-empty marker and erases the hook's context. Reading first and clearing after is still racy — the hook can land in between. The comparison has to be in the `WHERE` clause.
 
@@ -1602,7 +1602,7 @@ The two new sites are:
 - **The `no_pending` branch** (lines 1868-1877), which returns to `State::Idle` without touching either. This is the leak: a hook that drains the queue before the gate opens leaves a stalled context on the row *and* donates its elapsed seconds to the next message's clock.
 - **The `gate.safe` branch**, immediately after the `log_info("native", "delivery.gate_pass", …)` call. The clock measures continuous *blocking*, so it ends when the gate opens — not when delivery is later confirmed at `VerifyCursor`.
 
-- [ ] **Step 10: Retry a clear that failed**
+- [x] **Step 10: Retry a clear that failed**
 
 Keeping the marker on `Err` only helps if something comes back to it, and nothing does: every clear site sits on a path out of `State::Pending`, and `State::Idle` (`delivery.rs:1782-1864`) only leaves for `Pending` when new messages arrive. One failed clear on an agent that then goes quiet leaves a `stalled` context on the row for the life of the process.
 
@@ -1677,13 +1677,13 @@ fn a_failed_gate_clear_is_retried_and_still_respects_ownership() {
 
 `ST_ACTIVE` and `ST_LISTENING` are already imported by `delivery.rs`'s tests module (`use super::*` reaches the module's `crate::shared` import at line 16). `rusqlite::params!` is spelled out because that module imports only `super::*`.
 
-- [ ] **Step 11: Run the whole suite**
+- [x] **Step 11: Run the whole suite**
 
 Run: `cargo test`
 
 Expected: PASS, 0 failed.
 
-- [ ] **Step 12: Confirm the gate still reopens**
+- [x] **Step 12: Confirm the gate still reopens**
 
 The failure this task must not introduce is the one D1 was: an escalation that becomes its own cause. Prove it on a live agent — hold the prompt occupied past the threshold, then clear it:
 
@@ -1715,7 +1715,7 @@ Expected: once nothing is pending, the context is empty — no `:stalled` left o
 hcom kill tag:esc
 ```
 
-- [ ] **Step 13: Commit**
+- [x] **Step 13: Commit**
 
 ```bash
 git add src/delivery.rs src/db/events.rs src/db/instances.rs

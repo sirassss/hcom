@@ -1,6 +1,6 @@
 # Cursor CLI sessionEnd + idle follow-up Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Keep a live `cursor-agent` PTY on the hcom bus across `sessionEnd`, alias a second Cursor session UUID onto the same process, attach idle packets on a healthy Stop without a `status==completed` gate, and delete every session alias when the instance actually stops.
 
@@ -34,7 +34,7 @@ Do not edit `src/hooks/common.rs` `init_hook_context`, `src/hooks/claude.rs` pro
 
 This is the migration trigger: launcher only rewrites when `verify_cursor_hooks_installed` is false (`src/launcher.rs` Cursor branch).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append in `src/hooks/cursor.rs` `mod tests` (same `cursor_test_env` + `#[serial]` pattern):
 
@@ -93,13 +93,13 @@ Append in `src/hooks/cursor.rs` `mod tests` (same `cursor_test_env` + `#[serial]
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --locked --lib verify_rejects_fifteen_second_stop_timeout setup_writes_stop_timeout_thirty -- --test-threads=1`
 
 Expected: FAIL — `verify_rejects_fifteen_second_stop_timeout` still true (timeout only `is_some()`), and/or stop timeout is 15 not 30.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `src/hooks/cursor.rs`:
 
@@ -132,13 +132,13 @@ In `verify_hooks_at`, replace `entry.get("timeout").and_then(Value::as_u64).is_s
                         })
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked --lib cursor::tests -- --test-threads=1`
 
 Expected: PASS (including existing setup tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/hooks/cursor.rs
@@ -157,7 +157,7 @@ EOF
 **Files:**
 - Modify: `src/hooks/cursor.rs` (`handle_sessionend` ~616–626, tests)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add a helper next to `cursor_test_env` and the test (needs `HcomDb`, `HcomContext`, `HookPayload`):
 
@@ -211,13 +211,13 @@ Add a helper next to `cursor_test_env` and the test (needs `HcomDb`, `HcomContex
 
 Add `use crate::db::HcomDb;` and `use crate::hooks::HookPayload;` in the test module if not already in scope (`super::*` already has HookPayload via the parent module — `HookPayload` is `crate::hooks::HookPayload`; cursor.rs uses it. `HcomDb` is already imported at crate level in cursor.rs).
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --locked --lib sessionend_completed_keeps_instance -- --test-threads=1`
 
 Expected: FAIL — `row deleted` or status `inactive` / `exit:completed` because `finalize_session` ran.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Replace `handle_sessionend` with:
 
@@ -244,13 +244,13 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> V
 
 Do not call `finalize_session` or `soft_finalize_session`. Do not branch on `reason`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --locked --lib sessionend_completed_keeps_instance -- --test-threads=1`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/hooks/cursor.rs
@@ -269,7 +269,7 @@ EOF
 **Files:**
 - Modify: `src/hooks/cursor.rs` (`handle_stop` ~594–614)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     fn insert_broadcast(db: &HcomDb, from: &str, text: &str) {
@@ -330,13 +330,13 @@ EOF
 
 Keep the existing dispatch order in `dispatch_cursor_hook_native` (ACK only after `to_writer` + `flush`). Do not ACK on the parse-error branch (already returns 0 before handlers). Do not add `HCOM_PROCESS_ID` fallback on parse fail.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked --lib stop_followup_without_completed_status stop_empty_queue_has_no_followup -- --test-threads=1`
 
 Expected: `stop_followup_without_completed_status` FAIL (empty `{}` because status gate). Empty-queue test should already PASS.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `handle_stop`, delete:
 
@@ -348,13 +348,13 @@ In `handle_stop`, delete:
 
 Leave `set_status(listening)`, `notify_hook_instance_with_db`, and `prepare_pending_messages` as they are.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked --lib stop_followup_without_completed_status stop_empty_queue_has_no_followup -- --test-threads=1`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/hooks/cursor.rs
@@ -385,7 +385,7 @@ Path 3 already rebinds a new UUID onto a process placeholder. Path 1b retires a 
 
 `rebind_instance_session` deletes **all** `session_bindings` for that name. For Cursor aliases, use `rebind_session` instead (upsert one session_id, keep the other).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `src/instance_binding.rs` tests (copy the Path 1b fixture; add `"tool"`):
 
@@ -493,13 +493,13 @@ In `src/hooks/cursor.rs` tests:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked --lib test_bind_session_path1b_cursor_keeps_process_instance sessionstart_second_uuid_keeps_first_session_binding -- --test-threads=1`
 
 Expected: FAIL — cursor Path 1b still `exit:session_switch`; sessionstart drops `uuid-a` binding.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `src/instance_binding.rs` Path 1b `else` (the `exit:session_switch` block), wrap the retire in:
 
@@ -541,7 +541,7 @@ with:
     }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 
@@ -551,7 +551,7 @@ cargo test --locked --lib test_bind_session_path1b_cursor_keeps_process_instance
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/instance_binding.rs src/hooks/cursor.rs
@@ -574,7 +574,7 @@ EOF
 
 Inside `finalize_instance_stop` the work runs on transaction `tx`. Do **not** call `HcomDb::delete_session_bindings_for_instance` (it uses `self.conn` outside the txn). Use SQL on `tx`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `src/db/instances.rs` tests (follow `cleanup_test_db` / `open_at` pattern already in that file):
 
@@ -637,13 +637,13 @@ In `src/instance_lifecycle.rs` tests, reuse `setup_test_db` / `default_instance`
 
 If `save_instance_named` ignores `pid`, set pid with `db.conn().execute("UPDATE instances SET pid = ? WHERE name = 'deadc'", ...)` after insert. Check the saved row’s `pid` in the debugger/test if the first run does not mark dead.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test --locked --lib finalize_instance_stop_deletes_all_session_aliases mark_dead_deletes_all_session_aliases`
 
 Expected: FAIL — `uuid-b` binding still present.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `finalize_instance_stop`, replace the `if let Some(session_id)` block that deletes `session_bindings WHERE session_id = ?` with:
 
@@ -676,7 +676,7 @@ In `mark_dead_instances`, replace the `if let Some(ref session_id)` session_bind
 
 Keep `DELETE FROM process_bindings WHERE instance_name = ?`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --locked --lib finalize_instance_stop_deletes_all_session_aliases mark_dead_deletes_all_session_aliases`
 
@@ -684,7 +684,7 @@ Also: `cargo test --locked --lib test_finalize_session_calls_stop test_stop_inst
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/db/instances.rs src/instance_lifecycle.rs
@@ -705,7 +705,7 @@ EOF
 - Modify: `plugin/hcom/skills/hcom-agent-messaging/references/cross-tool.md` (same paragraph)
 - Modify: spec status line in `docs/superpowers/specs/2026-08-29-cursor-cli-sessionend-and-idle-followup-design.md`
 
-- [ ] **Step 1: Edit Cursor section** (both skill copies)
+- [x] **Step 1: Edit Cursor section** (both skill copies)
 
 Replace the Cursor **Session binding** and **Message delivery** bullets with:
 
@@ -714,11 +714,11 @@ Replace the Cursor **Session binding** and **Message delivery** bullets with:
 - **Message delivery**: Hook-based when hcom-launched. Active turn → body in postToolUse `additional_context`. Idle agent → PTY injects only `<hcom>`; a healthy `stop` hook puts the packet in `followup_message` (status need not be `completed`). Empty stdin on stop does not ACK; the next healthy stop re-delivers. `stop.timeout` is 30s (rewritten on next `hcom cursor-agent` spawn if still 15).
 ```
 
-- [ ] **Step 2: Flip spec status**
+- [x] **Step 2: Flip spec status**
 
 Change the spec header **Status** to: `Plan written at docs/superpowers/plans/2026-08-29-cursor-cli-sessionend-and-idle-followup.md`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add skills/hcom-agent-messaging/references/cross-tool.md plugin/hcom/skills/hcom-agent-messaging/references/cross-tool.md docs/superpowers/specs/2026-08-29-cursor-cli-sessionend-and-idle-followup-design.md
@@ -737,7 +737,7 @@ No failing test for markdown.
 
 **Files:** none new.
 
-- [ ] **Step 1: Run Cursor + bind + DB + Claude historical tests**
+- [x] **Step 1: Run Cursor + bind + DB + Claude historical tests**
 
 ```
 cargo test --locked --lib cursor::tests -- --test-threads=1
@@ -749,7 +749,7 @@ cargo test --locked --lib test_finalize_session_calls_stop
 
 Expected: all PASS. Claude historical reject unchanged.
 
-- [ ] **Step 2: If anything fails, fix in the file that caused it; do not “relax” Claude tests.**
+- [x] **Step 2: If anything fails, fix in the file that caused it; do not “relax” Claude tests.**
 
 - [ ] **Step 3: Manual acceptance (not merge-blocking)**
 

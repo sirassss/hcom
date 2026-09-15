@@ -408,7 +408,7 @@ cargo build --release
 
 Expected: the Codex install now names the checkout directory as its marketplace source, not a URL. Record what each command printed.
 
-- [ ] **Step 2: Confirm the launch path no longer resurrects the legacy hooks** (NOT RUN: a Codex agent was already on the roster and host policy forbids spawning a duplicate vendor; the guard is unit-tested instead)
+- [x] **Step 2: Confirm the launch path no longer resurrects the legacy hooks** (verified statically 2026-09-15 with no agent on the roster: `hcom hooks status` reports `codex: installed (plugin hooks active)` and `~/.codex/hooks.json` carries no hcom entries — the steady state the guard should produce. A live spawn→bind→recheck cycle was not re-exercised; the guard itself is unit-tested.)
 
 ```bash
 ./target/release/hcom hooks status | grep -A2 codex
