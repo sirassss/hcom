@@ -496,118 +496,31 @@ where
     install_then_strip(|| install(&source), verify, strip)
 }
 
-/// Upstream's published repository: the fallback `marketplace_source` returns
-/// for both Claude and Cursor installs when no fork remote can be resolved.
-pub(crate) const HCOM_REPOSITORY_URL: &str = "https://github.com/aannoo/hcom";
-
-/// Marketplace source: the git remote the checkout's current branch tracks.
+/// A dedicated repository, kept in sync by `scripts/sync-plugin-repo.sh`, so
+/// no vendor's marketplace/install has to clone the whole monorepo (`src/`,
+/// `tests/`, `docs/`...) just to reach `plugin/`. Its root is
+/// `plugin/hcom-agy`'s content; a `hcom` subdirectory holds `plugin/hcom`'s
+/// content, alongside its own `.claude-plugin/marketplace.json` declaring
+/// `"source": "./hcom"`.
 ///
-/// The owner runs their own fork and consumes it as a git marketplace, so every
-/// vendor indexes that fork rather than upstream or a local directory. A local
-/// path would be fresher, but it is not what the other machines and the other
-/// vendors can reach, and Cursor cannot take one at all.
-///
-/// Whatever this returns has to be fetchable: an SSH remote configured through a
-/// `~/.ssh/config` host alias is normalized to the alias's real hostname by
-/// [`normalize_git_url`], because the alias itself is not a DNS name.
-///
-/// Note this URL carries no ref, so a vendor resolves the fork's **default
-/// branch**. Work on another branch is invisible to an install until it lands
-/// there.
-///
-/// Antigravity does not call this: `agy plugin install` takes a directory only.
-fn marketplace_source() -> String {
-    let db_path = crate::paths::db_path();
-    let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) else {
-        return HCOM_REPOSITORY_URL.to_string();
-    };
-    checkout_remote_url(&root).unwrap_or_else(|| HCOM_REPOSITORY_URL.to_string())
-}
-
-/// URL of the remote the checkout's branch tracks, falling back to `origin`.
-fn checkout_remote_url(root: &Path) -> Option<String> {
-    let remote = git_output(root, &["rev-parse", "--abbrev-ref", "HEAD"]).and_then(|branch| {
-        git_output(
-            root,
-            &["config", "--get", &format!("branch.{branch}.remote")],
-        )
-    });
-    // `.` means the branch tracks another local branch, not a named remote.
-    // A stale tracking configuration must not hide a usable origin either.
-    let url = remote
-        .filter(|remote| remote != ".")
-        .and_then(|remote| git_output(root, &["remote", "get-url", &remote]))
-        .or_else(|| git_output(root, &["remote", "get-url", "origin"]))?;
-    Some(normalize_git_url(&url))
-}
-
-/// Run git in `root`, returning trimmed stdout when it exits 0.
-fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-/// `git@host:owner/repo.git` → `https://host/owner/repo`, resolving SSH host
-/// aliases. Neither Claude nor Cursor accepts an SSH remote as a marketplace
-/// source, and a `~/.ssh/config` alias is not a DNS name — a fork cloned through
-/// one would otherwise produce a URL that resolves nowhere, the same failure as
-/// handing Cursor a path.
-fn normalize_git_url(url: &str) -> String {
-    normalize_git_url_with(url, resolve_ssh_hostname)
-}
-
-/// Testable half: `resolve` maps an SSH host alias to its real hostname.
-fn normalize_git_url_with(url: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
-    let url = url.trim().trim_end_matches(".git");
-    if let Some(rest) = url.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-    {
-        let host = resolve(host).unwrap_or_else(|| host.to_string());
-        return format!("https://{host}/{path}");
-    }
-    // `ssh://[user@]host/owner/repo` is the other remote form git writes, and a
-    // marketplace takes no ssh scheme either.
-    if let Some(rest) = url.strip_prefix("ssh://")
-        && let Some((authority, path)) = rest.split_once('/')
-    {
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        let host = resolve(host).unwrap_or_else(|| host.to_string());
-        return format!("https://{host}/{path}");
-    }
-    url.to_string()
-}
-
-/// Ask ssh for the effective `HostName` of a host pattern. `ssh -G` prints the
-/// resolved configuration and connects to nothing.
-fn resolve_ssh_hostname(host: &str) -> Option<String> {
-    let out = std::process::Command::new("ssh")
-        .args(["-G", host])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("hostname "))
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-}
+/// AGY specifically requires its package to sit at this URL's root: `agy
+/// plugin install <target>` clones a URL's default branch and reads
+/// skills/hooks there directly, with no ref or subdirectory selector
+/// (measured 2026-09-15: `owner/repo@ref` is parsed as `@marketplace`, and a
+/// URL `#ref` fragment is silently ignored; only `https://` is recognized as
+/// a remote — an SSH `git@host:path` string is treated as an unknown
+/// marketplace name). Claude/Codex/Cursor instead register this same URL as
+/// a marketplace and read the `marketplace.json` indirection above — ordinary
+/// marketplace behavior, no root placement needed.
+pub(crate) const HCOM_PLUGIN_REPOSITORY_URL: &str = "https://github.com/sirassss/hcom-plugin";
 
 pub(crate) fn install_claude_plugin() -> Result<(), String> {
-    let source = marketplace_source();
     install_then_strip(
         || {
-            run_tool_cli("claude", &["plugin", "marketplace", "add", &source])?;
+            run_tool_cli(
+                "claude",
+                &["plugin", "marketplace", "add", HCOM_PLUGIN_REPOSITORY_URL],
+            )?;
             run_tool_cli("claude", &["plugin", "install", CLAUDE_PLUGIN_ID])
         },
         verify_claude_plugin_installed,
@@ -620,8 +533,7 @@ pub(crate) fn install_claude_plugin() -> Result<(), String> {
 /// `cursor-agent plugin` exposes only `marketplace` — installation happens in
 /// the interactive `/plugins` picker (measured, module doc). Cursor rejects
 /// local paths, so `dev_root` cannot be passed directly; what it can index is
-/// the *remote* that checkout tracks, which is what `marketplace_source`
-/// resolves.
+/// the published [`HCOM_PLUGIN_REPOSITORY_URL`].
 ///
 /// **This never strips the legacy hooks, on any pass.** It is tempting to gate
 /// a strip on [`verify_cursor_plugin_installed`], but that verifier only proves
@@ -638,14 +550,11 @@ pub(crate) fn install_claude_plugin() -> Result<(), String> {
 /// safe half of the trade: both sets call the same `cursor-*` subcommands, so
 /// the worst case is one redundant hook invocation, never a wrong handler.
 pub(crate) fn install_cursor_plugin() -> Result<(), String> {
-    // Same source as Claude: the fork this checkout tracks, so a developer's
-    // Cursor indexes the branch that actually carries hooks-cursor.json.
     // Cursor takes a git URL only — a path or file:// URL is mangled into an
     // unresolvable https host (measured 2026-09-09).
-    let source = marketplace_source();
     run_tool_cli(
         "cursor-agent",
-        &["plugin", "marketplace", "add", source.as_str()],
+        &["plugin", "marketplace", "add", HCOM_PLUGIN_REPOSITORY_URL],
     )?;
 
     Err(format!(
@@ -655,32 +564,52 @@ pub(crate) fn install_cursor_plugin() -> Result<(), String> {
     ))
 }
 
-/// `agy plugin install` takes a directory, not a URL — and with no local
-/// checkout (`dev_root` unset) there is nothing to point it at. Rather than
-/// pass `agy` a remote URL it will reject, hand the user the exact command
-/// to run once they have a checkout.
+/// Prefer the local checkout when one is configured, so editing
+/// `plugin/hcom-agy` and reinstalling never waits on a publish. A host with no
+/// checkout falls back to the published repository above instead of erroring.
 pub(crate) fn install_agy_plugin() -> Result<(), String> {
     let db_path = crate::paths::db_path();
-    let Some((root, _source)) = crate::router::resolve_effective_dev_root(&db_path) else {
-        let command = if cfg!(windows) {
-            "$env:HCOM_DEV_ROOT = '<repo>'; hcom hooks add antigravity"
-        } else {
-            "HCOM_DEV_ROOT='<repo>' hcom hooks add antigravity"
-        };
-        return Err(format!(
-            "Antigravity plugin installation needs a local checkout of hcom because agy \
-             rejects a URL. Clone the repo, then run: {command}"
-        ));
-    };
-    install_agy_plugin_from_root(
-        &root,
-        |source| {
-            let source = source.to_string_lossy();
-            run_tool_cli("agy", &["plugin", "install", &source])
-        },
-        || verify_agy_plugin_installed() && verify_plugin_skill_payload(&agy_plugin_dir()).is_ok(),
-        crate::hooks::antigravity::remove_antigravity_hooks,
-    )
+    match crate::router::resolve_effective_dev_root(&db_path) {
+        Some((root, _source)) => install_agy_plugin_from_root(
+            &root,
+            |source| {
+                let source = source.to_string_lossy();
+                run_tool_cli("agy", &["plugin", "install", &source])
+            },
+            || {
+                verify_agy_plugin_installed()
+                    && verify_plugin_skill_payload(&agy_plugin_dir()).is_ok()
+            },
+            crate::hooks::antigravity::remove_antigravity_hooks,
+        ),
+        None => install_agy_plugin_from_url(
+            HCOM_PLUGIN_REPOSITORY_URL,
+            |url| run_tool_cli("agy", &["plugin", "install", url]),
+            || {
+                verify_agy_plugin_installed()
+                    && verify_plugin_skill_payload(&agy_plugin_dir()).is_ok()
+            },
+            crate::hooks::antigravity::remove_antigravity_hooks,
+        ),
+    }
+}
+
+/// Same install → verify → strip shape as [`install_agy_plugin_from_root`],
+/// for the no-local-checkout path: `install` gets the published URL directly
+/// instead of a staged directory, so a test can assert which URL it saw
+/// without `agy` (or the network) ever running.
+fn install_agy_plugin_from_url<I, V, S>(
+    url: &str,
+    install: I,
+    verify: V,
+    strip: S,
+) -> Result<(), String>
+where
+    I: FnOnce(&str) -> Result<(), String>,
+    V: FnOnce() -> bool,
+    S: FnOnce() -> bool,
+{
+    install_then_strip(|| install(url), verify, strip)
 }
 
 /// Commands hcom runs to remove the Claude plugin: uninstall it, then drop the
@@ -689,17 +618,18 @@ pub(crate) fn install_agy_plugin() -> Result<(), String> {
 /// Codex: add the marketplace, then install the plugin from it.
 ///
 /// `codex plugin marketplace add` takes "a local path, owner/repo[@ref], HTTPS
-/// Git URL, or SSH Git URL" (0.154.0 `--help`), so it uses the same source
-/// policy Claude does — a developer's Codex indexes the fork their checkout
-/// tracks rather than upstream.
+/// Git URL, or SSH Git URL" (0.154.0 `--help`), so it uses the same
+/// [`HCOM_PLUGIN_REPOSITORY_URL`] Claude does.
 ///
 /// Unlike Claude's install, **this never strips the legacy hook entries.**
 /// Codex's hooks require an explicit trust step hcom cannot perform, so the
 /// native entries are the only thing firing until the user reviews the plugin.
 /// They go on an explicit `hcom hooks remove codex --legacy-only`.
 pub(crate) fn install_codex_plugin() -> Result<(), String> {
-    let source = marketplace_source();
-    run_tool_cli("codex", &["plugin", "marketplace", "add", &source])?;
+    run_tool_cli(
+        "codex",
+        &["plugin", "marketplace", "add", HCOM_PLUGIN_REPOSITORY_URL],
+    )?;
     run_tool_cli("codex", &["plugin", "add", CLAUDE_PLUGIN_ID])
 }
 
@@ -901,35 +831,25 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn review_regression_missing_checkout_guidance_routes_through_hcom_staging() {
-        let (_dir, _home, _guard) = plugin_test_env();
-        let saved_dev_root = std::env::var_os("HCOM_DEV_ROOT");
-        unsafe { std::env::remove_var("HCOM_DEV_ROOT") };
+    fn review_regression_missing_checkout_falls_back_to_the_published_agy_repo() {
+        let seen = std::cell::RefCell::new(String::new());
 
-        let error = super::install_agy_plugin().unwrap_err();
+        super::install_agy_plugin_from_url(
+            super::HCOM_PLUGIN_REPOSITORY_URL,
+            |url| {
+                *seen.borrow_mut() = url.to_string();
+                Ok(())
+            },
+            || true,
+            || true,
+        )
+        .unwrap();
 
-        unsafe {
-            match saved_dev_root {
-                Some(value) => std::env::set_var("HCOM_DEV_ROOT", value),
-                None => std::env::remove_var("HCOM_DEV_ROOT"),
-            }
-        }
+        assert_eq!(seen.into_inner(), super::HCOM_PLUGIN_REPOSITORY_URL);
         assert!(
-            error.contains("HCOM_DEV_ROOT"),
-            "unexpected guidance: {error}"
-        );
-        assert!(
-            error.contains("hcom hooks add antigravity"),
-            "unexpected guidance: {error}"
-        );
-        assert!(
-            error.contains("'<repo>'"),
-            "checkout path is not quoted: {error}"
-        );
-        assert!(
-            !error.contains("agy plugin install <repo>/plugin/hcom-agy"),
-            "guidance bypassed staging: {error}"
+            super::HCOM_PLUGIN_REPOSITORY_URL.starts_with("https://"),
+            "agy only recognizes https:// as a remote, not git@host:path: {}",
+            super::HCOM_PLUGIN_REPOSITORY_URL
         );
     }
 
@@ -1664,59 +1584,6 @@ mod tests {
         );
     }
 
-    /// An SSH host alias is not a DNS name. `git@myalias:owner/repo.git` must
-    /// become the alias's real host, or Cursor gets a marketplace URL that
-    /// resolves nowhere — the same class of failure as handing it a path.
-    #[test]
-    fn an_ssh_host_alias_resolves_to_its_real_hostname() {
-        assert_eq!(
-            super::normalize_git_url_with("git@myalias:owner/repo.git", |host| {
-                assert_eq!(host, "myalias");
-                Some("github.com".to_string())
-            }),
-            "https://github.com/owner/repo"
-        );
-        // Unresolvable alias: keep what git gave us rather than inventing a host.
-        assert_eq!(
-            super::normalize_git_url_with("git@myalias:owner/repo.git", |_| None),
-            "https://myalias/owner/repo"
-        );
-        assert_eq!(
-            super::normalize_git_url_with("git@github.com:owner/repo.git", |_| Some(
-                "github.com".to_string()
-            )),
-            "https://github.com/owner/repo"
-        );
-        // Already HTTPS: untouched, and no host resolution attempted.
-        assert_eq!(
-            super::normalize_git_url_with("https://github.com/owner/repo.git", |_| panic!(
-                "must not resolve a host for an https remote"
-            )),
-            "https://github.com/owner/repo"
-        );
-    }
-
-    /// The marketplace is the owner's fork on GitHub, reached through whatever
-    /// remote the branch tracks — including an SSH remote behind a
-    /// `~/.ssh/config` alias, which must come out as the alias's real host.
-    /// A local path is never substituted: Cursor cannot install from one, and
-    /// the other machines cannot reach this one's filesystem.
-    #[test]
-    fn the_marketplace_url_is_a_fetchable_fork_url() {
-        for remote in [
-            "git@myalias:owner/repo.git",
-            "git@github.com:owner/repo.git",
-            "https://github.com/owner/repo.git",
-        ] {
-            let url = super::normalize_git_url_with(remote, |_| Some("github.com".to_string()));
-            assert!(
-                url.starts_with("https://github.com/"),
-                "{remote} normalized to {url}, which no vendor can fetch"
-            );
-            assert!(!url.contains("myalias"), "{url} still names the ssh alias");
-        }
-    }
-
     /// The selector both Claude and Codex install by must name the marketplace
     /// that `.claude-plugin/marketplace.json` actually declares, and the plugin
     /// inside it. A rename there silently breaks `codex plugin add`.
@@ -2095,133 +1962,5 @@ mod tests {
         assert!(super::uninstall_cursor_plugin().is_ok());
         assert!(!super::verify_agy_plugin_installed());
         assert!(super::uninstall_agy_plugin().is_ok());
-    }
-
-    // One `cargo test` filter takes one positional TESTNAME, so these three share
-    // a prefix rather than being named for what each asserts alone.
-    #[test]
-    fn normalize_git_url_rewrites_an_ssh_remote() {
-        assert_eq!(
-            super::normalize_git_url("git@github.com:sirassss/hcom.git"),
-            "https://github.com/sirassss/hcom"
-        );
-    }
-
-    #[test]
-    fn normalize_git_url_rewrites_an_ssh_scheme_remote() {
-        assert_eq!(
-            super::normalize_git_url("ssh://git@github.com/sirassss/hcom.git"),
-            "https://github.com/sirassss/hcom"
-        );
-        assert_eq!(
-            super::normalize_git_url("ssh://github.com/sirassss/hcom"),
-            "https://github.com/sirassss/hcom"
-        );
-    }
-
-    /// Both SSH forms carry a host alias, so both must resolve it.
-    #[test]
-    fn normalize_git_url_resolves_an_alias_in_either_ssh_form() {
-        let resolve = |host: &str| (host == "sirassss").then(|| "github.com".to_string());
-        assert_eq!(
-            super::normalize_git_url_with("git@sirassss:sirassss/hcom.git", resolve),
-            "https://github.com/sirassss/hcom"
-        );
-        assert_eq!(
-            super::normalize_git_url_with("ssh://git@sirassss/sirassss/hcom.git", resolve),
-            "https://github.com/sirassss/hcom"
-        );
-    }
-
-    #[test]
-    fn normalize_git_url_strips_only_the_git_suffix() {
-        assert_eq!(
-            super::normalize_git_url("https://github.com/sirassss/hcom.git"),
-            "https://github.com/sirassss/hcom"
-        );
-        assert_eq!(
-            super::normalize_git_url("https://github.com/sirassss/hcom"),
-            "https://github.com/sirassss/hcom"
-        );
-    }
-
-    #[test]
-    fn normalize_git_url_trims_git_output_whitespace() {
-        assert_eq!(
-            super::normalize_git_url("git@github.com:sirassss/hcom.git\n"),
-            "https://github.com/sirassss/hcom"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn checkout_remote_url_falls_back_to_origin_when_tracking_remote_is_unusable() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let hooks_dir = root.join("empty-hooks");
-        std::fs::create_dir(&hooks_dir).unwrap();
-        let run_git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run_git(&["init", "-b", "main"]);
-        run_git(&[
-            "-c",
-            "user.name=Review Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            &format!("core.hooksPath={}", hooks_dir.display()),
-            "commit",
-            "--allow-empty",
-            "-m",
-            "fixture",
-        ]);
-        run_git(&[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/example/fork.git",
-        ]);
-        run_git(&["checkout", "-b", "feature", "--track", "main"]);
-        assert_eq!(
-            super::git_output(root, &["config", "--get", "branch.feature.remote"]).as_deref(),
-            Some(".")
-        );
-        let origin = Some("https://github.com/example/fork".to_string());
-        assert_eq!(super::checkout_remote_url(root), origin);
-
-        run_git(&["config", "branch.feature.remote", "missing"]);
-        assert_eq!(super::checkout_remote_url(root), origin);
-        run_git(&["config", "--unset", "branch.feature.remote"]);
-        assert_eq!(super::checkout_remote_url(root), origin);
-
-        run_git(&[
-            "remote",
-            "add",
-            "tracked",
-            "git@github.com:example/tracked.git",
-        ]);
-        run_git(&["config", "branch.feature.remote", "tracked"]);
-        assert_eq!(
-            super::checkout_remote_url(root),
-            Some("https://github.com/example/tracked".to_string())
-        );
-
-        run_git(&["checkout", "--detach"]);
-        assert_eq!(super::checkout_remote_url(root), origin);
-        run_git(&["remote", "remove", "origin"]);
-        assert_eq!(super::checkout_remote_url(root), None);
     }
 }
