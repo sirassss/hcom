@@ -42,7 +42,7 @@ Estimated production reduction: approximately 40–80 lines, not a measured patc
 - Preserve inline watermarks for filtered-out items and the owned replay snapshot across data reloads, resize, and chunk boundaries.
 - Plugin install still verifies before stripping legacy hooks. Codex still requires user trust; plugin entries must never become eligible for native hook trust bypass.
 - Canonical skills remain authored under `skills/hcom-agent-messaging/`; generated adapter trees remain byte-identical real files.
-- Cleanup is planned only. The separate upstream merge is authorized for execution in this session.
+- Cleanup execution was authorized by the owner after the review; retain the same behavior constraints.
 
 ## Task 1: Reuse lifecycle grouping and remove stale TUI scaffolding
 
@@ -50,10 +50,10 @@ Estimated production reduction: approximately 40–80 lines, not a measured patc
 
 **Interfaces:** `collect_new_items<'a>(..., data: &'a DataState, ...) -> Vec<FeedItem<'a>>`; `group_eject_rows(items: Vec<FeedItem<'_>>) -> VecDeque<ReplayRow>`. The latter produces the same owned queue consumed by `eject_replay_chunk`.
 
-- [ ] Keep existing grouping and replay tests; extend their fixture cases with a tool/message boundary, a different owner, and equal clock time on different dates. Assert concrete row counts/IDs, including runs of lengths 2 and 3.
-- [ ] Run `cargo test --bin hcom tui:: -- --test-threads=1` and record the baseline.
-- [ ] Let `begin_replay` pass `filter::collect_items` directly to `group_eject_rows`. Return borrowed `FeedItem` from `collect_new_items`, keeping both watermark updates exactly where they are. Sort with `order_cmp` directly.
-- [ ] Replace the duplicate grouping loop with this adapter (import existing `Row` and `group_lifecycle`):
+- [x] Keep existing grouping and replay tests; extend their fixture cases with a tool/message boundary, a different owner, and equal clock time on different dates. Assert concrete row counts/IDs, including runs of lengths 2 and 3.
+- [x] Run `cargo test --bin hcom tui:: -- --test-threads=1` and record the baseline.
+- [x] Let `begin_replay` pass `filter::collect_items` directly to `group_eject_rows`. Return borrowed `FeedItem` from `collect_new_items`, keeping both watermark updates exactly where they are. Sort with `order_cmp` directly.
+- [x] Replace the duplicate grouping loop with this adapter (import existing `Row` and `group_lifecycle`):
 
 ```rust
 fn group_eject_rows(items: Vec<FeedItem<'_>>) -> VecDeque<ReplayRow> {
@@ -69,9 +69,9 @@ fn group_eject_rows(items: Vec<FeedItem<'_>>) -> VecDeque<ReplayRow> {
 }
 ```
 
-- [ ] Update existing tests that construct `EjectItem` inputs to pass borrowed feeds. Remove `as_feed` only if its remaining callers disappear; keep `row_id` if replay still consumes it. No additional cloning before grouping.
-- [ ] Delete module-wide stale `allow(dead_code)` in `filter.rs`, `tag_of`'s task-only suppression, and `MsgFilter::describe`. Change its sole test to `MsgFilter::default().describe_with(&str::to_string)`.
-- [ ] Run the TUI test command above and `cargo check`. Verify replay cancellation, limits, ordering, and watermarks remain covered. Commit only these TUI changes.
+- [x] Update existing tests that construct `EjectItem` inputs to pass borrowed feeds. Remove `as_feed` only if its remaining callers disappear; keep `row_id` if replay still consumes it. No additional cloning before grouping.
+- [x] Delete module-wide stale `allow(dead_code)` in `filter.rs`, `tag_of`'s task-only suppression, and `MsgFilter::describe`. Change its sole test to `MsgFilter::default().describe_with(&str::to_string)`.
+- [x] Run the TUI test command above and `cargo check`. Verify replay cancellation, limits, ordering, and watermarks remain covered. Commit only these TUI changes.
 
 ## Task 2: Make Codex install planning an ordinary enum
 
@@ -79,8 +79,8 @@ fn group_eject_rows(items: Vec<FeedItem<'_>>) -> VecDeque<ReplayRow> {
 
 **Interfaces:** `plan_codex_add(...) -> CodexAddPlan`; `add_codex_plugin() -> Result<CodexAddOutcome, String>` remains unchanged.
 
-- [ ] Run `cargo test --bin hcom add_routes_every_state -- --test-threads=1` as baseline; retain every state/Claude-presence combination and message assertion.
-- [ ] Replace the single-variant enum with:
+- [x] Run `cargo test --bin hcom add_routes_every_state -- --test-threads=1` as baseline; retain every state/Claude-presence combination and message assertion.
+- [x] Replace the single-variant enum with:
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,8 +90,8 @@ pub(crate) enum CodexAddPlan {
 }
 ```
 
-- [ ] In `plan_codex_add` change report returns from `Ok(outcome)` to `CodexAddPlan::Report(outcome)`, and installation from `Err(CodexAddPlan::InstallNatively)` to `CodexAddPlan::InstallNatively`. In its executor match `Report(outcome) => Ok(outcome)` and the install variant directly. Do not alter decision conditions or diagnostics.
-- [ ] Update the existing assertions to the new variants. Run `cargo test --bin hcom hooks::codex:: -- --test-threads=1` and `cargo test --bin hcom commands::hooks:: -- --test-threads=1`. Commit this independently.
+- [x] In `plan_codex_add` change report returns from `Ok(outcome)` to `CodexAddPlan::Report(outcome)`, and installation from `Err(CodexAddPlan::InstallNatively)` to `CodexAddPlan::InstallNatively`. In its executor match `Report(outcome) => Ok(outcome)` and the install variant directly. Do not alter decision conditions or diagnostics.
+- [x] Update the existing assertions to the new variants. Run `cargo test --bin hcom hooks::codex:: -- --test-threads=1` and `cargo test --bin hcom commands::hooks:: -- --test-threads=1`. Commit this independently.
 
 ## Task 3: Construct AGY event arrays directly
 
@@ -99,8 +99,8 @@ pub(crate) enum CodexAddPlan {
 
 **Interfaces:** No signature change. Produce the same `hcom-lifecycle` JSON object.
 
-- [ ] Run `cargo test --bin hcom hooks::antigravity:: -- --test-threads=1` and `cargo test --bin hcom hooks::plugin:: -- --test-threads=1` as baseline.
-- [ ] Initialize `let mut lifecycle_map = serde_json::Map::new();` before iterating `AGY_HOOK_CONFIGS`. Keep construction of each `hook` and `entry`. Replace the vector lookup and final conversion loop with:
+- [x] Run `cargo test --bin hcom hooks::antigravity:: -- --test-threads=1` and `cargo test --bin hcom hooks::plugin:: -- --test-threads=1` as baseline.
+- [x] Initialize `let mut lifecycle_map = serde_json::Map::new();` before iterating `AGY_HOOK_CONFIGS`. Keep construction of each `hook` and `entry`. Replace the vector lookup and final conversion loop with:
 
 ```rust
 lifecycle_map
@@ -111,8 +111,8 @@ lifecycle_map
     .push(entry);
 ```
 
-- [ ] Keep `let hcom_lifecycle = Value::Object(lifecycle_map);`. Update the event-order comment to promise only order within each event array.
-- [ ] Rerun both commands and `cargo test --test plugin_payload`. The existing tests must still cover both PreInvocation handlers, matcher nesting, fallbacks, and unchanged committed payloads. Commit independently.
+- [x] Keep `let hcom_lifecycle = Value::Object(lifecycle_map);`. Update the event-order comment to promise only order within each event array.
+- [x] Rerun both commands and `cargo test --test plugin_payload`. The existing tests must still cover both PreInvocation handlers, matcher nesting, fallbacks, and unchanged committed payloads. Commit independently.
 
 ## Upstream assessment and integration record
 
@@ -148,6 +148,16 @@ Baseline parallel suite: 2,364 unit tests passed, one shell-env test failed, one
 
 ### Final local outcome
 
-Merge commit: `0a03355` (`05302da` + upstream `fabb309`). The final scoped test run exited 0: **2,458 passed, 16 ignored, one explicitly filtered baseline failure**. Upstream ancestry is integrated; no push was performed. Cleanup Tasks 1–3 remain a proposal, not an applied refactor.
+Merge commit: `0a03355` (`05302da` + upstream `fabb309`). The final scoped test run exited 0: **2,458 passed, 16 ignored, one explicitly filtered baseline failure**. Upstream ancestry is integrated; no push was performed. Cleanup Tasks 1–3 were subsequently authorized and applied; see the execution record below.
 
 net: approximately -40 to -80 production lines possible.
+
+## Cleanup execution record (2026-09-15)
+
+- `a62ed22`: inline replay/live batches reuse `group_lifecycle`; only surviving rows are cloned. Removed stale dead-code allowances and unused `describe`. Removing the allowance exposed `MsgTier::from_str` as test-only scaffolding for deferred persistence, so it was also removed; tier-cycle and label assertions remain.
+- `0faa38f`: Codex planning returns `Report` or `InstallNatively` directly, preserving all diagnostics and installation/trust conditions.
+- `8012728`: AGY builds event arrays in the final JSON map, preserving array order.
+- Extended the existing replay fixture to cover the three-event threshold, two-event runs, owner/tool/day boundaries, and ownership after the source data is dropped. It passed before and after the refactor; the separate message-boundary test remains.
+- Baselines: 215 TUI tests passed; 479 hook tests passed, one ignored. Final consolidated verification covers the per-task commands: `cargo test --bins --tests --no-fail-fast -- --test-threads=1 --skip shell_env::tests::resolver_discards_stderr_without_breaking_env_resolution` exited 0 with **2,458 passed, 16 ignored, one explicitly filtered baseline environment failure**.
+- `cargo check` passed without warnings; `cargo fmt --check` and `git diff --check` passed.
+- Measured source delta against `0f0996d`: **-57 lines outside unit-test modules** (-61 lines across the five Rust files including test changes). No dependencies added. Commits remain local on `feat/siras/develop`.
