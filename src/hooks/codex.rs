@@ -1553,7 +1553,9 @@ pub(crate) fn plan_codex_add(
     status: &CodexPluginStatus,
     claude: &ClaudePresence,
     claude_plugin_installed: bool,
-) -> Result<CodexAddOutcome, CodexAddPlan> {
+) -> CodexAddPlan {
+    use CodexAddPlan::{InstallNatively, Report};
+
     let detail = |extra: &str| {
         let mut text = extra.to_string();
         for line in &status.details {
@@ -1564,27 +1566,27 @@ pub(crate) fn plan_codex_add(
     };
 
     match status.state {
-        CodexPluginState::Active => Ok(CodexAddOutcome::AlreadyActive),
+        CodexPluginState::Active => Report(CodexAddOutcome::AlreadyActive),
         // Never strip Codex's legacy entries as a side effect of `add`: unlike
         // Claude's, they are the only thing firing until the plugin is trusted.
-        CodexPluginState::Duplicate => Ok(CodexAddOutcome::ActionRequired(detail(
+        CodexPluginState::Duplicate => Report(CodexAddOutcome::ActionRequired(detail(
             "plugin and legacy hooks are both active. Once the plugin is trusted, run: \
              hcom hooks remove codex --legacy-only",
         ))),
-        CodexPluginState::ReviewRequired => Ok(CodexAddOutcome::ActionRequired(detail(
+        CodexPluginState::ReviewRequired => Report(CodexAddOutcome::ActionRequired(detail(
             "open Codex and review/trust hcom's hooks, then: hcom hooks status",
         ))),
-        CodexPluginState::Disabled => Ok(CodexAddOutcome::ActionRequired(detail(
+        CodexPluginState::Disabled => Report(CodexAddOutcome::ActionRequired(detail(
             "enable hcom's hooks in Codex, then: hcom hooks status",
         ))),
-        CodexPluginState::Incompatible => Ok(CodexAddOutcome::ActionRequired(detail(
+        CodexPluginState::Incompatible => Report(CodexAddOutcome::ActionRequired(detail(
             "Codex is running Claude's handlers, which cannot serve Codex sessions. \
              Reinstall the plugin so the Codex overlay is selected.",
         ))),
-        CodexPluginState::Unverified => Ok(CodexAddOutcome::ActionRequired(detail(
+        CodexPluginState::Unverified => Report(CodexAddOutcome::ActionRequired(detail(
             "Codex's hook inventory is unavailable, so nothing was installed.",
         ))),
-        CodexPluginState::LegacyOnly => Ok(CodexAddOutcome::ActionRequired(detail(
+        CodexPluginState::LegacyOnly => Report(CodexAddOutcome::ActionRequired(detail(
             "hcom's native Codex hooks are in place and working. To migrate to the plugin, \
              install it first and remove the legacy entries only once it is trusted: \
              hcom hooks remove codex --legacy-only",
@@ -1601,22 +1603,23 @@ pub(crate) fn plan_codex_add(
                          standalone hcom skill), restart Codex, review the hooks, then: \
                          hcom hooks status",
                     );
-                    Ok(CodexAddOutcome::ActionRequired(detail(&text)))
+                    Report(CodexAddOutcome::ActionRequired(detail(&text)))
                 }
                 ClaudePresence::Indeterminate(why) => {
-                    Ok(CodexAddOutcome::ActionRequired(detail(&format!(
+                    Report(CodexAddOutcome::ActionRequired(detail(&format!(
                         "could not determine whether Claude is installed ({why}), so nothing was installed. Re-run once `claude --version` answers."
                     ))))
                 }
-                ClaudePresence::Absent => Err(CodexAddPlan::InstallNatively),
+                ClaudePresence::Absent => InstallNatively,
             }
         }
     }
 }
 
-/// The one branch of [`plan_codex_add`] that has to touch the machine.
+/// Either report the current state or install through the tool CLI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CodexAddPlan {
+    Report(CodexAddOutcome),
     InstallNatively,
 }
 
@@ -1631,8 +1634,8 @@ pub(crate) fn add_codex_plugin() -> Result<CodexAddOutcome, String> {
         crate::hooks::plugin::verify_claude_plugin_installed(),
     );
     match plan {
-        Ok(outcome) => Ok(outcome),
-        Err(CodexAddPlan::InstallNatively) => {
+        CodexAddPlan::Report(outcome) => Ok(outcome),
+        CodexAddPlan::InstallNatively => {
             crate::hooks::plugin::install_codex_plugin()?;
             // Install success is not activation: ask Codex again.
             match codex_plugin_status(&cwd).state {
@@ -3966,6 +3969,7 @@ mod tests {
     #[test]
     fn add_routes_every_state_without_installing_on_its_own() {
         use ClaudePresence::*;
+        use CodexAddPlan::{InstallNatively, Report};
 
         let present = Present;
         let absent = Absent;
@@ -3974,7 +3978,7 @@ mod tests {
         // Nothing but a complete, trusted, enabled set counts as done.
         assert_eq!(
             plan_codex_add(&status_of(CodexPluginState::Active), &absent, false),
-            Ok(CodexAddOutcome::AlreadyActive)
+            Report(CodexAddOutcome::AlreadyActive)
         );
 
         // Every state that needs the user says so, and installs nothing.
@@ -3988,14 +3992,14 @@ mod tests {
         ] {
             let outcome = plan_codex_add(&status_of(state), &absent, false);
             assert!(
-                matches!(outcome, Ok(CodexAddOutcome::ActionRequired(_))),
+                matches!(outcome, Report(CodexAddOutcome::ActionRequired(_))),
                 "{state:?} did not stop for the user: {outcome:?}"
             );
         }
 
         // Duplicate must point at the legacy-only removal, never a plain
         // remove (which would take the plugin down too).
-        let Ok(CodexAddOutcome::ActionRequired(text)) =
+        let Report(CodexAddOutcome::ActionRequired(text)) =
             plan_codex_add(&status_of(CodexPluginState::Duplicate), &absent, false)
         else {
             panic!("duplicate must be action-required");
@@ -4007,7 +4011,7 @@ mod tests {
             assert!(
                 matches!(
                     plan_codex_add(&status_of(CodexPluginState::Unverified), claude, false),
-                    Ok(CodexAddOutcome::ActionRequired(_))
+                    Report(CodexAddOutcome::ActionRequired(_))
                 ),
                 "unverified installed anyway with claude {claude:?}"
             );
@@ -4015,14 +4019,14 @@ mod tests {
 
         // Claude present: import guidance, and the prerequisite only when
         // Claude's own plugin is not installed yet.
-        let Ok(CodexAddOutcome::ActionRequired(text)) =
+        let Report(CodexAddOutcome::ActionRequired(text)) =
             plan_codex_add(&status_of(CodexPluginState::Missing), &present, false)
         else {
             panic!("claude present must be action-required");
         };
         assert!(text.contains("/import"), "{text}");
         assert!(text.contains("hcom hooks add claude"), "{text}");
-        let Ok(CodexAddOutcome::ActionRequired(text)) =
+        let Report(CodexAddOutcome::ActionRequired(text)) =
             plan_codex_add(&status_of(CodexPluginState::Missing), &present, true)
         else {
             panic!("claude present must be action-required");
@@ -4032,7 +4036,7 @@ mod tests {
         // Indeterminate never writes.
         assert!(matches!(
             plan_codex_add(&status_of(CodexPluginState::Missing), &unknown, false),
-            Ok(CodexAddOutcome::ActionRequired(_))
+            Report(CodexAddOutcome::ActionRequired(_))
         ));
 
         // Only a confirmed absence reaches the installer.
@@ -4043,7 +4047,7 @@ mod tests {
         ] {
             assert_eq!(
                 plan_codex_add(&status_of(state), &absent, false),
-                Err(CodexAddPlan::InstallNatively),
+                InstallNatively,
                 "{state:?}"
             );
         }
