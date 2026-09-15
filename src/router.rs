@@ -738,9 +738,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let process_id = std::env::var("HCOM_PROCESS_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let codex_thread_id = std::env::var("CODEX_THREAD_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let codex_thread_id = crate::shared::context::HcomContext::from_os().codex_thread_id;
     let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
@@ -862,9 +860,27 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
+        "reset" => match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
+            Ok(args) => {
+                if let Some(exit_code) =
+                    crate::commands::reset::try_cmd_reset_preserving_db(&db, &args, Some(&ctx))
+                {
+                    exit_code
+                } else {
+                    return crate::commands::reset::cmd_reset(db, &args, Some(&ctx));
+                }
+            }
+            Err(e) => {
+                e.print().ok();
+                let code = if e.use_stderr() { 1 } else { 0 };
+                if let Some(output) =
+                    crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
+                {
+                    print!("{output}");
+                }
+                return code;
+            }
+        },
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),

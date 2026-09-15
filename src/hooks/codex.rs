@@ -19,7 +19,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, value};
 
 use crate::db::{HcomDb, InstanceRow};
-use crate::hooks::{HookPayload, HookResult, common, family};
+use crate::hooks::{HookPayload, HookResult, common};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
@@ -264,51 +264,13 @@ fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> O
     )
 }
 
-fn bind_vanilla_instance_codex(
-    db: &HcomDb,
-    session_id: &str,
-    transcript_path: Option<&str>,
-) -> Option<String> {
-    let pending = common::get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
-    }
-
-    let derived_path = if transcript_path.is_none() || transcript_path == Some("") {
-        derive_codex_transcript_path(session_id)
-    } else {
-        None
-    };
-    let effective_path = transcript_path
-        .filter(|s| !s.is_empty())
-        .or(derived_path.as_deref())?;
-    let effective_path = normalize_codex_transcript_path(effective_path);
-
-    let instance_name = common::find_last_bind_marker(&effective_path)?;
-
-    family::bind_vanilla_instance(
-        db,
-        &instance_name,
-        Some(session_id).filter(|s| !s.is_empty()),
-        Some(&effective_path),
-        "codex",
-        "codex-sessionstart",
-    )
-}
-
 fn resolve_codex_instance(
     db: &HcomDb,
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> Option<InstanceRow> {
     let session_id = payload.session_id.as_deref().unwrap_or("");
-    if let Some(instance) = resolve_instance_codex(db, ctx, session_id) {
-        return Some(instance);
-    }
-
-    let bound_name =
-        bind_vanilla_instance_codex(db, session_id, payload.transcript_path.as_deref())?;
-    db.get_instance_full(&bound_name).ok().flatten()
+    resolve_instance_codex(db, ctx, session_id)
 }
 
 fn update_codex_position(
@@ -523,7 +485,7 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
             }
             0
         }
-        HookResult::Block { reason } => {
+        HookResult::Block { reason, .. } => {
             // Codex hooks on exit 2 read the reason from stderr, not stdout.
             let _ = std::io::stderr().lock().write_all(reason.as_bytes());
             2
@@ -1689,7 +1651,11 @@ pub(crate) fn add_codex_plugin() -> Result<CodexAddOutcome, String> {
 /// `Unverified`, never "not installed": the discovery hints below it are not
 /// evidence of what is running.
 pub(crate) fn codex_plugin_status(cwd: &Path) -> CodexPluginStatus {
-    let codex_home = codex_config_dir();
+    codex_plugin_status_at(cwd, &codex_config_dir())
+}
+
+/// Inspect the same config home the child will use, including launch overrides.
+pub(crate) fn codex_plugin_status_at(cwd: &Path, codex_home: &Path) -> CodexPluginStatus {
     // No Codex on this machine is "not installed", not "unverified": the
     // unverified state means hcom could not read an inventory Codex would
     // otherwise have, and its remediation tells the user to run a binary that
@@ -1700,15 +1666,15 @@ pub(crate) fn codex_plugin_status(cwd: &Path) -> CodexPluginStatus {
             details: vec!["no codex executable on PATH".to_string()],
         };
     }
-    match fetch_codex_hook_list(cwd, &codex_home) {
+    match fetch_codex_hook_list(cwd, codex_home) {
         Ok(entries) => classify_codex_plugin_hooks(
             &entries,
-            &get_codex_hooks_path(),
-            &codex_plugin_roots(&codex_home),
+            &codex_hooks_path_at(codex_home),
+            &codex_plugin_roots(codex_home),
         ),
         Err(error) => {
             let mut details = vec![format!("codex hooks/list unavailable: {error}")];
-            let roots = codex_plugin_roots(&codex_home);
+            let roots = codex_plugin_roots(codex_home);
             for root in roots {
                 details.push(format!("plugin store populated: {}", root.display()));
             }
@@ -3447,6 +3413,35 @@ mod tests {
         assert!(child_home.join("hooks.json").exists());
         assert!(verify_codex_hooks_installed_at(false, &child_home));
         assert!(!ambient_config.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn plugin_status_uses_effective_child_home() {
+        use crate::instance_binding::EnvVarGuard;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, _, _, _guard) = isolated_test_env();
+        let fake = tmp.path().join("codex");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = EnvVarGuard::set("PATH", tmp.path().to_str().unwrap());
+        let _version = EnvVarGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.130.0");
+        let _inventory = EnvVarGuard::unset("HCOM_TEST_CODEX_HOOKS_LIST_JSON");
+        let parent = tmp.path().join("parent-codex");
+        let _parent = EnvVarGuard::set("CODEX_HOME", parent.to_str().unwrap());
+        let child = tmp.path().join("child-codex");
+        try_setup_codex_hooks_at(false, &child).unwrap();
+
+        assert_eq!(
+            codex_plugin_status_at(tmp.path(), &child).state,
+            CodexPluginState::LegacyOnly
+        );
+        assert!(
+            !parent.exists(),
+            "inspection must not write the parent's home"
+        );
     }
 
     #[test]

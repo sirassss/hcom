@@ -213,10 +213,10 @@ pub mod test_helpers {
 
 // Re-export key types.
 pub use common::{
-    deliver_pending_messages, finalize_session, find_last_bind_marker, get_pending_instances,
-    init_hook_context, inject_bootstrap_once, poll_messages, stop_instance,
+    deliver_pending_messages, finalize_session, init_hook_context, inject_bootstrap_once,
+    poll_messages, stop_instance,
 };
-pub use family::{bind_vanilla_instance, extract_tool_detail};
+pub use family::extract_tool_detail;
 pub use utils::{HOOK_REGISTRY, HookCategory, HookInfo};
 
 /// Delivery cursor/status update to apply after hook output is written.
@@ -544,6 +544,8 @@ pub enum HookResult {
     Block {
         /// Reason text (formatted messages for delivery).
         reason: String,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Update the tool input before execution (exit 0, updatedInput field).
@@ -780,11 +782,16 @@ mod tests {
     fn test_hook_result_block() {
         let result = HookResult::Block {
             reason: "<hcom>message here</hcom>".into(),
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 2);
         match &result {
-            HookResult::Block { reason } => {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
                 assert_eq!(reason, "<hcom>message here</hcom>");
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Block"),
         }
