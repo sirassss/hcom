@@ -235,10 +235,8 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
 
     let hcom_cmd = crate::runtime_env::build_hcom_command();
 
-    // Build each event's array from AGY_HOOK_CONFIGS, preserving both the
-    // table's row order (within an event) and its first-seen event order —
-    // matches the inline json! literal this replaced byte-for-byte.
-    let mut lifecycle_events: Vec<(&str, Vec<Value>)> = Vec::new();
+    // Preserve table row order within each event's array.
+    let mut lifecycle_map = serde_json::Map::new();
     for &(event, name, subcmd, matcher, fallback, description) in AGY_HOOK_CONFIGS {
         let hook = json!({
             "name": name,
@@ -252,14 +250,12 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
         } else {
             json!({ "matcher": matcher, "hooks": [hook] })
         };
-        match lifecycle_events.iter_mut().find(|(e, _)| *e == event) {
-            Some((_, entries)) => entries.push(entry),
-            None => lifecycle_events.push((event, vec![entry])),
-        }
-    }
-    let mut lifecycle_map = serde_json::Map::new();
-    for (event, entries) in lifecycle_events {
-        lifecycle_map.insert(event.to_string(), Value::Array(entries));
+        lifecycle_map
+            .entry(event.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("lifecycle entries are arrays")
+            .push(entry);
     }
     let hcom_lifecycle = Value::Object(lifecycle_map);
 
