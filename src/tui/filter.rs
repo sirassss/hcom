@@ -3,9 +3,7 @@
 //! Pure logic: no ratatui, no SQLite. This replaces four divergent predicates
 //! (`eject::message_matches_filter` / `eject::event_matches_filter` /
 //! `messages::msg_matches` / `messages::event_matches`) with one gate that the
-//! inline and vertical render paths both call. Task 3 migrates those callers;
-//! until then everything here is an unused building block.
-#![allow(dead_code)] // consumers land in task 3
+//! inline and vertical render paths both call.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -84,15 +82,6 @@ impl MsgTier {
             MsgTier::Compact => "compact",
             MsgTier::Normal => "normal",
             MsgTier::Verbose => "verbose",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "compact" => Some(MsgTier::Compact),
-            "normal" => Some(MsgTier::Normal),
-            "verbose" => Some(MsgTier::Verbose),
-            _ => None,
         }
     }
 }
@@ -219,11 +208,6 @@ impl MsgFilter {
             parts.push(format!("\"{}\"", self.text));
         }
         parts.join(" \u{00b7} ")
-    }
-
-    /// [`describe_with`] with no identity resolution (raw roster names).
-    pub fn describe(&self) -> String {
-        self.describe_with(&|s| s.to_string())
     }
 
     /// All present conditions AND together (spec §3). Selected agents OR
@@ -536,17 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn tier_cycle_and_string_round_trip() {
+    fn tier_cycle_and_labels() {
         assert_eq!(MsgTier::default(), MsgTier::Compact);
         assert_eq!(MsgTier::Compact.next(), MsgTier::Normal);
         assert_eq!(MsgTier::Normal.next(), MsgTier::Verbose);
         assert_eq!(MsgTier::Verbose.next(), MsgTier::Compact);
-        for t in [MsgTier::Compact, MsgTier::Normal, MsgTier::Verbose] {
-            assert_eq!(MsgTier::from_str(t.as_str()), Some(t));
-        }
-        assert_eq!(MsgTier::from_str("COMPACT"), None);
-        assert_eq!(MsgTier::from_str(""), None);
-        assert_eq!(MsgTier::from_str("loud"), None);
+        assert_eq!(MsgTier::Compact.as_str(), "compact");
+        assert_eq!(MsgTier::Normal.as_str(), "normal");
+        assert_eq!(MsgTier::Verbose.as_str(), "verbose");
     }
 
     // ── parser ──────────────────────────────────────────────────────
@@ -963,7 +944,7 @@ mod tests {
         // free text quoted
         assert!(d.contains("\"free text\""));
         // empty filter → empty describe
-        assert_eq!(MsgFilter::default().describe(), "");
+        assert_eq!(MsgFilter::default().describe_with(&str::to_string), "");
     }
 
     #[test]

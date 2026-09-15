@@ -78,7 +78,6 @@ impl DataState {
     /// Tag of the roster agent matching `name`, or `None` for an unknown name
     /// or an untagged agent. Reflects the currently loaded roster only — an old
     /// agent absent from every roster has no tag.
-    #[allow(dead_code)] // consumed by MsgFilter in task 2
     pub fn tag_of(&self, name: &str) -> Option<String> {
         self.resolve_agent(name)
             .map(|a| a.tag.clone())

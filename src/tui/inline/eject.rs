@@ -9,7 +9,7 @@ use crate::tui::app::DataState;
 use crate::tui::filter::{self, FeedItem, MsgFilter, MsgTier};
 use crate::tui::model::*;
 use crate::tui::render::messages::{
-    build_waterlines, event_line, format_message, lifecycle_run_line,
+    Row, build_waterlines, event_line, format_message, group_lifecycle, lifecycle_run_line,
 };
 use crate::tui::render::text::highlight_spans;
 use crate::tui::theme::{Theme, palette};
@@ -124,17 +124,9 @@ impl Ejector {
         };
         self.refresh_waterlines(data);
 
-        // Share ordering and admission with the vertical viewport. Clone the
-        // matched items into the owned queue so it never borrows DataState
-        // across a reload, then collapse lifecycle runs before line-budget
-        // chunking (same rule as the vertical pane).
-        let items: Vec<EjectItem> = filter::collect_items(data, tier, f)
-            .into_iter()
-            .map(|it| match it {
-                FeedItem::Ev(e) => EjectItem::Ev(e.clone()),
-                FeedItem::Msg(m) => EjectItem::Msg(m.clone()),
-            })
-            .collect();
+        // Group borrowed items before snapshotting the surviving rows. The queue
+        // owns its data across reloads and uses the vertical pane's grouping rule.
+        let items = filter::collect_items(data, tier, f);
         let had_items = !items.is_empty();
         self.replay_items = group_eject_rows(items);
         // A filter/tier change keeps a pending replay even with zero items so
@@ -187,27 +179,27 @@ impl Ejector {
     /// then advances each watermark to the max id seen — filtered-out rows
     /// included — so a non-monotonic time-sorted vector never skips a new row
     /// and an empty batch never lowers the watermark.
-    fn collect_new_items(
+    fn collect_new_items<'a>(
         &mut self,
-        data: &DataState,
+        data: &'a DataState,
         tier: MsgTier,
         f: &MsgFilter,
-    ) -> Vec<EjectItem> {
+    ) -> Vec<FeedItem<'a>> {
         let old_ev_wm = self.last_event_row_id;
         let old_msg_wm = self.last_msg_id;
         let mut max_ev = old_ev_wm;
         let mut max_msg = old_msg_wm;
-        let mut items: Vec<EjectItem> = Vec::new();
+        let mut items = Vec::new();
         for ev in data.events.iter() {
             max_ev = max_ev.max(ev.row_id);
             if ev.row_id > old_ev_wm && filter::passes(&FeedItem::Ev(ev), tier, f, data) {
-                items.push(EjectItem::Ev(ev.clone()));
+                items.push(FeedItem::Ev(ev));
             }
         }
         for msg in data.messages.iter() {
             max_msg = max_msg.max(msg.event_id);
             if msg.event_id > old_msg_wm && filter::passes(&FeedItem::Msg(msg), tier, f, data) {
-                items.push(EjectItem::Msg(msg.clone()));
+                items.push(FeedItem::Msg(msg));
             }
         }
         self.last_event_row_id = max_ev;
@@ -215,7 +207,7 @@ impl Ejector {
         // Same total order as replay and the vertical pane — events are
         // collected first, so a plain time sort would put an event ahead of an
         // older message sharing its timestamp.
-        items.sort_by(|a, b| a.as_feed().order_cmp(&b.as_feed()));
+        items.sort_by(FeedItem::order_cmp);
         items
     }
 
@@ -455,40 +447,17 @@ fn live_marker_lines(width: u16) -> Vec<Line<'static>> {
 /// Collapse lifecycle runs in an already-sorted item vector (spec §7). Live
 /// grouping is batch-local — this is only ever handed one emission batch or one
 /// full replay snapshot.
-fn group_eject_rows(items: Vec<EjectItem>) -> VecDeque<ReplayRow> {
-    let mut rows = VecDeque::new();
-    let mut it = items.into_iter().peekable();
-    while let Some(cur) = it.next() {
-        match &cur {
-            EjectItem::Ev(e) if matches!(e.kind, EventKind::Activity(_)) => {
-                let agent = e.agent.clone();
-                let minute = (e.time / 60.0).floor() as i64;
-                let first_time = e.time;
-                let mut buf = vec![cur];
-                while let Some(EjectItem::Ev(n)) = it.peek() {
-                    if matches!(n.kind, EventKind::Activity(_))
-                        && n.agent == agent
-                        && (n.time / 60.0).floor() as i64 == minute
-                    {
-                        buf.push(it.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
-                if buf.len() >= 3 {
-                    rows.push_back(ReplayRow::LifecycleRun {
-                        agent,
-                        time: first_time,
-                        count: buf.len(),
-                    });
-                } else {
-                    rows.extend(buf.into_iter().map(ReplayRow::Item));
-                }
+fn group_eject_rows(items: Vec<FeedItem<'_>>) -> VecDeque<ReplayRow> {
+    group_lifecycle(&items)
+        .into_iter()
+        .map(|row| match row {
+            Row::Item(FeedItem::Msg(m)) => ReplayRow::Item(EjectItem::Msg((*m).clone())),
+            Row::Item(FeedItem::Ev(e)) => ReplayRow::Item(EjectItem::Ev((*e).clone())),
+            Row::LifecycleRun { agent, time, count } => {
+                ReplayRow::LifecycleRun { agent, time, count }
             }
-            _ => rows.push_back(ReplayRow::Item(cur)),
-        }
-    }
-    rows
+        })
+        .collect()
 }
 
 fn format_row_lines(
@@ -572,14 +541,6 @@ enum EjectItem {
 }
 
 impl EjectItem {
-    /// Borrow as the shared feed item, so ordering has exactly one definition.
-    fn as_feed(&self) -> FeedItem<'_> {
-        match self {
-            EjectItem::Ev(e) => FeedItem::Ev(e),
-            EjectItem::Msg(m) => FeedItem::Msg(m),
-        }
-    }
-
     #[cfg(test)]
     fn row_id(&self) -> u64 {
         match self {
@@ -759,19 +720,21 @@ mod tests {
         let life = |id: u64, t: f64, agent: &str| {
             ev_at(id, t, agent, EventKind::Activity(ActivityKind::StateChange))
         };
-        // agent a: 4 lifecycle events inside minute 0 → collapses to one run.
-        // agent b: 1 lifecycle event → stays plain.
-        // agent a: 2 more lifecycle events in minute 1 → stay plain (run < 3).
+        // Three events collapse; owner, tool and absolute-minute boundaries
+        // keep the remaining runs shorter than three.
         let d = data_with(
             vec![],
             vec![
                 life(1, 0.0, "a"),
                 life(2, 10.0, "a"),
                 life(3, 20.0, "a"),
-                life(4, 30.0, "a"),
-                life(5, 40.0, "b"),
-                life(6, 61.0, "a"),
-                life(7, 62.0, "a"),
+                life(4, 30.0, "b"),
+                life(5, 61.0, "a"),
+                life(6, 62.0, "a"),
+                ev_at(7, 63.0, "a", EventKind::Tool),
+                life(8, 64.0, "a"),
+                life(9, 65.0, "a"),
+                life(10, 86461.0, "a"),
             ],
         );
         let mut ej = Ejector::new();
@@ -782,13 +745,9 @@ mod tests {
             ReplayReason::FilterChange,
         );
 
-        assert_eq!(
-            run_counts(&ej),
-            vec![4],
-            "the 4-event same-minute run collapses"
-        );
-        // ids 5 (agent b) and 6,7 (agent a, next minute, run of 2) stay plain.
-        assert_eq!(replay_ids(&ej), vec![5, 6, 7]);
+        drop(d); // The replay owns its rows after the loaded window is replaced.
+        assert_eq!(run_counts(&ej), vec![3]);
+        assert_eq!(replay_ids(&ej), vec![4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
