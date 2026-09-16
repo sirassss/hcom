@@ -289,6 +289,18 @@ impl ToolCase for ClaudeCase {
             ("ENABLE_TOOL_SEARCH", "false"),
             ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1"),
         ]);
+
+        // Claude's hooks now ship through the plugin marketplace, not an
+        // auto-installed settings.json entry (`ensure_hooks_installed` only
+        // warns if the plugin is missing — see src/launcher.rs). A fresh
+        // isolated CLAUDE_CONFIG_DIR has no marketplace checkout, so without
+        // this the PermissionRequest hook (and every other hcom hook) never
+        // fires and the real-tool tests hang waiting on it.
+        let (code, stdout, stderr) = h.run(["hooks", "add", "claude"]);
+        assert!(
+            code == 0,
+            "hcom hooks add claude failed: code={code} stdout={stdout} stderr={stderr}"
+        );
     }
 
     fn launch_args(&self, _h: &Hcom) -> Vec<String> {
