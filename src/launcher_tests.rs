@@ -971,6 +971,37 @@ fn test_runner_script_strips_instance_state_vars() {
     std::fs::remove_file(env_file).ok();
 }
 
+/// herdr classifies an agent pane from its foreground process, which under PTY
+/// mode is `hcom pty`. The `HERDR_AGENT` hint names the tool for it, so it has
+/// to name the tool being launched (not the one that inherited the parent
+/// pane's value) and has to survive the sidecar's strip list.
+#[cfg(unix)]
+#[test]
+fn test_runner_forwards_herdr_agent_hint() {
+    let _env = hooks_missing_test_env();
+
+    // Overwrites an inherited value: a claude pane spawning codex names codex.
+    let mut env = HashMap::from([("HERDR_AGENT".to_string(), "claude".to_string())]);
+    env.extend(tool_extra_env("codex"));
+    assert_eq!(env.get("HERDR_AGENT").map(String::as_str), Some("codex"));
+
+    let script = create_runner_script("codex", "/tmp", "test", &env, &[], false).unwrap();
+    let content = std::fs::read_to_string(&script).unwrap();
+    let env_file = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(". "))
+        .map(|path| path.trim_matches('\'').to_string())
+        .expect("runner script should source a sidecar env file");
+    let sidecar = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        sidecar.contains("HERDR_AGENT=codex"),
+        "sidecar should carry the herdr agent hint, got: {sidecar}"
+    );
+
+    std::fs::remove_file(&script).ok();
+    std::fs::remove_file(env_file).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn test_run_here_runner_preserves_current_pane_identity() {

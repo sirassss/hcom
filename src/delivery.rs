@@ -283,10 +283,11 @@ mod host_label {
                 self.last_pushed = Some(label);
             }
 
-            // 2. Agent state via `pane.report_agent` so herdr classifies the
-            //    pane as an agent (its foreground process is `hcom pty`, not the
-            //    tool). Best-effort and deduped on the mapped state. Skipped
-            //    when the tool name is unknown — herdr needs a real agent label.
+            // 2. Agent state via `pane.report_agent`, for a pane already
+            //    classified as an agent (see `HERDR_AGENT` in `tool_extra_env`;
+            //    this call does not classify one). Best-effort and deduped on
+            //    the mapped state. Skipped when the tool name is unknown —
+            //    herdr needs a real agent label.
             if !tool.is_empty() {
                 let state = map_report_state(status);
                 if self.last_reported_state != Some(state) {
@@ -300,13 +301,11 @@ mod host_label {
             // 3. Set herdr's canonical agent `name` once so `herdr agent
             //    send/prompt/focus <name>` resolves — parity with the retired
             //    `agent start {name}` flow. herdr's `agent.rename` requires the
-            //    pane to already be a classified agent terminal; that classifier
-            //    is EITHER our `report_agent` above OR herdr's own installed
-            //    integration for the tool (which shadows ours — issue #102, F2).
-            //    We can't tell which from hcom's side, and an ignored
-            //    `report_agent` still returns a success envelope, so we don't
-            //    try to. Instead we attempt the rename each tick once we've
-            //    entered the agent regime and let it self-heal: `name_set` flips
+            //    pane to already be a classified agent terminal, and that comes
+            //    from the `HERDR_AGENT` hint on the `hcom pty` wrapper, not from
+            //    `report_agent` above. Panes launched before that hint existed
+            //    never classify, so we attempt the rename each tick and let it
+            //    self-heal: `name_set` flips
             //    only when `agent.rename` returns a real success — before
             //    classification it returns an `error` envelope (Rejected), which
             //    leaves `name_set` false so the next tick retries. The styled
@@ -458,21 +457,32 @@ mod host_label {
             }
         }
 
-        /// Report the agent and its state via `pane.report_agent`. When no other
-        /// source owns the pane, this establishes hcom as the `hook_authority`,
-        /// making `is_agent_terminal()` true independent of the foreground
-        /// process — so herdr tracks the pane as an agent even though `hcom pty`
-        /// is what's actually running.
+        /// Report the agent and its state via `pane.report_agent`. This reports
+        /// state for an *already classified* agent pane; it does not classify
+        /// one. On an unclassified pane herdr answers `{"type":"ok"}` and drops
+        /// the report — verified against herdr 0.9 with `source: "hcom"`, with
+        /// `source: "herdr:claude"`, and after `pane.clear_agent_authority`, so
+        /// the old "establishes hcom as hook_authority" claim (and the issue
+        /// #102 F2 source-shadowing theory) was wrong: the `source` field never
+        /// controlled it.
         ///
-        /// Caveat (issue #102, F2): if herdr has its *own* integration installed
-        /// for this tool (pi, omp, claude, codex, opencode, …), that
-        /// `herdr:<tool>` source owns lifecycle authority and our `source:
-        /// "hcom"` report is accepted-and-ignored — herdr still returns a
-        /// success envelope, so we can't detect the shadowing from here. That's
-        /// fine: herdr's own integration is then tracking state, and the report
-        /// still pays off for tools herdr doesn't integrate. herdr accepts any
-        /// `agent` string (nothing is rejected on that field), so this is purely
-        /// best-effort. `state` is a herdr snake_case `pane_agent_state`.
+        /// Classification comes from the pane's foreground process, which under
+        /// PTY mode is `hcom pty`. `HERDR_AGENT` (set in [`tool_extra_env`])
+        /// supplies herdr's documented wrapper hint so the pane classifies at
+        /// all; only then can this report land.
+        ///
+        /// Even then it only lands when herdr's screen manifest for that agent
+        /// matches *nothing* (`agent explain` → `rule: none`): a matching rule
+        /// wins and the report is discarded, again regardless of `source`. So on
+        /// a claude/codex pane, whose manifest reads the tool's own TUI, this is
+        /// inert by design — herdr deliberately keeps one status authority per
+        /// pane, and only its own lifecycle-complete integrations (e.g.
+        /// `herdr:omp`) displace the manifest. The call still pays off for tools
+        /// herdr ships no manifest for, where it is the only state source.
+        ///
+        /// herdr accepts any `agent` string (nothing is rejected on that field),
+        /// so this stays purely best-effort. `state` is a herdr snake_case
+        /// `pane_agent_state`.
         fn report_agent(&self, agent: &str, state: &str, seq: u64) -> Result<(), SocketError> {
             match self {
                 Backend::Herdr {

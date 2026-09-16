@@ -867,6 +867,17 @@ fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     if tool == "antigravity" {
         m.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
     }
+    // herdr classifies an agent pane from its *foreground* process, which under
+    // PTY mode is `hcom pty`, not the tool — so the pane never enters `herdr
+    // agent list` and `agent.rename` keeps failing with "agent target not
+    // found". HERDR_AGENT is herdr's documented hint for exactly this wrapper
+    // case ("set HERDR_AGENT=<agent> on the wrapper command"); it names the
+    // screen manifest to evaluate. Routed through the sidecar (non-HCOM_ key),
+    // so it reaches `hcom pty` and dies with it rather than leaking into the
+    // login shell the launch script drops to afterwards. Set unconditionally:
+    // outside herdr nothing reads it, and on a nested spawn it must *overwrite*
+    // the parent pane's inherited value so claude → codex names codex.
+    m.insert("HERDR_AGENT".to_string(), tool.to_string());
     m
 }
 
