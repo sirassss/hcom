@@ -327,11 +327,23 @@ fn migrate_placeholder_runtime_state(
     let Some(ph) = placeholder_data else {
         return;
     };
+    // The PTY wrapper observed this pid, not us: SessionStart can run in a
+    // different PID namespace than the process that spawned the tool. Carry the
+    // placeholder's recorded namespace across with the pid rather than stamping
+    // our own, or the canonical row would claim a pid we cannot actually see.
     if let Some(pid) = ph.pid
-        && let Ok(pid_u32) = u32::try_from(pid)
-        && let Err(e) = db.update_instance_pid(canonical_name, pid_u32)
+        && u32::try_from(pid).is_ok()
     {
-        crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+        let updates = serde_json::Map::from_iter([
+            ("pid".to_string(), serde_json::json!(pid)),
+            (
+                "pid_namespace".to_string(),
+                serde_json::json!(ph.pid_namespace.clone().unwrap_or_default()),
+            ),
+        ]);
+        if let Err(e) = db.update_instance_fields(canonical_name, &updates) {
+            crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+        }
     }
     if let Some(ref ctx) = ph.launch_context
         && let Err(e) = db.store_launch_context(canonical_name, ctx)
@@ -1875,6 +1887,66 @@ mod tests {
                 .contains("kitty-99"),
             "launch_context not migrated: {:?}",
             fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    /// The PTY wrapper that spawned the tool can live in a different PID
+    /// namespace than the hook doing this migration (a sandboxed hcom sharing
+    /// the host's DB). Stamping our own namespace here would claim we can see
+    /// a pid we cannot, and the next reconcile pass would reap a live agent.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn test_restore_stopped_carries_placeholder_namespace_not_the_hook_caller() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-oc-ns", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc-ns", "", "mozi").unwrap();
+        db.update_instance_pid("mozi", 4242).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET pid_namespace = 'pid:[foreign]' WHERE name = 'mozi'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            bind_session_to_process(&db, "ses-oc-ns", Some("pid-oc-ns")),
+            Some("fano".to_string())
+        );
+
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.pid, Some(4242));
+        assert_eq!(fano.pid_namespace.as_deref(), Some("pid:[foreign]"));
+        assert_ne!(
+            fano.pid_namespace.as_deref(),
+            crate::sys::process::current_pid_namespace(),
+            "the hook caller's namespace must not be stamped onto a copied pid"
         );
 
         cleanup(path);

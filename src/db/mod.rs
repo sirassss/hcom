@@ -37,7 +37,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -66,6 +66,14 @@ const MIGRATIONS: &[(i32, &str)] = &[
              ON claude_actor_capabilities(expires_at);
          CREATE INDEX IF NOT EXISTS idx_claude_actor_session
              ON claude_actor_capabilities(session_id);",
+    ),
+    (
+        19,
+        "ALTER TABLE instances ADD COLUMN pid_namespace TEXT DEFAULT '';
+         UPDATE instances
+         SET pid_namespace = json_extract(launch_context, '$.pid_namespace')
+         WHERE launch_context != '' AND json_valid(launch_context)
+           AND json_extract(launch_context, '$.pid_namespace') IS NOT NULL;",
     ),
 ];
 
@@ -337,6 +345,7 @@ impl HcomDb {
                 terminal_preset_effective TEXT DEFAULT '',
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
+                pid_namespace TEXT DEFAULT '',
                 launch_context TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
@@ -822,7 +831,7 @@ impl HcomDb {
     fn snapshot_running_to_pidtrack(&self) {
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT i.name, i.pid, i.tool, i.directory, i.session_id, p.process_id, \
-                    n_pty.port AS notify_port, n_inj.port AS inject_port \
+                    n_pty.port AS notify_port, n_inj.port AS inject_port, i.pid_namespace \
              FROM instances i \
              LEFT JOIN process_bindings p ON i.name = p.instance_name \
              LEFT JOIN notify_endpoints n_pty ON i.name = n_pty.instance AND n_pty.kind = 'pty' \
@@ -842,6 +851,7 @@ impl HcomDb {
                 row.get::<_, Option<String>>(5)?, // process_id
                 row.get::<_, Option<i64>>(6)?,    // notify_port
                 row.get::<_, Option<i64>>(7)?,    // inject_port
+                row.get::<_, Option<String>>(8)?, // pid_namespace
             ))
         }) else {
             return;
@@ -862,10 +872,24 @@ impl HcomDb {
                 .unwrap_or_default();
 
         for row in rows.flatten() {
-            let (name, pid, tool, directory, session_id, process_id, notify_port, inject_port) =
-                row;
-            let alive = crate::pidtrack::is_alive(pid as u32);
-            if !alive {
+            let (
+                name,
+                pid,
+                tool,
+                directory,
+                session_id,
+                process_id,
+                notify_port,
+                inject_port,
+                pid_namespace,
+            ) = row;
+            let pid_namespace = pid_namespace.unwrap_or_default();
+            // Snapshot anything we did not watch die: a PID from a namespace we
+            // cannot inspect is unknown, and dropping it here would lose the
+            // recovery metadata for a live agent across the archive.
+            if crate::sys::process::is_alive_in(pid as u32, Some(pid_namespace.as_str()))
+                == Some(false)
+            {
                 continue;
             }
 
@@ -879,6 +903,7 @@ impl HcomDb {
                     "session_id": session_id.unwrap_or_default(),
                     "notify_port": notify_port.unwrap_or(0),
                     "inject_port": inject_port.unwrap_or(0),
+                    "pid_namespace": pid_namespace,
                     "launched_at": now_epoch_f64(),
                 }),
             );
@@ -1109,9 +1134,15 @@ pub(super) mod tests {
     #[test]
     #[should_panic(expected = "not a registered or temp-tree path")]
     fn test_open_raw_rejects_non_temp_path() {
-        let db_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(".hcom-unsafe-test")
-            .join("hcom.db");
+        // Not CARGO_MANIFEST_DIR: a worktree checked out under /tmp (a normal
+        // thing for an agent to do) makes the repo path itself a temp path,
+        // producing a false failure unrelated to any real regression. Derive
+        // a guaranteed-non-temp fixture from temp_dir()'s own parent instead.
+        let temp = std::env::temp_dir();
+        let parent = temp
+            .parent()
+            .expect("the OS temp dir has a parent directory");
+        let db_path = parent.join(".hcom-unsafe-test").join("hcom.db");
         let _ = HcomDb::open_raw(&db_path);
     }
 
@@ -1131,9 +1162,13 @@ pub(super) mod tests {
     fn test_open_raw_rejects_temp_symlink_to_non_temp_path() {
         use std::os::unix::fs::symlink;
 
+        // Not CARGO_MANIFEST_DIR as the symlink target: a worktree checked
+        // out under /tmp makes the repo itself a temp path, which would make
+        // this "escape to non-temp" fixture point right back into /tmp.
+        // "/" always exists and is never under the OS temp dir.
         let temp = tempfile::tempdir().unwrap();
         let link = temp.path().join("outside");
-        symlink(env!("CARGO_MANIFEST_DIR"), &link).unwrap();
+        symlink("/", &link).unwrap();
         let db_path = link.join(".hcom").join("hcom.db");
 
         let _ = HcomDb::open_raw(&db_path);
@@ -1507,6 +1542,125 @@ pub(super) mod tests {
         assert_eq!(last_seen, 123);
 
         cleanup_test_db(db_path);
+    }
+
+    /// v19 moves the PID namespace marker out of the `launch_context` blob and
+    /// into its own column. Rows whose blob still holds a usable marker carry
+    /// it across; malformed or markerless blobs stay empty and read as
+    /// "namespace unknown", which keeps them out of the reaper's reach.
+    #[test]
+    fn test_ensure_schema_migrates_v18_to_v19_backfilling_pid_namespace() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2800);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_migrate_pid_ns_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     status_time INTEGER DEFAULT 0,
+                     last_seen INTEGER DEFAULT 0,
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+            for (name, ctx) in [
+                (
+                    "marked",
+                    r#"{"pane_id":"p1","pid_namespace":"pid:[4026531836]"}"#,
+                ),
+                ("unmarked", r#"{"pane_id":"p2"}"#),
+                ("garbage", "not json at all"),
+                ("empty", ""),
+            ] {
+                conn.execute(
+                    "INSERT INTO instances (name, created_at, launch_context) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![name, 1.0f64, ctx],
+                )
+                .unwrap();
+            }
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let namespace = |name: &str| -> String {
+            db.conn
+                .query_row(
+                    "SELECT pid_namespace FROM instances WHERE name = ?",
+                    params![name],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .unwrap_or_default()
+        };
+        assert_eq!(namespace("marked"), "pid:[4026531836]");
+        assert_eq!(namespace("unmarked"), "");
+        assert_eq!(namespace("garbage"), "");
+        assert_eq!(namespace("empty"), "");
+
+        cleanup_test_db(db_path);
+    }
+
+    /// The pre-archive snapshot is what lets a running agent be recovered into
+    /// the fresh DB. A PID from a namespace this process cannot inspect is not
+    /// evidence the agent exited, so dropping it here would strand it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_snapshot_keeps_rows_whose_namespace_we_cannot_inspect() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2900);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_hcom_snapshot_ns_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(temp_dir.join(".tmp")).unwrap();
+        let db_path = temp_dir.join("hcom.db");
+
+        let db = HcomDb::open_at(&db_path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, pid, pid_namespace)
+                 VALUES ('host', 'claude', 1.0, 4194305, 'pid:[foreign]'),
+                        ('ours', 'claude', 1.0, 4194306, ?)",
+                params![crate::sys::process::current_pid_namespace().unwrap_or_default()],
+            )
+            .unwrap();
+
+        db.snapshot_running_to_pidtrack();
+
+        let pidfile =
+            std::fs::read_to_string(temp_dir.join(".tmp").join("launched_pids.json")).unwrap();
+        let entries: serde_json::Value = serde_json::from_str(&pidfile).unwrap();
+        assert_eq!(
+            entries["4194305"]["pid_namespace"], "pid:[foreign]",
+            "foreign row kept, marker carried across: {pidfile}"
+        );
+        assert!(
+            entries.get("4194306").is_none(),
+            "our own dead pid is not snapshotted: {pidfile}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

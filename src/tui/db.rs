@@ -31,6 +31,12 @@ fn read_device_uuid(conn: &Connection) -> String {
 pub struct DbDataSource {
     db_path: PathBuf,
     conn: Option<Connection>,
+    // Separate, writable, lazily-opened handle used solely by
+    // `reconcile_dead_instances`. `conn` above is opened with
+    // `PRAGMA query_only=ON` (the TUI's normal read path must never
+    // accidentally mutate live agent state), so maintenance needs its own
+    // connection rather than reusing that one.
+    write_db: Option<crate::db::HcomDb>,
     last_data_version: u64,
     cached: Option<DataState>,
     last_error: Option<String>,
@@ -49,12 +55,37 @@ impl DbDataSource {
         Self {
             db_path: paths::db_path(),
             conn: None,
+            write_db: None,
             last_data_version: 0,
             cached: None,
             last_error: None,
             config_mtime: None,
             timeline_limit: 200,
         }
+    }
+
+    /// Lazy-open the writable handle used for maintenance; reconnects on
+    /// failure the same way `ensure_conn` does for the read connection — no
+    /// panic, no poisoning future calls, just retry next time this is called.
+    fn ensure_write_db(&mut self) -> bool {
+        if self.write_db.is_none() {
+            match crate::db::HcomDb::open_at(&self.db_path) {
+                Ok(db) => {
+                    self.write_db = Some(db);
+                    // Mirror ensure_conn's success-clears-last_error branch: a
+                    // transient open failure (e.g. brief lock contention) must
+                    // not leave a stale error in the TUI status bar once a
+                    // later maintenance tick recovers.
+                    self.last_error = None;
+                }
+                Err(e) => {
+                    self.last_error =
+                        Some(format!("open write db {}: {}", self.db_path.display(), e));
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Lazy-open persistent connection; reconnects on failure.
@@ -185,6 +216,29 @@ impl DataSource for DbDataSource {
             return data;
         }
         self.cached.clone().unwrap_or_else(DataState::empty)
+    }
+
+    fn reconcile_dead_instances(&mut self) -> anyhow::Result<usize> {
+        if !self.ensure_write_db() {
+            return Err(anyhow::anyhow!(
+                self.last_error
+                    .clone()
+                    .unwrap_or_else(|| "write db unavailable".to_string())
+            ));
+        }
+        let db = self.write_db.as_ref().expect("just ensured");
+        let n = crate::instance_lifecycle::reconcile_dead_instances(
+            db,
+            crate::instance_lifecycle::DeadProcessDetector::Tui,
+        )?;
+        if n > 0 {
+            // Reconciliation wrote through `write_db`, a different connection
+            // than the one `data_version` is read from in `conn`. Don't trust
+            // that connection-scoped counter to have observed the write —
+            // force the next load to re-query instead.
+            self.cached = None;
+        }
+        Ok(n)
     }
 }
 
@@ -724,8 +778,11 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
             Err(_) => continue,
         };
 
-        // Check if PID is still alive
-        if !crate::pidtrack::is_alive(pid) {
+        // Hide only PIDs we watched die. One recorded in a namespace this
+        // process cannot inspect is unknown, and a live host agent must not
+        // vanish from the orphan list just because a sandbox cannot see it.
+        let pid_namespace = json_str(info, "pid_namespace", "");
+        if crate::sys::process::is_alive_in(pid, Some(pid_namespace)) == Some(false) {
             continue;
         }
 
@@ -1858,5 +1915,391 @@ mod tests {
         assert_eq!(count_gt(&ids, 0), 4);
         assert_eq!(count_gt(&ids, 4), 2);
         assert_eq!(count_gt(&ids, 12), 0);
+    }
+
+    // ── reconcile_dead_instances ────────────────────────────────
+
+    // A PID above every platform's pid_max, so it names no live process
+    // (matches instance_lifecycle::tests::DEAD_PID).
+    const DEAD_PID: i64 = 4_194_305;
+
+    /// A local instance parked `active` with a PID that cannot be alive —
+    /// the shape `reconcile_dead_instances` is supposed to reap.
+    fn insert_dead_local_instance(db: &crate::db::HcomDb, name: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, created_at, pid, tcp_mode, pid_namespace)
+                 VALUES (?, 'claude', 'active', 'tool:Bash', ?, ?, 1, ?)",
+                rusqlite::params![
+                    name,
+                    crate::shared::time::now_epoch_f64(),
+                    DEAD_PID,
+                    crate::sys::process::current_pid_namespace().unwrap_or_default()
+                ],
+            )
+            .unwrap();
+    }
+
+    /// The TUI's orphan pane is where a sandboxed hcom would silently drop a
+    /// live host agent: bare `is_alive` on a foreign PID reads as dead.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn load_orphans_lists_processes_from_a_foreign_namespace() {
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        std::fs::create_dir_all(hcom_dir.join(".tmp")).unwrap();
+        std::fs::write(
+            hcom_dir.join(".tmp").join("launched_pids.json"),
+            serde_json::json!({
+                "4194305": {
+                    "tool": "claude",
+                    "names": ["host_agent"],
+                    "launched_at": 1.0,
+                    "pid_namespace": "pid:[foreign]",
+                },
+                "4194306": {
+                    "tool": "claude",
+                    "names": ["our_dead_agent"],
+                    "launched_at": 1.0,
+                    "pid_namespace":
+                        crate::sys::process::current_pid_namespace().unwrap_or_default(),
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        if let Ok(mut guard) = crate::tui::db::ORPHAN_CACHE.lock() {
+            *guard = None;
+        }
+
+        let db = crate::db::HcomDb::open_at(&hcom_dir.join("hcom.db")).unwrap();
+        let orphans = crate::tui::db::load_orphans(db.conn());
+
+        assert!(
+            orphans.iter().any(|o| o.pid == 4_194_305),
+            "a pid we cannot inspect must stay listed"
+        );
+        assert!(
+            !orphans.iter().any(|o| o.pid == 4_194_306),
+            "a dead pid in our own namespace is still hidden"
+        );
+        if let Ok(mut guard) = crate::tui::db::ORPHAN_CACHE.lock() {
+            *guard = None;
+        }
+    }
+
+    #[test]
+    fn db_source_reconcile_removes_dead_row_then_returns_zero() {
+        use crate::tui::data::DataSource;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        insert_dead_local_instance(&db, "ghost");
+        drop(db);
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+
+        assert_eq!(
+            ds.reconcile_dead_instances().unwrap(),
+            1,
+            "one dead local row must be reconciled"
+        );
+        assert_eq!(
+            ds.reconcile_dead_instances().unwrap(),
+            0,
+            "nothing left to reconcile on the next pass"
+        );
+    }
+
+    #[test]
+    fn db_source_reconcile_invalidates_cache_so_load_sees_committed_deletion() {
+        use crate::tui::data::DataSource;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        insert_dead_local_instance(&db, "ghost");
+        drop(db);
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+
+        // Populate the read-path cache first, as the TUI's normal render tick
+        // would before a maintenance tick runs.
+        let before = ds.load();
+        assert!(
+            before.agents.iter().any(|a| a.name == "ghost"),
+            "fixture: ghost must be visible before reconcile"
+        );
+        assert!(ds.cached.is_some(), "fixture: load() must cache a snapshot");
+
+        assert_eq!(ds.reconcile_dead_instances().unwrap(), 1);
+
+        // Reconciliation writes through a separate connection than the one
+        // `data_version` is read from, so trusting that reading alone could
+        // still see the pre-reconcile snapshot. The explicit dirty flag must
+        // force a full reload regardless.
+        assert!(
+            ds.cached.is_none(),
+            "a successful reconcile must invalidate the cached snapshot"
+        );
+
+        let after = ds.load();
+        assert!(
+            !after.agents.iter().any(|a| a.name == "ghost"),
+            "reload must observe the committed deletion"
+        );
+    }
+
+    #[test]
+    fn write_db_open_success_clears_a_stale_last_error() {
+        use crate::tui::data::DataSource;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        drop(db);
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+        // Simulate the state left behind by an earlier failed open (e.g.
+        // transient lock contention) that has since cleared up.
+        ds.last_error = Some("open write db ...: stale failure".to_string());
+
+        assert_eq!(ds.reconcile_dead_instances().unwrap(), 0);
+        assert!(
+            ds.last_error.is_none(),
+            "a successful write-db open must clear a stale last_error, not leave it \
+             stuck in the TUI status bar forever"
+        );
+    }
+
+    // ── Task 4: end-to-end acceptance fixture ──────────────────────
+    //
+    // Exercises the pipeline through the `DataSource` trait interface (not
+    // `instance_lifecycle::reconcile_dead_instances` directly), asserting on
+    // the acceptance criteria in the spec's "### TUI lifecycle" section.
+    // Task 1's tests already cover the full skip-list matrix, idempotency
+    // ordering, and reason/cascade details at the DB layer; this stays a
+    // lighter, representative pass through `DbDataSource`.
+
+    fn insert_local_instance(db: &crate::db::HcomDb, name: &str, status: &str, pid: i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, created_at, pid, tcp_mode, pid_namespace)
+                 VALUES (?, 'claude', ?, 'tool:Bash', ?, ?, 1, ?)",
+                rusqlite::params![
+                    name,
+                    status,
+                    crate::shared::time::now_epoch_f64(),
+                    pid,
+                    crate::sys::process::current_pid_namespace().unwrap_or_default()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_remote_instance(db: &crate::db::HcomDb, name: &str, pid: i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances \
+                    (name, tool, status, status_context, created_at, pid, tcp_mode, origin_device_id)
+                 VALUES (?, 'claude', 'active', 'tool:Bash', ?, ?, 1, 'device-remote')",
+                rusqlite::params![name, crate::shared::time::now_epoch_f64(), pid],
+            )
+            .unwrap();
+    }
+
+    fn insert_pidless_instance(db: &crate::db::HcomDb, name: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at, tcp_mode)
+                 VALUES (?, 'claude', 'active', 'tool:Bash', ?, 1)",
+                rusqlite::params![name, crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+    }
+
+    fn last_life_detector(db: &crate::db::HcomDb, name: &str) -> String {
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ? \
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&data).unwrap()["detector"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Acceptance criteria 1, 2, 8 (spec "### TUI lifecycle"): a local
+    /// `active` row and a local `listening` row, both with a dead PID, are
+    /// both removed through the `DataSource` trait interface in one pass,
+    /// and each leaves exactly one stopped life event stamped
+    /// `detector: "tui"`.
+    #[test]
+    fn db_source_reconcile_removes_dead_active_and_listening_rows_via_trait() {
+        use crate::tui::data::DataSource;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+
+        // A single connection for the whole test (via `ds`'s own lazily-opened
+        // write handle), not a separate setup connection plus `ds`'s own --
+        // two connections opening/closing the same fresh sqlite file adds
+        // avoidable contention under parallel test load.
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+        assert!(
+            ds.ensure_write_db(),
+            "fixture: write db must open: {:?}",
+            ds.last_error
+        );
+        {
+            let db = ds.write_db.as_ref().unwrap();
+            insert_local_instance(db, "dead_active", crate::shared::ST_ACTIVE, DEAD_PID);
+            insert_local_instance(
+                db,
+                "dead_listening",
+                crate::shared::ST_LISTENING,
+                DEAD_PID + 1,
+            );
+        }
+
+        assert_eq!(
+            ds.reconcile_dead_instances().unwrap(),
+            2,
+            "both dead active and listening rows must reconcile in one pass"
+        );
+
+        let db = ds.write_db.as_ref().unwrap();
+        assert!(db.get_instance_full("dead_active").unwrap().is_none());
+        assert!(db.get_instance_full("dead_listening").unwrap().is_none());
+        assert_eq!(last_life_detector(db, "dead_active"), "tui");
+        assert_eq!(last_life_detector(db, "dead_listening"), "tui");
+    }
+
+    /// Acceptance criterion 3: a live PID is never removed, across repeated
+    /// reconcile calls -- not just the first one.
+    #[test]
+    fn db_source_reconcile_keeps_live_pid_row_across_repeated_calls() {
+        use crate::tui::data::DataSource;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+        assert!(
+            ds.ensure_write_db(),
+            "fixture: write db must open: {:?}",
+            ds.last_error
+        );
+        insert_local_instance(
+            ds.write_db.as_ref().unwrap(),
+            "alive",
+            crate::shared::ST_ACTIVE,
+            std::process::id() as i64,
+        );
+
+        for pass in 0..3 {
+            assert_eq!(
+                ds.reconcile_dead_instances().unwrap(),
+                0,
+                "live PID must survive pass {pass}"
+            );
+        }
+
+        let db = ds.write_db.as_ref().unwrap();
+        assert!(db.get_instance_full("alive").unwrap().is_some());
+    }
+
+    /// Acceptance criterion 4 (lighter touch -- Task 1's tests already cover
+    /// the full skip-list matrix at the `reconcile_dead_instances` level):
+    /// one remote row and one PID-less row, both otherwise eligible, survive
+    /// a reconcile pass through the `DataSource` interface.
+    #[test]
+    fn db_source_reconcile_skips_remote_and_pidless_rows_via_trait() {
+        use crate::tui::data::DataSource;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+        assert!(
+            ds.ensure_write_db(),
+            "fixture: write db must open: {:?}",
+            ds.last_error
+        );
+        {
+            let db = ds.write_db.as_ref().unwrap();
+            insert_remote_instance(db, "remote_dead", DEAD_PID);
+            insert_pidless_instance(db, "pidless");
+        }
+
+        assert_eq!(ds.reconcile_dead_instances().unwrap(), 0);
+
+        let db = ds.write_db.as_ref().unwrap();
+        assert!(db.get_instance_full("remote_dead").unwrap().is_some());
+        assert!(db.get_instance_full("pidless").unwrap().is_some());
+    }
+
+    /// Acceptance criterion 7 (timing): measures a real fixture-DB
+    /// `reconcile_dead_instances()` call with `Instant`. The write handle is
+    /// opened (and the row inserted) before the clock starts, so the
+    /// measured span is the steady-state per-tick cost the spec's cadence
+    /// actually pays -- not the one-time lazy-open cost `tick_reconcile`
+    /// only incurs once per TUI session.
+    ///
+    /// This is honest evidence only for the DB-layer half of the spec's
+    /// <=2s budget -- a tiny local sqlite fixture with no contention is
+    /// near-instant by construction. It does NOT measure real wall-clock
+    /// behavior of a live TUI noticing and redrawing (real terminal I/O,
+    /// the 1s cadence timer driving `tick_reconcile`, reload jitter, or
+    /// real process-death latency); that half of the budget is a design
+    /// target (Task 3's 1s cadence + reload-on-change), not something a
+    /// fixture test can validate. See the spec's Acceptance end-to-end
+    /// steps 3-6, recorded unverified there.
+    #[test]
+    fn db_source_reconcile_dead_pid_row_completes_well_under_budget() {
+        use crate::tui::data::DataSource;
+        use std::time::{Duration, Instant};
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("hcom.db");
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path;
+        assert!(
+            ds.ensure_write_db(),
+            "fixture: write db must open: {:?}",
+            ds.last_error
+        );
+        insert_local_instance(
+            ds.write_db.as_ref().unwrap(),
+            "dead_timed",
+            crate::shared::ST_ACTIVE,
+            DEAD_PID + 2,
+        );
+
+        let start = Instant::now();
+        let n = ds.reconcile_dead_instances().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(n, 1);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "fixture DB reconcile took {elapsed:?}; expected near-instant. This measures \
+             only the DB-layer half of the spec's <=2s budget, not real TUI wall-clock time \
+             (terminal I/O, cadence timer, redraw, real process-death latency)."
+        );
     }
 }

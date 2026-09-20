@@ -819,11 +819,11 @@ pub fn cleanup_stale_instances(
             // agent.
             if reason != "exit_cleanup"
                 && let Some(pid) = data.pid
-                && crate::sys::process::is_alive(pid as u32)
+                && tracked_pid_liveness(data) != Some(false)
             {
                 crate::log::log_info(
                     "cleanup",
-                    "skip_live_pid",
+                    "skip_unconfirmed_dead_pid",
                     &format!(
                         "instance={} reason={} context={} age={}s pid={}",
                         data.name, reason, context, age, pid
@@ -879,20 +879,92 @@ fn cleanup_stale_remote_instances(db: &HcomDb) {
     }
 }
 
-/// Detect and clean up instances whose processes died (e.g. system reboot).
+/// Which cadence detected the dead process, recorded on the life event so
+/// the startup pass and the (later) TUI cadence are distinguishable in
+/// logs/snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadProcessDetector {
+    /// The once-per-process reaper run from `main.rs` at startup.
+    Startup,
+    /// The in-TUI cadence.
+    Tui,
+}
+
+impl DeadProcessDetector {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Tui => "tui",
+        }
+    }
+}
+
+/// `None` means this caller cannot establish death: a negative kill(pid, 0)
+/// from a foreign PID namespace says nothing about the host process.
 ///
-/// After a reboot, hcom instances with PIDs in the DB are stale — their
-/// processes no longer exist. This function finds them, saves a stopped
-/// snapshot for resume, and removes the dead row. Hook-based agents without
-/// tracked PIDs are handled by the existing heartbeat staleness detection
-/// the next time `hcom list` runs.
+/// The namespace is stamped beside the PID on every write (see
+/// `HcomDb::with_pid_namespace`), so a row that has one was written by a
+/// process that could see that PID. Rows predating the column have none and
+/// stay `None`: never trade a stale row for a live agent silently losing its
+/// identity. The next PID write stamps them.
+fn tracked_pid_liveness(inst: &crate::db::InstanceRow) -> Option<bool> {
+    let pid = u32::try_from(inst.pid?).ok().filter(|pid| *pid > 0)?;
+    // A row with no marker passes `""`, which matches no real namespace — so
+    // it reads as unknown rather than as "namespace check not applicable".
+    crate::sys::process::is_alive_in(pid, Some(inst.pid_namespace.as_deref().unwrap_or("")))
+}
+
+/// Outcome of probing whether a PID still names a live process.
 ///
-/// Returns the number of instances marked dead.
-pub fn mark_dead_instances(db: &HcomDb) -> i32 {
-    let Ok(instances) = db.iter_instances_full() else {
-        return 0;
-    };
-    let mut marked = 0;
+/// `is_alive` treats only `EPERM` as alive; every other error — `ESRCH`
+/// included — reads as dead, which is the tracked cross-namespace bug (see
+/// `docs/issues/2026-09-17-cross-namespace-liveness-reaps-live-agents.md`).
+/// `Unknown` covers PID namespaces this caller cannot inspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessProbe {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+/// Detect and clean up instances whose processes died (crash, `kill`,
+/// reboot, closed terminal/process group).
+///
+/// Finds local instances with a tracked PID that no longer names a live
+/// process, saves a stopped snapshot for resume, and removes the dead row.
+/// Hook-based agents without tracked PIDs are handled by the existing
+/// heartbeat staleness detection the next time `hcom list` runs.
+///
+/// The underlying finalize is identity- *and* liveness-guarded
+/// (`HcomDb::finalize_instance_stop_guarded`): a row that has since been
+/// rebound or resumed under the same name is left alone rather than deleted
+/// out from under it, and a concurrent finalizer (e.g. a PTY exit) racing in
+/// first is a normal no-op here, not an error.
+///
+/// Returns the number of instances actually reconciled this pass. Errors
+/// (DB unreadable, a single instance's finalize failing) are not fatal: the
+/// caller logs and retries on the next pass, since a skipped row is always
+/// retryable — nothing here is destructive without winning its guard.
+pub fn reconcile_dead_instances(
+    db: &HcomDb,
+    detector: DeadProcessDetector,
+) -> anyhow::Result<usize> {
+    reconcile_dead_instances_with_probe(db, detector, |inst, _pid| {
+        match tracked_pid_liveness(inst) {
+            Some(true) => ProcessProbe::Alive,
+            Some(false) => ProcessProbe::Dead,
+            None => ProcessProbe::Unknown,
+        }
+    })
+}
+
+fn reconcile_dead_instances_with_probe(
+    db: &HcomDb,
+    detector: DeadProcessDetector,
+    probe: impl Fn(&crate::db::InstanceRow, u32) -> ProcessProbe,
+) -> anyhow::Result<usize> {
+    let instances = db.iter_instances_full()?;
+    let mut reconciled = 0;
 
     for inst in &instances {
         if inst.status == ST_INACTIVE || inst.status == ST_LAUNCHING {
@@ -912,8 +984,11 @@ pub fn mark_dead_instances(db: &HcomDb) -> i32 {
             _ => continue,
         };
 
-        if crate::pidtrack::is_alive(pid) {
-            continue;
+        // Recheck liveness immediately before finalizing. Anything but a
+        // confirmed-dead probe result fails safe and keeps the row.
+        match probe(inst, pid) {
+            ProcessProbe::Alive | ProcessProbe::Unknown => continue,
+            ProcessProbe::Dead => {}
         }
 
         let snapshot = serde_json::json!({
@@ -937,45 +1012,77 @@ pub fn mark_dead_instances(db: &HcomDb) -> i32 {
             "last_event_id": inst.last_event_id,
         });
 
-        // Defense-in-depth: redundant with the `instances` ON DELETE CASCADE
-        // on `session_bindings.instance_name`, kept for correctness
-        // independent of the FK and for any path that skips the cascade.
-        let _ = db.delete_session_bindings_for_instance(&inst.name);
-        if let Some(ref session_id) = inst.session_id {
-            let _ = db.conn().execute(
-                "DELETE FROM process_bindings WHERE session_id = ?",
-                rusqlite::params![session_id],
-            );
-        }
+        // Một hcom khác có thể đang dừng instance này có chủ đích; lý do của nó
+        // đúng hơn phỏng đoán "dead_process" của ta.
+        let (reason, initiated_by) =
+            crate::hooks::common::read_stop_reason(db, &inst.name, inst.created_at)
+                .unwrap_or_else(|| ("exit:dead_process".to_string(), "system".to_string()));
 
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE instance_name = ?",
-            rusqlite::params![inst.name],
-        );
-        let _ = db.delete_notify_endpoints(&inst.name);
-        let _ = db.cleanup_subscriptions(&inst.name);
-
-        if db
-            .log_life_event(
-                &inst.name,
-                "stopped",
-                "system",
-                "exit:reboot",
-                Some(snapshot),
-            )
-            .is_ok()
-        {
-            let _ = db.delete_instance(&inst.name);
-            marked += 1;
-            crate::log::log_info(
-                "lifecycle",
-                "mark_dead",
-                &format!("instance={} pid={} tool={}", inst.name, pid, inst.tool,),
-            );
+        let event_data = serde_json::json!({
+            "action": "stopped",
+            "by": initiated_by,
+            "reason": reason,
+            "detector": detector.as_str(),
+            "snapshot": snapshot,
+        });
+        // Guarded on identity AND the observed pid/status: a concurrent
+        // finalizer (PTY exit, another reconciler pass) or a fresh
+        // rebind/resume under the same name must not be double-published or
+        // deleted out from under it.
+        match db.finalize_instance_stop_guarded(
+            &inst.name,
+            inst.created_at,
+            inst.session_id.as_deref(),
+            inst.agent_id.as_deref(),
+            inst.pid,
+            &inst.status,
+            &event_data,
+        ) {
+            Ok(true) => {
+                reconciled += 1;
+                crate::log::log_info(
+                    "lifecycle",
+                    "mark_dead",
+                    &format!(
+                        "instance={} pid={} tool={} detector={}",
+                        inst.name,
+                        pid,
+                        inst.tool,
+                        detector.as_str(),
+                    ),
+                );
+            }
+            Ok(false) => {
+                // Normal race: another finalizer already won, or the row
+                // changed underneath us. Nothing to retry for this pass.
+            }
+            Err(e) => {
+                crate::log::log_warn(
+                    "lifecycle",
+                    "reconcile_dead_instance_failed",
+                    &format!("instance={} err={e}", inst.name),
+                );
+            }
         }
     }
 
-    marked
+    Ok(reconciled)
+}
+
+/// Startup-compatible wrapper around [`reconcile_dead_instances`]. Runs once
+/// per `hcom` process (`main.rs`, before dispatch). Best-effort: a failure to
+/// even read the instance table is logged and treated as zero reconciled,
+/// never aborts startup — the next `hcom` invocation retries.
+///
+/// Returns the number of instances marked dead.
+pub fn mark_dead_instances(db: &HcomDb) -> i32 {
+    match reconcile_dead_instances(db, DeadProcessDetector::Startup) {
+        Ok(n) => n as i32,
+        Err(e) => {
+            crate::log::log_warn("lifecycle", "mark_dead_instances_failed", &e.to_string());
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1027,8 +1134,9 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO instances
-                    (name, tool, status, status_context, status_time, last_stop, created_at, pid, tcp_mode)
-                 VALUES (?, 'claude', ?, 'tool:Bash', ?, ?, ?, ?, 1)",
+                    (name, tool, status, status_context, status_time, last_stop, created_at, \
+                     pid, tcp_mode, pid_namespace)
+                 VALUES (?, 'claude', ?, 'tool:Bash', ?, ?, ?, ?, 1, ?)",
                 rusqlite::params![
                     name,
                     ST_ACTIVE,
@@ -1036,7 +1144,17 @@ mod tests {
                     now - heartbeat_age,
                     (now - status_age) as f64,
                     pid,
+                    crate::sys::process::current_pid_namespace().unwrap_or_default(),
                 ],
+            )
+            .unwrap();
+    }
+
+    fn set_pid_namespace(db: &HcomDb, name: &str, namespace: Option<&str>) {
+        db.conn()
+            .execute(
+                "UPDATE instances SET pid_namespace = ? WHERE name = ?",
+                rusqlite::params![namespace.unwrap_or(""), name],
             )
             .unwrap();
     }
@@ -1057,6 +1175,19 @@ mod tests {
 
         assert_eq!(deleted, 0, "a live process must never be unlinked");
         assert!(instance_exists(&db, "alive"));
+        cleanup(path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_cleanup_spares_pid_from_foreign_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_stale_active(&db, "foreign", 3700, 2400, DEAD_PID);
+        set_pid_namespace(&db, "foreign", Some("pid:[foreign]"));
+
+        assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 0);
+        assert!(instance_exists(&db, "foreign"));
         cleanup(path);
     }
 
@@ -1278,6 +1409,7 @@ mod tests {
             hints: None,
             origin_device_id: None,
             pid: None,
+            pid_namespace: None,
             launch_args: None,
             terminal_preset_requested: None,
             terminal_preset_effective: None,
@@ -1784,6 +1916,421 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         assert!(n >= 1);
         assert_eq!(db.get_session_binding("uuid-a").unwrap(), None);
         assert_eq!(db.get_session_binding("uuid-b").unwrap(), None);
+        cleanup(path);
+    }
+
+    fn insert_active_with_session(
+        db: &HcomDb,
+        name: &str,
+        session_id: &str,
+        created_at: f64,
+        pid: i64,
+    ) {
+        let now = now_epoch_i64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, session_id, status, status_context, status_time, \
+                     last_stop, created_at, pid, tcp_mode, pid_namespace)
+                 VALUES (?, 'claude', ?, ?, '', ?, ?, ?, ?, 1, ?)",
+                rusqlite::params![
+                    name,
+                    session_id,
+                    ST_ACTIVE,
+                    now,
+                    now,
+                    created_at,
+                    pid,
+                    crate::sys::process::current_pid_namespace().unwrap_or_default()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn last_life_field(db: &HcomDb, name: &str, field: &str) -> String {
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ? \
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&data).unwrap()[field]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn last_life_reason(db: &HcomDb, name: &str) -> String {
+        last_life_field(db, name, "reason")
+    }
+
+    fn life_event_count(db: &HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Step 1 regression fixture: a probe-injected pass over every row shape
+    /// the reaper's contract distinguishes. Only the local active/listening
+    /// rows whose PID probes `Dead` get reconciled; everything else — an
+    /// `Alive` or `Unknown` probe result, remote, PID-less, `launching`, or
+    /// `inactive` — must survive untouched. The one row that also carries
+    /// session aliases/process binding/notify endpoint/subscription proves
+    /// the full cascade still runs, and exactly one stopped life event is
+    /// published per successful cleanup.
+    #[test]
+    fn reconcile_dead_instances_removes_only_dead_local_active_or_listening_rows() {
+        let (db, path) = setup_test_db();
+
+        // Dead + active + local, with full cascade fan-out. Must be removed.
+        insert_active_with_session(&db, "dead_active", "sess-active", 1.0, 100);
+        db.rebind_session("alias-active", "dead_active").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at) \
+                 VALUES ('proc-active', 'sess-active', 'dead_active', 0)",
+                [],
+            )
+            .unwrap();
+        db.register_notify_port("dead_active", 9001).unwrap();
+        db.kv_set(
+            "events_sub:sub-active",
+            Some(&serde_json::json!({"caller": "dead_active", "events": ["life"]}).to_string()),
+        )
+        .unwrap();
+
+        // Dead + listening + local. Must be removed.
+        let mut listening = serde_json::Map::new();
+        listening.insert("name".into(), serde_json::json!("dead_listening"));
+        listening.insert("tool".into(), serde_json::json!("claude"));
+        listening.insert("status".into(), serde_json::json!(ST_LISTENING));
+        listening.insert("pid".into(), serde_json::json!(200));
+        listening.insert("created_at".into(), serde_json::json!(2.0));
+        db.save_instance_named("dead_listening", &listening)
+            .unwrap();
+
+        // Alive + active + local. Probe says Alive — must survive.
+        insert_active_with_session(&db, "alive_active", "sess-alive", 3.0, 300);
+
+        // Unknown probe result (uncertain PID check). Fail-safe — must survive.
+        insert_active_with_session(&db, "unknown_active", "sess-unknown", 4.0, 400);
+
+        // Remote instance, dead PID. Skipped regardless of probe.
+        let mut remote = serde_json::Map::new();
+        remote.insert("name".into(), serde_json::json!("remote_dead"));
+        remote.insert("tool".into(), serde_json::json!("claude"));
+        remote.insert("status".into(), serde_json::json!(ST_ACTIVE));
+        remote.insert("pid".into(), serde_json::json!(500));
+        remote.insert("created_at".into(), serde_json::json!(5.0));
+        remote.insert("origin_device_id".into(), serde_json::json!("device-1"));
+        db.save_instance_named("remote_dead", &remote).unwrap();
+
+        // PID-less instance. Skipped (nothing to probe).
+        let mut pidless = serde_json::Map::new();
+        pidless.insert("name".into(), serde_json::json!("pidless_active"));
+        pidless.insert("tool".into(), serde_json::json!("claude"));
+        pidless.insert("status".into(), serde_json::json!(ST_ACTIVE));
+        pidless.insert("created_at".into(), serde_json::json!(6.0));
+        db.save_instance_named("pidless_active", &pidless).unwrap();
+
+        // launching, dead PID. Skipped per the existing status contract.
+        let mut launching = serde_json::Map::new();
+        launching.insert("name".into(), serde_json::json!("launching_dead"));
+        launching.insert("tool".into(), serde_json::json!("claude"));
+        launching.insert("status".into(), serde_json::json!(ST_LAUNCHING));
+        launching.insert("pid".into(), serde_json::json!(700));
+        launching.insert("created_at".into(), serde_json::json!(7.0));
+        db.save_instance_named("launching_dead", &launching)
+            .unwrap();
+
+        // inactive, dead PID. Skipped per the existing status contract.
+        let mut inactive = serde_json::Map::new();
+        inactive.insert("name".into(), serde_json::json!("inactive_dead"));
+        inactive.insert("tool".into(), serde_json::json!("claude"));
+        inactive.insert("status".into(), serde_json::json!(ST_INACTIVE));
+        inactive.insert("pid".into(), serde_json::json!(800));
+        inactive.insert("created_at".into(), serde_json::json!(8.0));
+        db.save_instance_named("inactive_dead", &inactive).unwrap();
+
+        let reconciled = reconcile_dead_instances_with_probe(
+            &db,
+            DeadProcessDetector::Tui,
+            |_, pid| match pid {
+                100 | 200 => ProcessProbe::Dead,
+                300 => ProcessProbe::Alive,
+                400 => ProcessProbe::Unknown,
+                other => panic!(
+                    "unexpected probe on pid {other}: skip-list rows must never reach the probe"
+                ),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reconciled, 2);
+        assert!(db.get_instance_full("dead_active").unwrap().is_none());
+        assert!(db.get_instance_full("dead_listening").unwrap().is_none());
+        assert!(db.get_instance_full("alive_active").unwrap().is_some());
+        assert!(db.get_instance_full("unknown_active").unwrap().is_some());
+        assert!(db.get_instance_full("remote_dead").unwrap().is_some());
+        assert!(db.get_instance_full("pidless_active").unwrap().is_some());
+        assert!(db.get_instance_full("launching_dead").unwrap().is_some());
+        assert!(db.get_instance_full("inactive_dead").unwrap().is_some());
+
+        // Full cascade ran for the identity-cleaned row.
+        assert_eq!(db.get_session_binding("sess-active").unwrap(), None);
+        assert_eq!(db.get_session_binding("alias-active").unwrap(), None);
+        let proc_bindings: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM process_bindings WHERE instance_name = 'dead_active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proc_bindings, 0);
+        let notify: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'dead_active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notify, 0);
+        let sub: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key = 'events_sub:sub-active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub, 0);
+
+        // Exactly one stopped life event per successful identity cleanup,
+        // each stamped with the detector that ran the reconcile pass.
+        assert_eq!(life_event_count(&db, "dead_active"), 1);
+        assert_eq!(life_event_count(&db, "dead_listening"), 1);
+        assert_eq!(last_life_field(&db, "dead_active", "detector"), "tui");
+        assert_eq!(last_life_field(&db, "dead_listening", "detector"), "tui");
+        assert_eq!(last_life_reason(&db, "dead_active"), "exit:dead_process");
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn mark_dead_prefers_claimed_stop_reason() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "sess-kume", 1000.0, DEAD_PID);
+
+        crate::hooks::common::claim_stop_reason(&db, "kume", 1000.0, "alam", "killed");
+        assert_eq!(mark_dead_instances(&db), 1);
+        assert_eq!(last_life_reason(&db, "kume"), "killed");
+        assert_eq!(last_life_field(&db, "kume", "by"), "alam");
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn mark_dead_preserves_claim_when_event_write_fails() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "sess-kume", 1000.0, DEAD_PID);
+        crate::hooks::common::claim_stop_reason(&db, "kume", 1000.0, "alam", "killed");
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_life BEFORE INSERT ON events
+             WHEN NEW.type = 'life' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+
+        assert_eq!(mark_dead_instances(&db), 0);
+        assert!(db.get_instance_full("kume").unwrap().is_some());
+        db.conn().execute_batch("DROP TRIGGER reject_life").unwrap();
+        assert_eq!(mark_dead_instances(&db), 1);
+        assert_eq!(last_life_reason(&db, "kume"), "killed");
+        assert_eq!(last_life_field(&db, "kume", "by"), "alam");
+        assert!(db.kv_get("stop_reason:kume").unwrap().is_none());
+        cleanup(path);
+    }
+
+    #[test]
+    fn stale_stopper_cannot_overwrite_resumed_instances_claim() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "sess-kume", 2000.0, DEAD_PID);
+        crate::hooks::common::claim_stop_reason(&db, "kume", 2000.0, "alam", "killed");
+        // An older stopper resumes after the name has already been reused.
+        crate::hooks::common::claim_stop_reason(&db, "kume", 1000.0, "system", "stale_cleanup");
+        assert_eq!(mark_dead_instances(&db), 1);
+        assert_eq!(last_life_reason(&db, "kume"), "killed");
+        assert_eq!(last_life_field(&db, "kume", "by"), "alam");
+        cleanup(path);
+    }
+
+    /// A claim orphaned by a losing `hcom kill` (or SessionEnd) can survive a
+    /// non-fork `hcom r <name>` resume, which keeps the same name AND the same
+    /// session_id (prior_session_id, resume.rs). `created_at` is what
+    /// actually changes across that resume, so it — not session_id — is the
+    /// discriminator that must reject a stale claim.
+    #[test]
+    fn mark_dead_ignores_claim_from_a_different_instance_lifetime() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "sess-kume", 2000.0, DEAD_PID);
+
+        // Chỗ đặt còn sót lại từ một instance cũ trùng tên VÀ trùng session_id
+        // (resume không-fork giữ nguyên session_id cũ), nhưng created_at khác.
+        db.kv_set("stop_reason:kume", Some("killed|alam|1000"))
+            .unwrap();
+        assert_eq!(mark_dead_instances(&db), 1);
+        assert_eq!(last_life_reason(&db, "kume"), "exit:dead_process");
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn mark_dead_without_a_claim_reports_dead_process_with_startup_detector() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "sess-kume", 1000.0, DEAD_PID);
+
+        assert_eq!(mark_dead_instances(&db), 1);
+        assert_eq!(last_life_reason(&db, "kume"), "exit:dead_process");
+        assert_eq!(last_life_field(&db, "kume", "detector"), "startup");
+
+        cleanup(path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn foreign_pid_namespace_cannot_reap_live_roster() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "claude-session", 1000.0, DEAD_PID);
+        insert_active_with_session(&db, "lori", "codex-session", 2000.0, DEAD_PID + 1);
+        insert_active_with_session(&db, "legacy", "old-session", 3000.0, DEAD_PID + 2);
+        // These PIDs belong to a namespace this CLI cannot inspect. A negative
+        // kill(pid, 0) here is not evidence that either agent exited.
+        for name in ["kume", "lori"] {
+            set_pid_namespace(&db, name, Some("pid:[foreign]"));
+        }
+        // Predates the column entirely: no evidence either way, so it stays.
+        set_pid_namespace(&db, "legacy", None);
+
+        assert_eq!(mark_dead_instances(&db), 0);
+        assert!(instance_exists(&db, "kume"));
+        assert!(instance_exists(&db, "lori"));
+        assert!(instance_exists(&db, "legacy"));
+        cleanup(path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn recording_a_new_pid_replaces_a_stale_foreign_namespace() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "lori", "codex-session", 2000.0, DEAD_PID);
+        set_pid_namespace(&db, "lori", Some("pid:[old]"));
+        db.store_launch_context("lori", r#"{"pane_id":"pane-1"}"#)
+            .unwrap();
+
+        // We are the process that spawned this pid, so our namespace is the
+        // one that describes it.
+        db.update_instance_pid("lori", DEAD_PID as u32).unwrap();
+
+        let row = db.get_instance_full("lori").unwrap().unwrap();
+        assert_eq!(
+            row.pid_namespace.as_deref(),
+            crate::sys::process::current_pid_namespace()
+        );
+        assert_eq!(
+            row.launch_context.as_deref(),
+            Some(r#"{"pane_id":"pane-1"}"#)
+        );
+        cleanup(path);
+    }
+
+    /// The regression that made the whole guard a no-op: every vendor's
+    /// SessionStart rebuilds `launch_context` from scratch, so a namespace
+    /// marker living in that blob was erased seconds after launch and every
+    /// dead row became permanently unreapable.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn session_start_context_capture_does_not_disarm_the_reaper() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "kume", "claude-session", 1000.0, DEAD_PID);
+        assert_eq!(
+            db.get_instance_full("kume")
+                .unwrap()
+                .unwrap()
+                .pid_namespace
+                .as_deref(),
+            crate::sys::process::current_pid_namespace()
+        );
+
+        crate::instance_binding::capture_and_store_launch_context(&db, "kume");
+
+        assert_eq!(
+            db.get_instance_full("kume")
+                .unwrap()
+                .unwrap()
+                .pid_namespace
+                .as_deref(),
+            crate::sys::process::current_pid_namespace(),
+            "context capture must not touch the namespace stamped beside the pid"
+        );
+        assert_eq!(mark_dead_instances(&db), 1);
+        assert!(!instance_exists(&db, "kume"));
+        cleanup(path);
+    }
+
+    /// An orphan recorded in this namespace carries our marker through the
+    /// pidfile, and adoption must land it on the row — otherwise the adopted
+    /// agent could never be reconciled. (The foreign case, where adoption must
+    /// copy rather than stamp, is covered in `pidtrack`.)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn adopting_an_orphan_carries_the_observing_namespace_onto_the_row() {
+        let (db, path) = setup_test_db();
+        let orphan = crate::pidtrack::OrphanProcess {
+            pid: DEAD_PID as u32,
+            tool: "claude".to_string(),
+            directory: "/tmp".to_string(),
+            pid_namespace: crate::sys::process::current_pid_namespace()
+                .unwrap_or_default()
+                .to_string(),
+            ..Default::default()
+        };
+
+        crate::pidtrack::recover_single_orphan_to_db(&db, &orphan, "poko").unwrap();
+
+        let row = db.get_instance_full("poko").unwrap().unwrap();
+        assert_eq!(row.pid, Some(DEAD_PID));
+        assert_eq!(
+            row.pid_namespace.as_deref(),
+            crate::sys::process::current_pid_namespace()
+        );
+        cleanup(path);
+    }
+
+    /// Clearing a pid must clear the namespace with it: a namespace left
+    /// behind would describe a pid that is no longer there.
+    #[test]
+    fn clearing_a_pid_clears_its_namespace() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "lori", "codex-session", 2000.0, DEAD_PID);
+
+        crate::instances::update_instance_position(
+            &db,
+            "lori",
+            &serde_json::Map::from_iter([("pid".to_string(), serde_json::Value::Null)]),
+        );
+
+        let row = db.get_instance_full("lori").unwrap().unwrap();
+        assert_eq!(row.pid, None);
+        assert_eq!(row.pid_namespace, None);
         cleanup(path);
     }
 }

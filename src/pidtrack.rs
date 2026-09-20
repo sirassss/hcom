@@ -37,6 +37,12 @@ pub struct PidEntry {
     pub inject_port: u16,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
+    /// PID namespace `pid` was observed in (see
+    /// [`crate::sys::process::current_pid_namespace`]). Empty for entries
+    /// written before this field existed, or on platforms without PID
+    /// namespaces; such entries read as "liveness unknown" and are never pruned.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pid_namespace: String,
 }
 
 fn is_zero(v: &u16) -> bool {
@@ -44,7 +50,7 @@ fn is_zero(v: &u16) -> bool {
 }
 
 /// Orphan process info (enriched with PID).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrphanProcess {
     pub pid: u32,
     pub tool: String,
@@ -60,6 +66,8 @@ pub struct OrphanProcess {
     pub notify_port: u16,
     pub inject_port: u16,
     pub tag: String,
+    /// See [`PidEntry::pid_namespace`].
+    pub pid_namespace: String,
 }
 
 impl From<(u32, &PidEntry)> for OrphanProcess {
@@ -79,6 +87,7 @@ impl From<(u32, &PidEntry)> for OrphanProcess {
             notify_port: entry.notify_port,
             inject_port: entry.inject_port,
             tag: entry.tag.clone(),
+            pid_namespace: entry.pid_namespace.clone(),
         }
     }
 }
@@ -91,6 +100,19 @@ fn pidfile_path(hcom_dir: &Path) -> PathBuf {
 /// Check if a process is alive. See [`crate::sys::process::is_alive`].
 pub fn is_alive(pid: u32) -> bool {
     crate::sys::process::is_alive(pid)
+}
+
+/// The namespace to stamp on a PID this process observed itself.
+fn current_namespace() -> String {
+    crate::sys::process::current_pid_namespace()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether this entry's PID is one we can still see. `None` for a PID recorded
+/// in a namespace we cannot inspect — never evidence for removing the entry.
+fn entry_liveness(pid: u32, entry: &PidEntry) -> Option<bool> {
+    crate::sys::process::is_alive_in(pid, Some(entry.pid_namespace.as_str()))
 }
 
 /// Read raw pidfile data.
@@ -126,6 +148,11 @@ pub struct PidRecord<'a> {
     pub notify_port: u16,
     pub inject_port: u16,
     pub tag: &'a str,
+    /// Where this PID was observed. `None` means the caller spawned or hosts
+    /// the process itself, so its own namespace describes it. `Some(marker)`
+    /// carries a namespace someone else recorded — including `Some("")`, which
+    /// says "unknown" and must not be quietly upgraded to ours.
+    pub pid_namespace: Option<&'a str>,
 }
 
 impl<'a> PidRecord<'a> {
@@ -153,6 +180,7 @@ impl<'a> PidRecord<'a> {
             notify_port: 0,
             inject_port: 0,
             tag: "",
+            pid_namespace: None,
         }
     }
 }
@@ -175,7 +203,15 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         notify_port,
         inject_port,
         tag,
+        pid_namespace,
     } = rec;
+    // `None` = ours to stamp; `Some("")` = the source knows it does not know,
+    // which stays unknown rather than being relabelled with our namespace.
+    let source_namespace = match pid_namespace {
+        None => Some(current_namespace()),
+        Some(marker) if !marker.is_empty() => Some((*marker).to_string()),
+        Some(_) => None,
+    };
     let mut data = read_raw(hcom_dir);
     let key = pid.to_string();
 
@@ -215,6 +251,11 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !tag.is_empty() && entry.tag.is_empty() {
             entry.tag = tag.to_string();
         }
+        if entry.pid_namespace.is_empty()
+            && let Some(ns) = source_namespace
+        {
+            entry.pid_namespace = ns;
+        }
     } else {
         data.insert(
             key,
@@ -233,6 +274,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 notify_port: *notify_port,
                 inject_port: *inject_port,
                 tag: tag.to_string(),
+                pid_namespace: source_namespace.unwrap_or_default(),
             },
         );
     }
@@ -251,14 +293,18 @@ pub fn get_orphan_processes(
 ) -> Vec<OrphanProcess> {
     let data = read_raw(hcom_dir);
 
-    // Filter to alive processes only
+    // Keep everything except PIDs we watched die. An entry recorded in another
+    // PID namespace reads as unknown, not dead: pruning it would throw away the
+    // pane/session metadata a live host agent needs to be recovered.
     let mut alive: HashMap<String, PidEntry> = HashMap::new();
     for (pid_str, entry) in &data {
-        if let Ok(pid) = pid_str.parse::<u32>()
-            && is_alive(pid)
-        {
-            alive.insert(pid_str.clone(), entry.clone());
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if entry_liveness(pid, entry) == Some(false) {
+            continue;
         }
+        alive.insert(pid_str.clone(), entry.clone());
     }
 
     // Write back pruned data if anything was removed
@@ -277,11 +323,25 @@ pub fn get_orphan_processes(
         })
         .collect();
 
-    // Prune active PIDs from file and filter from result
+    // Prune active PIDs from file and filter from result.
+    //
+    // `active` holds bare PID numbers, which are only unique within one PID
+    // namespace. Removal is therefore limited to entries recorded in *our*
+    // namespace, so a host PID that happens to collide numerically with a
+    // sandbox PID cannot delete the other's metadata.
+    //
+    // ponytail: the `retain` below stays on bare PIDs — a collision there only
+    // hides an entry from this listing (display, and what `hcom` offers to
+    // adopt), and a foreign-namespace entry is not adoptable from here anyway.
+    // Widen to (namespace, pid) if adoption ever spans namespaces.
     if let Some(active) = active_pids {
         let active_in_file: Vec<String> = result
             .iter()
-            .filter(|p| active.contains(&p.pid))
+            .filter(|p| {
+                active.contains(&p.pid)
+                    && crate::sys::process::is_alive_in(p.pid, Some(p.pid_namespace.as_str()))
+                        .is_some()
+            })
             .map(|p| p.pid.to_string())
             .collect();
         if !active_in_file.is_empty() {
@@ -333,8 +393,14 @@ pub fn recover_single_orphan_to_db(
         .map_err(|e| format!("failed to insert instance '{}': {}", instance_name, e))?;
 
     // Update PID and directory
+    // The orphan's pid was observed by whoever recorded it in the pidfile, not
+    // by us. Copy that marker across rather than stamping our own namespace.
     let mut updates = serde_json::Map::new();
     updates.insert("pid".into(), serde_json::json!(orphan.pid));
+    updates.insert(
+        "pid_namespace".into(),
+        serde_json::json!(orphan.pid_namespace),
+    );
     if !orphan.directory.is_empty() {
         updates.insert("directory".into(), serde_json::json!(orphan.directory));
     }
@@ -452,6 +518,7 @@ mod tests {
             notify_port: 8080,
             inject_port: 8081,
             tag: "test-tag",
+            pid_namespace: None,
         });
 
         let data = read_raw(dir.path());
@@ -570,6 +637,142 @@ mod tests {
         assert!(!data.contains_key(&our_pid.to_string()));
     }
 
+    /// Writes an entry the way another PID namespace would have: same shape,
+    /// a marker this process cannot match, and a PID number that is dead here.
+    fn record_foreign(dir: &Path, pid: u32, name: &str) {
+        record_pid(&rec(dir, pid, "claude", name));
+        let mut data = read_raw(dir);
+        data.get_mut(&pid.to_string()).unwrap().pid_namespace = "pid:[foreign]".to_string();
+        write_raw(dir, &data);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn orphan_scan_keeps_entries_from_a_foreign_namespace() {
+        let dir = make_temp_dir();
+        record_foreign(dir.path(), 99_999_998, "host_agent");
+        record_pid(&rec(dir.path(), 99_999_999, "claude", "ours_and_dead"));
+
+        let orphans = get_orphan_processes(dir.path(), None);
+
+        let data = read_raw(dir.path());
+        assert!(
+            data.contains_key("99999998"),
+            "a pid we cannot inspect is not evidence of death"
+        );
+        assert!(!data.contains_key("99999999"), "our own dead pid is pruned");
+        assert!(orphans.iter().any(|o| o.pid == 99_999_998));
+        assert_eq!(
+            orphans
+                .iter()
+                .find(|o| o.pid == 99_999_998)
+                .unwrap()
+                .pid_namespace,
+            "pid:[foreign]",
+            "the marker travels with the orphan so adoption can copy it"
+        );
+    }
+
+    /// Bare PID numbers are only unique inside one namespace, so an active
+    /// local PID must not delete a foreign entry that happens to share its
+    /// number along with all of its recovery metadata.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn active_pid_pruning_cannot_delete_a_colliding_foreign_entry() {
+        let dir = make_temp_dir();
+        let our_pid = std::process::id();
+        record_foreign(dir.path(), our_pid, "host_agent");
+
+        let mut active = HashSet::new();
+        active.insert(our_pid);
+        let orphans = get_orphan_processes(dir.path(), Some(&active));
+
+        assert!(orphans.is_empty(), "still hidden from this listing");
+        let data = read_raw(dir.path());
+        assert!(
+            data.contains_key(&our_pid.to_string()),
+            "but its metadata survives in the pidfile"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn adoption_copies_the_orphan_marker_instead_of_stamping_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+        let orphan = OrphanProcess {
+            pid: 99_999_998,
+            tool: "claude".into(),
+            names: vec!["kume".into()],
+            pid_namespace: "pid:[foreign]".into(),
+            ..Default::default()
+        };
+
+        recover_single_orphan_to_db(&db, &orphan, "kume").unwrap();
+
+        let row = db.get_instance_full("kume").unwrap().unwrap();
+        assert_eq!(row.pid, Some(99_999_998));
+        assert_eq!(row.pid_namespace.as_deref(), Some("pid:[foreign]"));
+    }
+
+    #[test]
+    fn recording_a_pid_we_spawned_stamps_our_namespace() {
+        let dir = make_temp_dir();
+        record_pid(&rec(dir.path(), 12345, "claude", "luna"));
+
+        assert_eq!(
+            read_raw(dir.path()).get("12345").unwrap().pid_namespace,
+            crate::sys::process::current_pid_namespace().unwrap_or_default()
+        );
+    }
+
+    /// The stop path records a pid it read out of the instance row, not one it
+    /// spawned. A sandboxed hcom running it for a host agent must leave the
+    /// host's marker alone.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn recording_a_pid_from_another_source_keeps_that_source_marker() {
+        let dir = make_temp_dir();
+
+        record_pid(&PidRecord {
+            pid_namespace: Some("pid:[foreign]"),
+            ..rec(dir.path(), 4_194_305, "claude", "host_agent")
+        });
+        // An unknown source stays unknown instead of being relabelled as ours.
+        record_pid(&PidRecord {
+            pid_namespace: Some(""),
+            ..rec(dir.path(), 4_194_306, "claude", "legacy_row")
+        });
+
+        let data = read_raw(dir.path());
+        assert_eq!(data.get("4194305").unwrap().pid_namespace, "pid:[foreign]");
+        assert_eq!(data.get("4194306").unwrap().pid_namespace, "");
+
+        // A second record from the same unknown source must not fill it in.
+        record_pid(&PidRecord {
+            pid_namespace: Some(""),
+            ..rec(dir.path(), 4_194_306, "claude", "legacy_row")
+        });
+        assert_eq!(
+            read_raw(dir.path()).get("4194306").unwrap().pid_namespace,
+            ""
+        );
+    }
+
+    #[test]
+    fn orphan_scan_drops_keys_that_are_not_pids() {
+        let dir = make_temp_dir();
+        record_pid(&rec(dir.path(), std::process::id(), "claude", "luna"));
+        let mut data = read_raw(dir.path());
+        let junk = data.values().next().unwrap().clone();
+        data.insert("not-a-pid".to_string(), junk);
+        write_raw(dir.path(), &data);
+
+        get_orphan_processes(dir.path(), None);
+
+        assert!(!read_raw(dir.path()).contains_key("not-a-pid"));
+    }
+
     #[test]
     fn test_empty_pidfile() {
         let dir = make_temp_dir();
@@ -610,6 +813,7 @@ mod tests {
             notify_port: 0,
             inject_port: 0,
             tag: String::new(),
+            pid_namespace: current_namespace(),
         };
 
         let result = recover_single_orphan_to_db(&db, &orphan, "luna");

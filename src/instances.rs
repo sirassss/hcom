@@ -110,6 +110,7 @@ mod tests {
             hints: None,
             origin_device_id: None,
             pid: None,
+            pid_namespace: None,
             launch_args: None,
             terminal_preset_requested: None,
             terminal_preset_effective: None,

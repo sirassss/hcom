@@ -1,5 +1,5 @@
 use std::io::Stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event as CrosstermEvent, KeyEventKind};
@@ -211,6 +211,34 @@ impl App {
         n
     }
 
+    /// One-second dead-local-agent reconciliation cadence, independent of the
+    /// data-reload cadence. Takes `now` as a parameter (rather than reading
+    /// the clock itself) so tests can drive it with synthetic `Instant`
+    /// values. Returns true when it forced a fresh `reload_data()`/redraw.
+    fn tick_reconcile(
+        &mut self,
+        last_reconcile: &mut Instant,
+        last_reload: &mut Instant,
+        now: Instant,
+    ) -> bool {
+        if now.duration_since(*last_reconcile) < Duration::from_secs(1) {
+            return false;
+        }
+        *last_reconcile = now;
+        match self.source.reconcile_dead_instances() {
+            Ok(n) if n > 0 => {
+                self.reload_data();
+                *last_reload = now;
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                crate::log::log_warn("tui", "dead_process_reconcile", &error.to_string());
+                false
+            }
+        }
+    }
+
     /// Combined run loop: works with both inline and fullscreen viewports.
     /// Returns when the user quits or requests a viewport switch.
     pub fn run(
@@ -221,6 +249,7 @@ impl App {
         let is_inline = self.ui.view_mode == ViewMode::Inline;
         let mut dirty = true;
         let mut last_reload = std::time::Instant::now();
+        let mut last_reconcile = std::time::Instant::now();
         let mut resize_cooldown: u8 = 0;
 
         loop {
@@ -343,6 +372,15 @@ impl App {
                 dirty = true;
             }
 
+            // Reap dead local agents once a second, independent of the reload cadence.
+            if self.tick_reconcile(
+                &mut last_reconcile,
+                &mut last_reload,
+                std::time::Instant::now(),
+            ) {
+                dirty = true;
+            }
+
             // Data reload — refresh faster while launching/pending RPC, slower when idle.
             let reload_ms = if animating { 120 } else { 350 };
             if last_reload.elapsed() >= Duration::from_millis(reload_ms) {
@@ -367,6 +405,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
     use super::*;
     use crate::tui::model::{Agent, AgentStatus, OrphanProcess, Tool};
 
@@ -469,6 +511,209 @@ mod tests {
             rpc_client: None,
             bigboss: "bigboss".to_string(),
         }
+    }
+
+    // ── tick_reconcile: fake source recording call order ──────────
+
+    /// Records `load`/`reconcile_dead_instances` calls in order, and returns
+    /// queued results for `reconcile_dead_instances` (one per call, `Ok(0)`
+    /// once the queue is drained).
+    struct RecordingSource {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        reconcile_results: Rc<RefCell<VecDeque<Result<usize, String>>>>,
+    }
+
+    impl RecordingSource {
+        fn new(results: Vec<Result<usize, String>>) -> (Self, Rc<RefCell<Vec<&'static str>>>) {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let source = Self {
+                log: log.clone(),
+                reconcile_results: Rc::new(RefCell::new(VecDeque::from(results))),
+            };
+            (source, log)
+        }
+    }
+
+    impl DataSource for RecordingSource {
+        fn load(&mut self) -> DataState {
+            self.log.borrow_mut().push("load");
+            DataState::empty()
+        }
+        fn load_all_stopped(&mut self) -> Vec<Agent> {
+            vec![]
+        }
+        fn reconcile_dead_instances(&mut self) -> anyhow::Result<usize> {
+            self.log.borrow_mut().push("reconcile");
+            match self.reconcile_results.borrow_mut().pop_front() {
+                Some(Ok(n)) => Ok(n),
+                Some(Err(e)) => Err(anyhow::anyhow!(e)),
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn test_app_with_source(source: RecordingSource) -> App {
+        let mut app = test_app();
+        app.source = Box::new(source);
+        app
+    }
+
+    #[test]
+    fn tick_reconcile_no_call_before_one_second_boundary() {
+        let base = Instant::now();
+        let (source, log) = RecordingSource::new(vec![Ok(0)]);
+        let mut app = test_app_with_source(source);
+        let mut last_reconcile = base;
+        let mut last_reload = base;
+
+        for offset_ms in [0, 350, 999] {
+            let now = base + Duration::from_millis(offset_ms);
+            let forced = app.tick_reconcile(&mut last_reconcile, &mut last_reload, now);
+            assert!(!forced, "must not fire before 1s elapsed ({offset_ms}ms)");
+        }
+        assert!(
+            log.borrow().is_empty(),
+            "reconcile_dead_instances must not be called before the 1s boundary"
+        );
+    }
+
+    #[test]
+    fn tick_reconcile_fires_once_at_boundary_then_again_a_second_later() {
+        let base = Instant::now();
+        let (source, log) = RecordingSource::new(vec![Ok(0), Ok(0)]);
+        let mut app = test_app_with_source(source);
+        let mut last_reconcile = base;
+        let mut last_reload = base;
+
+        // Exactly due at 1000ms.
+        let forced = app.tick_reconcile(
+            &mut last_reconcile,
+            &mut last_reload,
+            base + Duration::from_millis(1000),
+        );
+        assert!(!forced, "Ok(0) must not force a reload");
+        assert_eq!(*log.borrow(), vec!["reconcile"]);
+        assert_eq!(last_reconcile, base + Duration::from_millis(1000));
+
+        // Just after firing (1200ms) — inside the new window, must not fire again.
+        let forced_again = app.tick_reconcile(
+            &mut last_reconcile,
+            &mut last_reload,
+            base + Duration::from_millis(1200),
+        );
+        assert!(!forced_again);
+        assert_eq!(
+            *log.borrow(),
+            vec!["reconcile"],
+            "no extra call before next boundary"
+        );
+
+        // A full second after the *last* firing (2000ms) — due again exactly once.
+        let forced_2s = app.tick_reconcile(
+            &mut last_reconcile,
+            &mut last_reload,
+            base + Duration::from_millis(2000),
+        );
+        assert!(!forced_2s);
+        assert_eq!(*log.borrow(), vec!["reconcile", "reconcile"]);
+    }
+
+    #[test]
+    fn tick_reconcile_runs_before_reload_and_deletions_force_fresh_roster() {
+        let base = Instant::now();
+        let (source, log) = RecordingSource::new(vec![Ok(2)]);
+        let mut app = test_app_with_source(source);
+        let mut last_reconcile = base;
+        let mut last_reload = base;
+
+        let now = base + Duration::from_secs(1);
+        let forced = app.tick_reconcile(&mut last_reconcile, &mut last_reload, now);
+
+        assert!(forced, "n > 0 must force a reload and dirty redraw");
+        assert_eq!(
+            *log.borrow(),
+            vec!["reconcile", "load"],
+            "reconcile must run before the reload it triggers"
+        );
+        assert_eq!(
+            last_reload, now,
+            "last_reload resets alongside the forced reload"
+        );
+    }
+
+    #[test]
+    fn tick_reconcile_failure_keeps_ui_alive_and_retries_a_full_second_later() {
+        let base = Instant::now();
+        let (source, log) = RecordingSource::new(vec![Err("db busy".to_string())]);
+        let mut app = test_app_with_source(source);
+        let mut last_reconcile = base;
+        let mut last_reload = base;
+
+        let now = base + Duration::from_secs(1);
+        let forced = app.tick_reconcile(&mut last_reconcile, &mut last_reload, now);
+
+        assert!(!forced, "a failure must not panic or force a reload");
+        assert_eq!(
+            *log.borrow(),
+            vec!["reconcile"],
+            "no reload call on failure"
+        );
+        assert_eq!(last_reload, base, "reload timer untouched on failure");
+        assert_eq!(
+            last_reconcile, now,
+            "timer still resets on failure, so the next attempt is a full second later, not an immediate retry"
+        );
+
+        // Soon after (100ms later) — still within the new window, no retry yet.
+        let soon = now + Duration::from_millis(100);
+        let forced_soon = app.tick_reconcile(&mut last_reconcile, &mut last_reload, soon);
+        assert!(!forced_soon);
+        assert_eq!(
+            *log.borrow(),
+            vec!["reconcile"],
+            "no immediate retry after a failure"
+        );
+
+        // A full second after the failed attempt — retries exactly once.
+        let retry = now + Duration::from_secs(1);
+        let forced_retry = app.tick_reconcile(&mut last_reconcile, &mut last_reload, retry);
+        assert!(!forced_retry);
+        assert_eq!(*log.borrow(), vec!["reconcile", "reconcile"]);
+    }
+
+    #[test]
+    fn tick_reconcile_viewport_reentry_uses_fresh_window_no_duplicate_firing() {
+        // run() re-entry after a viewport switch gets fresh local `last_reconcile`/
+        // `last_reload` variables (no persistent timer/thread to duplicate) — this
+        // test simulates two separate "sessions" and checks neither fires early.
+        let (source, log) = RecordingSource::new(vec![Ok(0), Ok(0)]);
+        let mut app = test_app_with_source(source);
+
+        let base1 = Instant::now();
+        let mut last_reconcile1 = base1;
+        let mut last_reload1 = base1;
+        app.tick_reconcile(
+            &mut last_reconcile1,
+            &mut last_reload1,
+            base1 + Duration::from_millis(500),
+        );
+        assert!(log.borrow().is_empty(), "not yet due in the first session");
+
+        // Viewport switch: run() returns and is re-invoked with fresh locals.
+        let base2 = Instant::now();
+        let mut last_reconcile2 = base2;
+        let mut last_reload2 = base2;
+        let forced = app.tick_reconcile(
+            &mut last_reconcile2,
+            &mut last_reload2,
+            base2 + Duration::from_millis(500),
+        );
+
+        assert!(!forced);
+        assert!(
+            log.borrow().is_empty(),
+            "re-entry must not carry over elapsed time or fire immediately"
+        );
     }
 
     // ── cursor_target: agents only ────────────────────────────────

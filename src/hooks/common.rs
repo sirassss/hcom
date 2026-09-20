@@ -1054,6 +1054,61 @@ pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
     crate::notify::wake(db, instance_name, &[crate::notify::WakeKind::Hook]);
 }
 
+/// Chỗ đặt trước lý do dừng, để một tiến trình `hcom` khác chạy
+/// `mark_dead_instances` (main.rs:72, chạy ở MỌI lệnh) không ghi đè bằng
+/// "exit:dead_process" khi nó thấy PID chết trước lúc ta kịp ghi life event.
+///
+/// Value là `<reason>|<initiated_by>|<created_at>`: tên agent là từ CVCV và
+/// được tái sử dụng, nên một key sót lại từ lần crash trước không được phép
+/// gán lý do cho một instance khác trùng tên. `session_id` không đủ để phân
+/// biệt: `hcom r <name>` resume không-fork giữ nguyên `session_id` cũ
+/// (`prior_session_id`, resume.rs), nên một claim mồ côi từ lần chạy trước
+/// (kill thua PTY/SessionEnd bỏ dở, xoá row mà không tiêu thụ claim) vẫn khớp
+/// session_id của instance mới sau resume. `created_at` là duy nhất theo
+/// vòng đời instance nên dùng nó làm khoá đối chiếu thay vì session_id.
+fn stop_reason_key(name: &str) -> String {
+    format!("stop_reason:{name}")
+}
+
+pub(crate) fn claim_stop_reason(
+    db: &HcomDb,
+    name: &str,
+    created_at: f64,
+    initiated_by: &str,
+    reason: &str,
+) {
+    let value = format!("{reason}|{initiated_by}|{created_at}");
+    // A delayed stopper must not overwrite a newer lifetime's claim.
+    let _ = db.conn().execute(
+        "INSERT OR REPLACE INTO kv (key, value)
+         SELECT ?, ? WHERE EXISTS (
+             SELECT 1 FROM instances WHERE name = ? AND created_at = ?
+         )",
+        params![stop_reason_key(name), value, name, created_at],
+    );
+}
+
+/// Read a matching claim without consuming it. The winning stop transaction
+/// deletes it together with the instance; failed or competing writers can retry.
+pub(crate) fn read_stop_reason(
+    db: &HcomDb,
+    name: &str,
+    created_at: f64,
+) -> Option<(String, String)> {
+    let key = stop_reason_key(name);
+    let raw = db.kv_get(&key).ok().flatten()?;
+    // splitn(3): created_at là phần cuối và không được phép bị cắt tiếp.
+    let mut parts = raw.splitn(3, '|');
+    let reason = parts.next()?;
+    let initiated_by = parts.next()?;
+    let claimed_created_at: f64 = parts.next()?.parse().ok()?;
+    if claimed_created_at == created_at {
+        Some((reason.to_string(), initiated_by.to_string()))
+    } else {
+        None
+    }
+}
+
 /// Stop instance: log snapshot, clean bindings, delete row.
 ///
 /// Handles: snapshot capture, session/process/notify/subscription cleanup,
@@ -1129,6 +1184,17 @@ fn stop_instance_inner(
             ));
         }
     };
+
+    // Đặt chỗ lý do trước khi có bất kỳ tín hiệu nào được gửi. Từ đây trở đi
+    // PID có thể chết bất cứ lúc nào, và mark_dead_instances của một tiến trình
+    // hcom khác có thể thắng cuộc ghi.
+    claim_stop_reason(
+        db,
+        instance_name,
+        instance_data.created_at,
+        initiated_by,
+        reason,
+    );
 
     // Kill headless processes (background=true)
     let pid = instance_data.pid;
@@ -1216,6 +1282,11 @@ fn stop_instance_inner(
                     notify_port,
                     inject_port,
                     tag: instance_data.tag.as_deref().unwrap_or(""),
+                    // This pid comes from the instance row, not from a process
+                    // this hook spawned: a sandboxed hcom running the stop path
+                    // for a host agent must not relabel the host's marker as
+                    // its own. An empty marker stays unknown.
+                    pid_namespace: Some(instance_data.pid_namespace.as_deref().unwrap_or("")),
                 });
                 log::log_info(
                     "stop",
@@ -1333,6 +1404,10 @@ fn stop_instance_inner(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
+    // ponytail: direct row deletion (e.g. PTY exit) can leave one orphan claim
+    // per name. A new lifetime's claim overwrites it, and the created_at check
+    // prevents a stale reason from being used. Keep cleanup transactional here;
+    // add a lifetime-checked orphan sweep if retained kv rows become significant.
     match db.finalize_instance_stop(
         instance_name,
         instance_data.created_at,

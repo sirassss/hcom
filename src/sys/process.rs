@@ -108,6 +108,53 @@ pub fn has_identity(pid: u32, expected: &str) -> bool {
     identity(pid).as_deref() == Some(expected)
 }
 
+/// The PID namespace this process can inspect, e.g. `pid:[4026531836]`.
+///
+/// A sandbox can have its own PID namespace while sharing hcom's DB with
+/// agents launched on the host. A PID is only interpretable inside the
+/// namespace it was observed in: [`is_alive`] on a PID from a foreign
+/// namespace names a different process, or none at all.
+///
+/// `None` on platforms without PID namespaces — callers then have nothing to
+/// compare and fall back to the bare liveness probe.
+///
+/// Read once: a process cannot change its own PID namespace (`setns` affects
+/// children, not the caller), and this is on the TUI's per-row reload path.
+pub fn current_pid_namespace() -> Option<&'static str> {
+    static NAMESPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAMESPACE
+        .get_or_init(|| {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                std::fs::read_link("/proc/self/ns/pid")
+                    .ok()
+                    .and_then(|path| path.into_os_string().into_string().ok())
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                None
+            }
+        })
+        .as_deref()
+}
+
+/// Liveness of `pid` as observed from the namespace it was recorded in.
+///
+/// `None` means this process cannot establish anything: `observed_in` is a
+/// namespace it cannot inspect, so a negative [`is_alive`] here is not evidence
+/// that the process exited. Every caller treats `None` the same way — only
+/// `Some(false)` may drive a removal — so a sandboxed hcom sharing the host's
+/// state never unlinks a live host agent.
+pub fn is_alive_in(pid: u32, observed_in: Option<&str>) -> Option<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if observed_in != current_pid_namespace() {
+        return None;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = observed_in;
+    Some(is_alive(pid))
+}
+
 /// Whether a process with the given PID is currently alive.
 ///
 /// Unix: `kill(pid, 0)`, treating `EPERM` (the process exists but is owned by

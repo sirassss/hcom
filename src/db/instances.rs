@@ -43,6 +43,10 @@ pub struct InstanceRow {
     pub hints: Option<String>,
     pub origin_device_id: Option<String>,
     pub pid: Option<i64>,
+    /// PID namespace `pid` was observed in (see
+    /// [`crate::sys::process::current_pid_namespace`]). `None` for rows written
+    /// before this column existed, or on platforms without PID namespaces.
+    pub pid_namespace: Option<String>,
     pub launch_args: Option<String>,
     pub terminal_preset_requested: Option<String>,
     pub terminal_preset_effective: Option<String>,
@@ -107,6 +111,9 @@ impl InstanceRow {
                 .get::<_, Option<String>>("origin_device_id")?
                 .filter(|s| !s.is_empty()),
             pid: row.get::<_, Option<i64>>("pid")?,
+            pid_namespace: row
+                .get::<_, Option<String>>("pid_namespace")?
+                .filter(|s| !s.is_empty()),
             launch_args: row
                 .get::<_, Option<String>>("launch_args")?
                 .filter(|s| !s.is_empty()),
@@ -227,11 +234,18 @@ impl HcomDb {
         Ok(rows > 0)
     }
 
-    /// Update instance PID after spawn
+    /// Update instance PID after spawn, stamping the namespace it was observed
+    /// in. The caller spawned this process, so its own namespace is the right
+    /// one; a caller copying a PID observed elsewhere must use
+    /// [`Self::update_instance_fields`] with an explicit `pid_namespace`.
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET pid = ? WHERE name = ?",
-            params![pid as i64, name],
+            "UPDATE instances SET pid = ?, pid_namespace = ? WHERE name = ?",
+            params![
+                pid as i64,
+                crate::sys::process::current_pid_namespace().unwrap_or_default(),
+                name
+            ],
         )?;
         Ok(())
     }
@@ -428,20 +442,88 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
+        self.finalize_instance_stop_impl(name, created_at, session_id, agent_id, None, event_data)
+    }
+
+    /// Same as [`Self::finalize_instance_stop`], but the delete additionally
+    /// requires the instance's *current* `pid`/`status` to still match
+    /// `expected_pid`/`expected_status`.
+    ///
+    /// A dead-process reaper reads a PID snapshot, probes it out-of-band, and
+    /// only then decides to finalize — so identity (name/created_at/session/
+    /// agent) alone isn't enough: the row could have been rebound or resumed
+    /// with a *new* live PID under the same identity in between. The guard
+    /// makes that race a no-op (`Ok(false)`) instead of deleting a live row.
+    // Every parameter names a distinct part of the identity/liveness CAS;
+    // bundling them into a struct would just move the same count elsewhere.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_instance_stop_guarded(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        expected_pid: Option<i64>,
+        expected_status: &str,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
+        self.finalize_instance_stop_impl(
+            name,
+            created_at,
+            session_id,
+            agent_id,
+            Some((expected_pid, expected_status)),
+            event_data,
+        )
+    }
+
+    fn finalize_instance_stop_impl(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid_status_guard: Option<(Option<i64>, &str)>,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
         let timestamp = chrono_now_iso();
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
-            let deleted = tx.execute(
-                "DELETE FROM instances
-                 WHERE name = ? AND created_at = ?
-                   AND session_id IS ? AND agent_id IS ?",
-                params![name, created_at, session_id, agent_id],
-            )?;
+            let deleted = if let Some((expected_pid, expected_status)) = pid_status_guard {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?
+                       AND pid IS ? AND status = ?",
+                    params![
+                        name,
+                        created_at,
+                        session_id,
+                        agent_id,
+                        expected_pid,
+                        expected_status
+                    ],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?",
+                    params![name, created_at, session_id, agent_id],
+                )?
+            };
             if deleted == 0 {
                 return Ok(false);
             }
+
+            // Consume the claim only with the winning event/delete. A failed
+            // event write rolls it back, and a later lifetime cannot lose its claim.
+            tx.execute(
+                "DELETE FROM kv WHERE key = ?",
+                params![format!("stop_reason:{name}")],
+            )?;
 
             // Defense-in-depth: `session_bindings.instance_name` already has
             // ON DELETE CASCADE from `instances`, so this is redundant here,
@@ -757,6 +839,9 @@ impl HcomDb {
         name: &str,
         data: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<bool> {
+        let patched = Self::with_pid_namespace(data);
+        let data = patched.as_ref().unwrap_or(data);
+
         // Build column list and values dynamically
         let mut cols = vec!["name"];
         let mut placeholders = vec!["?"];
@@ -823,6 +908,8 @@ impl HcomDb {
         if updates.is_empty() {
             return Ok(());
         }
+        let patched = Self::with_pid_namespace(updates);
+        let updates = patched.as_ref().unwrap_or(updates);
 
         let mut set_parts = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -842,6 +929,32 @@ impl HcomDb {
         let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, refs.as_slice())?;
         Ok(())
+    }
+
+    /// A PID is only interpretable together with the PID namespace it was
+    /// observed in, so every write of `pid` carries its namespace and no later
+    /// writer can leave the two out of sync. Returns a patched copy, or `None`
+    /// when there is nothing to add: either the write does not touch `pid`, or
+    /// the caller already supplied a `pid_namespace` because it is copying a
+    /// PID some *other* process observed (see the placeholder migration in
+    /// `crate::instance_binding`).
+    ///
+    /// Clearing `pid` clears the namespace with it.
+    fn with_pid_namespace(
+        data: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let pid = data.get("pid")?;
+        if data.contains_key("pid_namespace") {
+            return None;
+        }
+        let namespace = if pid.is_null() {
+            ""
+        } else {
+            crate::sys::process::current_pid_namespace().unwrap_or_default()
+        };
+        let mut patched = data.clone();
+        patched.insert("pid_namespace".into(), serde_json::json!(namespace));
+        Some(patched)
     }
 
     /// Validate column name against SQL injection (whitelist of known columns).
@@ -872,6 +985,7 @@ impl HcomDb {
             "hints",
             "origin_device_id",
             "pid",
+            "pid_namespace",
             "launch_args",
             "launch_context",
             "name_announced",
@@ -1227,6 +1341,255 @@ mod tests {
         assert_eq!(db.get_session_binding("uuid-a").unwrap(), None);
         assert_eq!(db.get_session_binding("uuid-b").unwrap(), None);
         assert!(db.get_instance_full("zilo").unwrap().is_none());
+
+        cleanup_test_db(db_path);
+    }
+
+    fn insert_basic_instance(db: &HcomDb, name: &str, status: &str, pid: i64, created_at: f64) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, pid, last_event_id)
+                 VALUES (?, 'claude', ?, 'start', 0, ?, ?, 0)",
+                params![name, status, created_at, pid],
+            )
+            .unwrap();
+    }
+
+    fn life_event_count(db: &HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn finalize_instance_stop_guarded_rejects_stale_created_at() {
+        let (db, db_path) = setup_full_test_db();
+        insert_basic_instance(&db, "mochi", "active", 111, 1.0);
+
+        // A resume replaces the row under the same name with a new lifetime.
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 2.0 WHERE name = 'mochi'",
+                [],
+            )
+            .unwrap();
+
+        let won = db
+            .finalize_instance_stop_guarded(
+                "mochi",
+                1.0, // stale created_at read before the resume
+                None,
+                None,
+                Some(111),
+                "active",
+                &serde_json::json!({"action": "stopped"}),
+            )
+            .unwrap();
+        assert!(!won, "stale created_at must not finalize the resumed row");
+        assert!(db.get_instance_full("mochi").unwrap().is_some());
+        assert_eq!(life_event_count(&db, "mochi"), 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_instance_stop_guarded_rejects_stale_pid_or_status() {
+        let (db, db_path) = setup_full_test_db();
+        insert_basic_instance(&db, "poko", "active", 222, 5.0);
+
+        // Rebound to a new PID before the reaper's guarded finalize runs.
+        db.conn()
+            .execute("UPDATE instances SET pid = 333 WHERE name = 'poko'", [])
+            .unwrap();
+        let stale_pid = db
+            .finalize_instance_stop_guarded(
+                "poko",
+                5.0,
+                None,
+                None,
+                Some(222),
+                "active",
+                &serde_json::json!({"action": "stopped"}),
+            )
+            .unwrap();
+        assert!(
+            !stale_pid,
+            "stale pid guard must not finalize a rebound row"
+        );
+        assert!(db.get_instance_full("poko").unwrap().is_some());
+
+        // Status changed (e.g. active -> listening) before finalize runs.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening' WHERE name = 'poko'",
+                [],
+            )
+            .unwrap();
+        let stale_status = db
+            .finalize_instance_stop_guarded(
+                "poko",
+                5.0,
+                None,
+                None,
+                Some(333),
+                "active",
+                &serde_json::json!({"action": "stopped"}),
+            )
+            .unwrap();
+        assert!(
+            !stale_status,
+            "stale status guard must not finalize a re-statused row"
+        );
+        assert!(db.get_instance_full("poko").unwrap().is_some());
+
+        // Matching the row's *current* pid/status wins.
+        let won = db
+            .finalize_instance_stop_guarded(
+                "poko",
+                5.0,
+                None,
+                None,
+                Some(333),
+                "listening",
+                &serde_json::json!({"action": "stopped"}),
+            )
+            .unwrap();
+        assert!(won);
+        assert!(db.get_instance_full("poko").unwrap().is_none());
+        assert_eq!(life_event_count(&db, "poko"), 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_instance_stop_guarded_rolls_back_on_event_insert_failure() {
+        let (db, db_path) = setup_full_test_db();
+        insert_basic_instance(&db, "ren", "active", 444, 9.0);
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_life_guarded BEFORE INSERT ON events
+                 WHEN NEW.type = 'life' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+
+        let result = db.finalize_instance_stop_guarded(
+            "ren",
+            9.0,
+            None,
+            None,
+            Some(444),
+            "active",
+            &serde_json::json!({"action": "stopped"}),
+        );
+        assert!(
+            result.is_err(),
+            "event insert failure must surface as Err, not a false no-op"
+        );
+        assert!(
+            db.get_instance_full("ren").unwrap().is_some(),
+            "the delete must roll back together with the failed event insert"
+        );
+
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_life_guarded")
+            .unwrap();
+        let won = db
+            .finalize_instance_stop_guarded(
+                "ren",
+                9.0,
+                None,
+                None,
+                Some(444),
+                "active",
+                &serde_json::json!({"action": "stopped"}),
+            )
+            .unwrap();
+        assert!(won);
+        assert_eq!(
+            life_event_count(&db, "ren"),
+            1,
+            "retrying after the trigger is gone must publish exactly one event"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_instance_stop_race_pty_then_reaper_yields_one_event() {
+        let (db, db_path) = setup_full_test_db();
+        insert_basic_instance(&db, "kobi", "active", 555, 3.0);
+
+        // PTY exit finalizer (unguarded) wins first.
+        let pty_won = db
+            .finalize_instance_stop(
+                "kobi",
+                3.0,
+                None,
+                None,
+                &serde_json::json!({"action": "stopped", "reason": "pty_exit"}),
+            )
+            .unwrap();
+        assert!(pty_won);
+
+        // The reaper detects the same dead PID a moment later and races in.
+        let reaper_won = db
+            .finalize_instance_stop_guarded(
+                "kobi",
+                3.0,
+                None,
+                None,
+                Some(555),
+                "active",
+                &serde_json::json!({"action": "stopped", "reason": "exit:dead_process"}),
+            )
+            .unwrap();
+        assert!(
+            !reaper_won,
+            "the losing side must see a normal no-op, not an error"
+        );
+        assert_eq!(life_event_count(&db, "kobi"), 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_instance_stop_race_reaper_then_pty_yields_one_event() {
+        let (db, db_path) = setup_full_test_db();
+        insert_basic_instance(&db, "sula", "active", 666, 4.0);
+
+        // The reaper (guarded) wins the race this time.
+        let reaper_won = db
+            .finalize_instance_stop_guarded(
+                "sula",
+                4.0,
+                None,
+                None,
+                Some(666),
+                "active",
+                &serde_json::json!({"action": "stopped", "reason": "exit:dead_process"}),
+            )
+            .unwrap();
+        assert!(reaper_won);
+
+        // PTY exit finalizer arrives after; the row is already gone.
+        let pty_won = db
+            .finalize_instance_stop(
+                "sula",
+                4.0,
+                None,
+                None,
+                &serde_json::json!({"action": "stopped", "reason": "pty_exit"}),
+            )
+            .unwrap();
+        assert!(
+            !pty_won,
+            "the losing side must see a normal no-op, not an error"
+        );
+        assert_eq!(life_event_count(&db, "sula"), 1);
 
         cleanup_test_db(db_path);
     }

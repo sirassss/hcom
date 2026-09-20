@@ -140,6 +140,9 @@ pub fn kill_tracked_instance(
         .pid
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
     let is_headless = inst.background != 0;
+    // kill_instance() gửi SIGTERM ngay bên dưới; đặt chỗ trước đó, vì
+    // stop_instance() chỉ chạy sau khi tiến trình đã có thể chết.
+    crate::hooks::common::claim_stop_reason(db, name, inst.created_at, initiator, "killed");
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless);
     stop_instance(db, name, initiator, "killed");
@@ -335,6 +338,15 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
+            // kill_instance() sends SIGTERM below; claim before it, since
+            // stop_instance() only runs after the process may already be dead.
+            crate::hooks::common::claim_stop_reason(
+                db,
+                &inst.name,
+                inst.created_at,
+                initiator,
+                "killed",
+            );
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -446,6 +458,15 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     for inst in &tagged {
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
+            // kill_instance() sends SIGTERM below; claim before it, since
+            // stop_instance() only runs after the process may already be dead.
+            crate::hooks::common::claim_stop_reason(
+                db,
+                &inst.name,
+                inst.created_at,
+                initiator,
+                "killed",
+            );
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -872,5 +893,49 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("unexpected kill_result mystery"));
+    }
+
+    // `kill_all`/`kill_by_tag`/`kill_tracked_instance` each call
+    // `kill_instance()` (sends the real SIGTERM) and then their own
+    // `stop_instance()` right after, in the same synchronous call. That
+    // second call already passes the correct reason/initiator
+    // unconditionally, so no single-threaded, single-process test of the
+    // final DB state can tell "claimed before the signal" apart from "claimed
+    // after" or "never claimed" — the bug this guards against only shows up
+    // when a *different* hcom process's mark_dead_instances races in during
+    // the window between the real SIGTERM and this process's own
+    // stop_instance() call, which needs real, slow-to-die processes to
+    // reproduce. `mark_dead_prefers_claimed_stop_reason` (instance_lifecycle.rs)
+    // already covers "a claim, once written, is what mark_dead_instances
+    // reports" — what's specific to these call sites is that the claim
+    // happens before the signal at all. `kill_tracked_instance` is the
+    // single-target path the original bug report is about; it was otherwise
+    // guarded only by a real-tool test that is not in CI. Pin that ordering
+    // directly instead of writing a DB-outcome test that would still pass
+    // with the claim deleted.
+    #[test]
+    fn kill_all_and_kill_by_tag_claim_stop_reason_before_kill_instance() {
+        let src = include_str!("kill.rs");
+        for fn_name in [
+            "fn kill_tracked_instance(",
+            "fn kill_all(",
+            "fn kill_by_tag(",
+        ] {
+            let fn_start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} not found in kill.rs"));
+            let body = &src[fn_start..];
+            let claim_pos = body.find("claim_stop_reason(").unwrap_or_else(|| {
+                panic!("{fn_name}: no claim_stop_reason(...) call found in its body")
+            });
+            let kill_pos = body
+                .find("kill_instance(db")
+                .unwrap_or_else(|| panic!("{fn_name}: no kill_instance(...) call found"));
+            assert!(
+                claim_pos < kill_pos,
+                "{fn_name}: claim_stop_reason must be called before kill_instance sends \
+                 the signal (claim at byte {claim_pos}, kill_instance at byte {kill_pos})"
+            );
+        }
     }
 }
