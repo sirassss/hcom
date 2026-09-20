@@ -385,23 +385,23 @@ Output test phải bảo đảm các state không quan sát được không dùn
 
 ### TUI lifecycle
 
-1. Local `active` instance với dead PID biến mất khỏi TUI đang mở mà không restart.
-2. Local `listening` instance với dead PID cũng biến mất.
-3. Live PID không bị xóa qua nhiều cadence.
-4. Remote, PID-less, `launching` và `inactive` rows giữ contract hiện có.
-5. PTY cleanup trước TUI reaper và thứ tự ngược lại đều idempotent.
-6. Reaper failure không làm TUI crash.
-7. Dead row được loại khỏi visible roster trong mục tiêu tối đa khoảng hai giây.
-8. Life event dùng `exit:dead_process` và cho biết detector.
+1. Local `active` instance với dead PID biến mất khỏi TUI đang mở mà không restart. (verified: fixture test, `src/tui/db.rs::db_source_reconcile_removes_dead_active_and_listening_rows_via_trait`; also `src/instance_lifecycle.rs::reconcile_dead_instances_removes_only_dead_local_active_or_listening_rows`)
+2. Local `listening` instance với dead PID cũng biến mất. (verified: same two tests as (1), which cover the listening row alongside the active row)
+3. Live PID không bị xóa qua nhiều cadence. (verified: fixture test, `src/tui/db.rs::db_source_reconcile_keeps_live_pid_row_across_repeated_calls` — calls `reconcile_dead_instances()` through the `DataSource` trait 3 times, row survives every pass)
+4. Remote, PID-less, `launching` và `inactive` rows giữ contract hiện có. (verified: full matrix at Task 1's `src/instance_lifecycle.rs::reconcile_dead_instances_removes_only_dead_local_active_or_listening_rows`; a lighter representative pass through the `DataSource` interface at `src/tui/db.rs::db_source_reconcile_skips_remote_and_pidless_rows_via_trait` covers remote + PID-less)
+5. PTY cleanup trước TUI reaper và thứ tự ngược lại đều idempotent. (verified: Task 1 unit tests, `src/instance_lifecycle.rs` — identity/liveness-guarded `finalize_instance_stop_guarded` cascade tests; not re-tested through the `DataSource` interface in Task 4, same coverage applies)
+6. Reaper failure không làm TUI crash. (verified: Task 3 unit test, `src/tui/app.rs::tick_reconcile_failure_keeps_ui_alive_and_retries_a_full_second_later` — an `Err` from the data source does not panic or force a reload, and retries a full second later)
+7. Dead row được loại khỏi visible roster trong mục tiêu tối đa khoảng hai giây. (PARTIALLY verified: fixture test `src/tui/db.rs::db_source_reconcile_dead_pid_row_completes_well_under_budget` times a real `reconcile_dead_instances()` fixture-DB call at well under 500ms — this only demonstrates the DB-layer half of the budget is cheap; it does NOT measure real wall-clock TUI behavior (terminal I/O, the 1s cadence timer, redraw jitter, real process-death latency). The full <=2s budget as observed in a live TUI is UNVERIFIED — no live-terminal test run this session; no owner go-ahead was given to kill a real process, per this plan's Global Constraint)
+8. Life event dùng `exit:dead_process` và cho biết detector. (verified: `src/instance_lifecycle.rs::reconcile_dead_instances_removes_only_dead_local_active_or_listening_rows` asserts `reason == "exit:dead_process"` and `detector == "tui"`; also asserted directly through the `DataSource` interface at `src/tui/db.rs::db_source_reconcile_removes_dead_active_and_listening_rows_via_trait`)
 
 Acceptance end-to-end:
 
-1. Mở hcom TUI và một Codex agent.
-2. Xác nhận cả trường hợp agent đang `active` và `listening`.
-3. Kill terminal/process group.
-4. Xác nhận PID đã chết.
-5. Xác nhận row tự biến mất khỏi TUI mà không thoát/mở lại TUI.
-6. Lặp lại với tab detach nhưng PID còn sống; row phải còn.
+1. Mở hcom TUI và một Codex agent. (UNVERIFIED this session — no real terminal/live Codex agent was used; not attempted)
+2. Xác nhận cả trường hợp agent đang `active` và `listening`. (UNVERIFIED this session in a live TUI — the equivalent DB-level outcome is verified by fixture tests per criteria 1-2 above, but not observed in a real running TUI)
+3. Kill terminal/process group. (UNVERIFIED — no live-process-kill test run this session; no owner go-ahead was given to kill a real process, per this plan's Global Constraint against stopping/killing real agents without explicit go-ahead)
+4. Xác nhận PID đã chết. (UNVERIFIED — depends on step 3, not attempted for the same reason)
+5. Xác nhận row tự biến mất khỏi TUI mà không thoát/mở lại TUI. (UNVERIFIED in a live TUI — depends on steps 3-4; the underlying reconcile-and-reload mechanism is verified by fixture tests, see criteria 1-2 and 7 above, and Task 3's `tick_reconcile` tests in `src/tui/app.rs`)
+6. Lặp lại với tab detach nhưng PID còn sống; row phải còn. (UNVERIFIED in a live TUI for the same reason as steps 3-5; the underlying live-PID-survives behavior is verified by fixture test, see criterion 3 above)
 
 ## File touch list cho implementation plan sau này
 

@@ -1764,7 +1764,7 @@ Two constraints the probe has to respect:
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-08-agy-wake-design.md` (the D3 section)
 
-- [ ] **Step 1: Build the probe hooks**
+- [x] **Step 1: Build the probe hooks**
 
 Both hooks log every invocation with entry and exit timestamps — Q1 is read off that log, not inferred. The `Stop` hook caps its own continues so the measurement cannot hang.
 
@@ -1814,7 +1814,7 @@ SH
 chmod +x /tmp/agy-stop-probe/stop.sh /tmp/agy-stop-probe/pre.sh
 ```
 
-- [ ] **Step 2: Point a scratch agy config at them**
+- [x] **Step 2: Point a scratch agy config at them**
 
 `GEMINI_CLI_HOME` is a raw prefix; hcom and agy both append `.gemini` (`runtime_env.rs:50-56`). This is the same `hooks.json` hcom's own installer writes and removes (`antigravity.rs:68-75`), so the scratch config exercises a path agy really reads.
 
@@ -1836,7 +1836,7 @@ cat > /tmp/agy-stop-probe/home/.gemini/config/hooks.json <<'JSON'
 JSON
 ```
 
-- [ ] **Step 3: Confirm the scratch config is actually loaded**
+- [x] **Step 3: Confirm the scratch config is actually loaded**
 
 Before measuring anything, prove the probe is wired — otherwise every later "no" is indistinguishable from "the hooks never ran".
 
@@ -1852,7 +1852,7 @@ cat /tmp/agy-stop-probe/log
 
 Expected: at least a `pre#1` line. No lines at all means **the probe is not wired** — nothing more. It does not show that a vanilla agy has no hook surface: the plugin route (`~/.gemini/config/plugins/hcom/hooks/hooks.json`) demonstrably works, so a scratch `hooks.json` that agy ignores is a fact about this scaffold. Record it as *inconclusive*, then retry through the plugin directory of the scratch home before drawing any D3 conclusion. Every later "no" in this task is only readable once this step says yes.
 
-- [ ] **Step 4: Answer Q1 and Q2**
+- [x] **Step 4: Answer Q1 and Q2**
 
 ```bash
 rm -f /tmp/agy-stop-probe/log /tmp/agy-stop-probe/*.count
@@ -1865,7 +1865,7 @@ Record: **Q1** — pair the `stop#1` line with its `stop#1-exit` line. Both pres
 
 **Q2** — did the TUI start another turn after the hook returned `continue`, or did the session end? A `pre#2` line whose `after_stops=1` is preceded by a `stop#1-exit decision=continue` corroborates it. `after_stops` counts hook *entries*, not successful returns, so it is read together with that exit line, never on its own.
 
-- [ ] **Step 5: Answer Q3 — is there a loop guard?**
+- [x] **Step 5: Answer Q3 — is there a loop guard?**
 
 ```bash
 rm -f /tmp/agy-stop-probe/log /tmp/agy-stop-probe/*.count
@@ -1874,7 +1874,7 @@ GEMINI_CLI_HOME=/tmp/agy-stop-probe/home PROBE_SLEEP=1 agy
 
 Send one message and let it run. Record how many `decision=continue` lines agy honoured before stopping anyway. A `decision=allow (probe cap)` line means agy honoured all three and the probe stopped first — agy's own guard, if any, is above 3.
 
-- [ ] **Step 6: Answer Q4 — does the woken turn deliver?**
+- [x] **Step 6: Answer Q4 — does the woken turn deliver?**
 
 Same run as Step 5. Three records, and they answer different things:
 
@@ -1882,11 +1882,11 @@ Same run as Step 5. Three records, and they answer different things:
 - `pre#2` present, with a `stop#N-exit decision=continue` before it and no user submission in between: a turn ran and followed a `Stop` that actually returned `continue`. That correlation is corroboration for a woken turn, not proof — `after_stops` counts entries, so the exit line is the half that matters.
 - The reply: the marker asks for an exact echo, so `PROBE_DELIVERED` in the reply is delivery. Its **absence is inconclusive, not proof of failure** — a model can be handed an ephemeral message and answer something else. If the echo is missing while `pre#2` is present, re-run before concluding, and record it as unconfirmed transport rather than absent transport.
 
-- [ ] **Step 7: Record the answers in the spec**
+- [x] **Step 7: Record the answers in the spec**
 
 Replace the four numbered questions in D3 with the measured answers and their date, then write the acceptance criteria for whichever branch the measurement supports — a blocking `handle_sessionend` if all four hold, or a plain statement at `hcom start` that a vanilla agy will not wake if any fails. Note explicitly if Q1 came back at agy's default rather than the configured timeout: that caps how long a blocking Stop can wait and belongs in the design, not just the log.
 
-- [ ] **Step 8: Clean up and commit**
+- [x] **Step 8: Clean up and commit** (cleanup done; commit left for user review)
 
 ```bash
 rm -rf /tmp/agy-stop-probe

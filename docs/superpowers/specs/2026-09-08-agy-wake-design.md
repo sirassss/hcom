@@ -130,7 +130,7 @@ The last two rows are what the current code loses. Every read failure funnels th
 
 ## D3 — a vanilla `agy` that joins with `hcom start` has no wake path at all
 
-Not yet measured; carried from the issue doc and consistent with the code.
+Measured 2026-09-20 on agy 1.2.7, interactive TUI, probe hooks per Task 9. All four questions hold.
 
 Wake for Antigravity lives entirely in the PTY delivery loop (`delivery.rs:1746+`), which only runs for an agent hcom launched. An agent started by hand and joined with `hcom start` has `bindings: hooks` and no delivery loop, so nothing injects into its TUI. Claude covers this case with a blocking `hcom poll` in its Stop hook; Antigravity has no equivalent.
 
@@ -138,22 +138,41 @@ This is a separate defect from D1 and must not be bundled with it: D1 is a broke
 
 ### Design
 
-Measure first, then choose. The probe has to be an **interactive** agy session: `agy -p` is print mode — it runs one turn and exits, so it cannot show whether a `Stop` decision starts a *second* turn, which is the whole question. Hooks still load from `~/.gemini/config/hooks.json` (the file hcom's own installer writes and removes, `antigravity.rs:68-75`), so a scratch `GEMINI_CLI_HOME` carries a probe manifest without touching the real config.
+Measure first, then choose. The probe has to be an **interactive** agy session: `agy -p` is print mode — it runs one turn and exits, so it cannot show whether a `Stop` decision starts a *second* turn, which is the whole question. Hooks load from `~/.gemini/config/hooks.json`.
+
+**Correction to the isolation plan:** the probe was designed around a scratch `GEMINI_CLI_HOME`, on the assumption that agy resolves its config directory the same way hcom's installer does (`antigravity.rs:68-75`, `runtime_env.rs:50-56`). That assumption is wrong for the binary itself — `strings $(which agy) | grep GEMINI_CLI_HOME` matches nothing; the string is not in the binary. A scratch `GEMINI_CLI_HOME` was confirmed inert: `agy` ran a full turn against it and wrote nothing under it, while reading plugins and skills from the real `~/.gemini`. agy resolves its config home from the process `HOME` (Go `os.UserHomeDir()`); overriding `HOME` instead produced the unauthenticated first-run screen, confirming `HOME` is the actual variable. Isolation therefore requires an `HOME` override, with the real `~/.gemini` (auth included) copied into the scratch home and only `config/hooks.json` replaced — not a `GEMINI_CLI_HOME` override. `runtime_env.rs:50-56`'s `GEMINI_CLI_HOME` handling is real and used by hcom's own installer/uninstaller; it just isn't consulted by agy's own runtime, so it does not help isolate a hand-run probe session.
+
+A second confound surfaced on the first interactive run and is worth recording for whoever re-runs this: with the real `~/.gemini/config/plugins/superpowers` and `~/.gemini/GEMINI.md` present in the scratch home (copied along with auth), a single first turn ("say hi") drove 15 `PreInvocation` cycles before any `Stop` fired — the model used tool calls to inspect the probe's own files unprompted. That demonstrates `PreInvocation` fires per tool-invocation step *within* one user turn, not once per turn, which the probe's turn-counting `n >= 2` marker gate does not distinguish from a woken turn on its own — only the `after_stops` field (which counts `Stop` *entries*, tied to `decision=continue` lines) disambiguates them. The clean runs below removed `plugins/` and `GEMINI.md` from the scratch home first.
 
 The measurement, on a hand-started `agy`:
 
 1. Does agy honour a `timeout` larger than its 30s default on a `Stop` hook? (`HOOK_TIMEOUT_SEC = 15` today, `antigravity.rs:127`.)
+
+   **Yes, to at least 48s.** `stop#1 entered=1789913657` paired with `stop#1-exit at=1789913705 decision=continue`, a run with `PROBE_SLEEP=45`. The 120s configured timeout was not established — only the 48s actually slept was proven. Pinning the true ceiling needs a higher `PROBE_SLEEP` paired with an independent timeout observation (agy's own diagnostic, or a process watch), which this run did not attempt.
+
 2. Does returning `{"decision":"continue"}` from `Stop` start a new turn? (`antigravity.rs:119-120` claims any value other than `continue` allows the stop — this is a code comment, not a measurement.)
+
+   **Yes.** In both the `PROBE_SLEEP=1` and `PROBE_SLEEP=45` runs, `pre#N` (`after_stops` incremented) is logged in the same second as the preceding `stop#(N-1)-exit ... decision=continue`, with no user submission between them — e.g. `stop#1-exit at=1789913705 decision=continue` immediately followed by `pre#2 injected marker at 1789913705 after_stops=1`.
+
 3. Is there a loop guard limiting consecutive continues?
+
+   **Not established above 3.** agy honoured all three `decision=continue` responses the probe emitted (`stop#1`, `stop#2`, `stop#3`), and the probe's own cap fired first (`stop#4-exit ... decision=allow (probe cap)`). Whether agy has an internal guard, and where, is unmeasured past that bound — this run cannot distinguish "no guard" from "guard above 3".
+
 4. Does the new turn run `PreInvocation`, so `gemini-beforeagent` can deliver via `injectSteps[*].ephemeralMessage` (`gemini.rs:702-730`)?
+
+   **Yes, confirmed transport, not just correlation.** In the `PROBE_SLEEP=1` run the TUI showed three separate `PROBE_DELIVERED` replies verbatim, each one the sole content of a turn whose `pre#N` (`after_stops=1,2,3`) was immediately preceded by a `stop#(N-1)-exit ... decision=continue` line.
 
 Q4 needs a marker only a *woken* turn can produce. `PreInvocation` fires on the first turn too, before any `Stop` has run, so seeing the marker proves nothing by itself. The probe counts its own invocations in a file and injects the marker from turn 2 onward; a reply mentioning it then means the turn that saw it was started by the `Stop` decision, which is the claim under test.
 
 The probe must also be able to stop. A hook that always returns `continue` loops for as long as agy allows — that is Q3's answer, and also a way to hang the measurement. Cap the continues the probe emits, and log every invocation with its own entry and exit timestamps, so Q1 is read off the log instead of inferred.
 
-If all four hold: `handle_sessionend` blocks for pending messages up to the measured timeout and returns `continue` when one arrives — the Claude Stop-hook shape, expressed in agy's protocol. If any fails: `hcom start` on a vanilla agy states plainly that it will not wake on its own, and the instance carries that fact where `hcom list` shows it, so a coordinator does not read `listening` as "will act".
+**All four hold, so `handle_sessionend` blocks for pending messages up to the measured timeout and returns `continue` when one arrives** — the Claude Stop-hook shape, expressed in agy's protocol. The implementation should:
 
-**Acceptance depends on the branch taken** and is written when the measurement lands.
+- Block only up to a timeout at or below the ~48s floor actually measured, not the 120s configured-but-unproven figure, until a follow-up run pins the real ceiling (open item, not blocking — Q1 above).
+- Not assume a specific continue-count ceiling from agy itself (Q3 unmeasured past 3); if hcom's own loop needs a cap for its blocking `hcom poll`, that cap must come from hcom's side, not from an assumed agy guard.
+- Use the `HOME`-override isolation approach above (not `GEMINI_CLI_HOME`) for any future probe or test harness targeting a hand-started agy.
+
+**Acceptance:** a hand-started `agy` joined via `hcom start`, running `handle_sessionend` as a blocking `Stop` hook, receives a queued message via `PreInvocation`'s `injectSteps[*].ephemeralMessage` on the turn immediately following a `continue` decision, with no user action in between — mirroring the measurement above. Acceptance does not require a specific timeout or continue-count value; both are read from configuration, not hardcoded to the figures measured here.
 
 ---
 

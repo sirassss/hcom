@@ -6,7 +6,17 @@ phát hiện khi chạy lại `real_tool_claude` (bản pinned Claude Code 2.1.2
 lỗ hổng plugin-install trong test harness (xem commit `f46552d`). Bug này có thể đã tồn tại từ
 lâu — CI trước giờ chưa từng chạy tới đoạn code này vì luôn fail sớm hơn ở bước cài hook.
 
-`type: BUG` (đã reproduce cục bộ 3/3 lần, chưa raise task, chưa quyết hướng fix)
+`type: BUG`
+
+**TRẠNG THÁI: ĐÃ FIX** (2026-09-17, trên `feat/siras/develop`, **chưa push**).
+Claim `<reason>|<initiated_by>|<created_at>` vào bảng `kv` trước khi gửi tín hiệu; guard đặt ở
+`stop_instance_inner` nên phủ mọi caller, cộng 3 điểm trong `kill.rs` nơi tín hiệu đi trước.
+Commit `b3bdb4d`, `f3d5305`, `08f018a`, và `b58c4a0` (mila: gộp việc dọn claim vào transaction
+của `finalize_instance_stop`, và chặn stopper cũ ghi đè claim của lifetime mới).
+Regression thật `real_claude_full_lifecycle_send_fork_kill_resume_and_cleanup` pass 3/3.
+
+Còn nợ có chủ đích: một orphan claim mỗi tên khi row bị xoá thẳng (PTY exit) — xem comment
+`ponytail:` tại `src/hooks/common.rs:1402`, có ghi trần và đường nâng cấp.
 
 ---
 
@@ -63,15 +73,100 @@ nhưng không phải chỉ xảy ra trong test: bất kỳ ai chạy TUI hcom ho
 thay vì `killed`), có thể ảnh hưởng logic downstream nào đang phân biệt hai reason này (chưa rà
 soát hết).
 
-## Gợi ý hướng fix (chưa quyết, chưa raise task)
+## Hướng fix (đã rà xong, 2026-09-16)
 
-- `mark_dead_instances` nên bỏ qua/deprioritize instance khi có một `kill`/`stop` đang chạy dở —
-  cần cờ "in-flight stop" (ví dụ ghi trạng thái tạm trước khi gửi SIGTERM) mà `mark_dead_instances`
-  kiểm tra trước khi tự ý ghi đè.
-- Hoặc: gộp bước "kill" + "record reason" thành một transaction/khoá ở tầng DB để loại race
-  triệt để, thay vì chỉ giảm cửa sổ.
-- Cần hiểu rõ hơn các nơi khác đang đọc field reason này trước khi chọn hướng, nên để nguyên
-  chưa tự vá.
+### Trước hết: reason này có ai đọc không?
+
+`grep -rn "exit:reboot" src/ tests/` → **đúng một hit**, chính chỗ ghi
+(`instance_lifecycle.rs:963`). Chiều ngược lại, `grep -rn '"killed"' src/ tests/` cho hai chỗ
+trông như logic nhưng **đọc field khác**:
+
+- `instance_lifecycle.rs:796` — `matches!(context, "killed" | "closed" | ...)` đọc
+  `computed.context`, tức cột `status_context` (do `delivery.rs:2730` ghi `"exit:killed"` /
+  `"exit:closed"`), không phải reason của life event.
+- `tui/db.rs:907/915` — nhánh theo **`action`** (`"stopped" | "killed"`), reason chỉ được nối
+  vào chuỗi hiển thị.
+
+Vậy field `reason` của life event thực sự **chỉ để hiển thị** (`hcom list --stopped`, resume
+hint, TUI activity). Đây là bug hiển thị sai, không làm hỏng state — và fix đúng chỗ thì rẻ.
+
+### Loại bỏ: "gộp vào một transaction / khoá DB"
+
+Gợi ý cũ sai. Race này là **thứ tự**, không phải tính nguyên tử: `mark_dead_instances` đã
+`log_life_event` + `delete_instance` xong *trước khi* `stop_instance` kịp `get_instance_full`.
+Làm mỗi bên nguyên tử hơn không đổi gì — kẻ thắng vẫn ghi `exit:reboot`. Muốn hết race thì
+phải **chiếm chỗ trạng thái kết thúc trước khi gửi tín hiệu**.
+
+### Phạm vi thật: không chỉ `kill`
+
+`grep -rn "stop_instance(\|stop_placeholder_instance(" src/` — `kill` chỉ là một trong số caller.
+Mọi caller truyền reason riêng đều mất nó vào `exit:reboot` qua đúng cửa sổ đó, vì
+`mark_dead_instances` chạy ở `main.rs:72` cho **mọi** lần gọi `hcom`:
+
+| Caller | reason |
+|---|---|
+| `commands/kill.rs:145/367/371/477/481` | `killed` |
+| `commands/stop.rs:94/172/231/314` | `stop_all` / `tag_stop` / `multi_stop` / (biến) |
+| `hooks/claude.rs:2495/2581` | `idle` / (biến, teardown subagent) |
+| `instance_lifecycle.rs:835` | `exit_cleanup` / `stale_cleanup` / `inactive_cleanup` |
+
+⇒ Guard phải nằm ở chỗ mọi caller đi qua (`stop_instance_inner`), không phải vá riêng
+`kill.rs`. `kill.rs` vẫn cần thêm một claim **sớm hơn nữa**, vì `kill_instance()` gửi SIGTERM
+*trước khi* `stop_instance` được gọi.
+
+### Phương án A (khuyến nghị) — đặt sẵn reason vào `kv` trước SIGTERM
+
+`kill_tracked_instance` (`src/commands/kill.rs:130`) hiện làm:
+
+```rust
+let (result, …) = kill_instance(db, name, pid, &inst, is_headless);   // gửi SIGTERM
+stop_instance(db, name, initiator, "killed");                          // mới ghi reason
+```
+
+Chèn một claim trước tín hiệu, và cho `mark_dead_instances` fallback vào đó:
+
+- `hooks/common.rs::stop_instance_inner`: ngay sau khi đọc được row, **trước** mọi việc gửi
+  tín hiệu, ghi `stop_reason:<name>` = `<reason>|<session_id>`. Một chỗ này phủ hết caller
+  trong bảng trên.
+- `commands/kill.rs::kill_tracked_instance`: ghi cùng key **trước** `kill_instance`, vì tín hiệu
+  đi trước `stop_instance` ở đường này.
+- `instance_lifecycle.rs:963`: thay literal `"exit:reboot"` bằng
+  `db.kv_get(&key).ok().flatten().unwrap_or_else(|| "exit:reboot".into())`.
+- Ai ghi xong thì xoá key (`kv_set(key, None)`) — cả `mark_dead_instances` lẫn
+  `kill_tracked_instance` sau khi `stop_instance` trả về.
+
+Helper đã có sẵn: `src/db/kv.rs::kv_get` / `kv_set`. Không cần migration, không cần cờ mới.
+Bên nào thắng race cũng ghi ra reason đúng.
+
+Rủi ro đã biết: nếu tiến trình `hcom kill` chết giữa hai bước, key `stop_reason:<name>` còn
+lại; tên agent là CVCV nên có thể tái sử dụng và một lần stop sau đó bị gán nhầm reason
+`killed`. Giảm bằng cách nhét `session_id` vào value và chỉ dùng khi khớp.
+
+### Phương án B (đơn giản hơn, rủi ro hơn) — đảo thứ tự trong `kill_tracked_instance`
+
+`kill_instance` không chạm DB (nhận `_db: &HcomDb`, không dùng), nên về mặt kỹ thuật có thể gọi
+`stop_instance` trước rồi mới `kill_instance`. Nhưng:
+
+- `stop_instance` đã xoá row + ghi life event; nếu `kill_instance` sau đó **thất bại** (pane
+  không đóng được, tiến trình sống sót) thì agent còn chạy mà hcom không còn theo dõi — tệ hơn
+  bug hiện tại.
+- Với instance headless, `stop_instance_inner` tự `terminate_group` + poll 2s + `kill_group`
+  (`src/hooks/common.rs`), nên gọi trước rồi lại `kill_instance` là làm hai lần.
+- Với PTY, `stop_instance` đăng ký tiến trình còn sống vào `pidtrack`; giết nó ngay sau đó để
+  lại entry chết.
+
+Chỉ chọn B nếu A vướng gì đó không lường được.
+
+### Không chọn: "chỉ chạy `mark_dead_instances` trên lệnh ghi"
+
+Thu hẹp cửa sổ chứ không đóng. Một lệnh `hcom` *ghi* chạy song song, hoặc TUI, vẫn trúng race.
+Và reconciliation vẫn phải chạy trên đường đọc để TUI thấy đúng sự thật sau reboot.
+
+### Kiểm chứng
+
+Test `real_claude_full_lifecycle_send_fork_kill_resume_and_cleanup` (deterministic 3/3) là
+regression test sẵn có. Thêm một unit test ở tầng DB: dựng row instance với PID chết, set
+`stop_reason:<name>`, gọi `mark_dead_instances`, assert life event reason == `killed`.
 
 ## Cách tái hiện
 
