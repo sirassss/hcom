@@ -108,11 +108,28 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
                 // The legacy path is empty (or stale) once the plugin is in
                 // use, and printing it next to "installed" points at a file
                 // that holds nothing — same reasoning as `hcom hooks status`.
-                let advice = super::hooks::plugin_status_line(
-                    tool.as_str(),
-                    hooks,
-                    super::hooks::legacy_hooks_present(tool),
-                );
+                //
+                // Cursor doesn't go through `plugin_status_line` — same
+                // reason as `cmd_hooks_status`: its own verifier can't tell
+                // "no install" from "Claude covers it" from "own cache
+                // present but broken", so it needs `cursor_status_line`'s
+                // extra facts to avoid printing the flat, potentially false
+                // "not installed" line while Claude's plugin is covering it.
+                let advice = if tool == crate::tool::Tool::Cursor {
+                    super::hooks::cursor_status_line(&super::hooks::CursorStatus {
+                        installed: hooks,
+                        legacy: super::hooks::legacy_hooks_present(tool),
+                        claude_covers: crate::hooks::plugin::cursor_hooks_covered(),
+                        broken_skill_payload:
+                            crate::hooks::plugin::cursor_cache_entry_missing_skill_payload(),
+                    })
+                } else {
+                    super::hooks::plugin_status_line(
+                        tool.as_str(),
+                        hooks,
+                        super::hooks::legacy_hooks_present(tool),
+                    )
+                };
                 (String::new(), advice)
             } else {
                 (tool.hooks_settings_path(), String::new())
@@ -784,6 +801,52 @@ mod tests {
         let json = tool_statuses_json(&tools);
         assert!(json["claude"].get("settings_path").is_none());
         assert_eq!(json["claude"]["advice"], claude.advice.as_str());
+    }
+
+    /// Task 8 fix: `get_tool_statuses()` has its own Cursor call site,
+    /// independent of `cmd_hooks_status` in hooks.rs. Before this fix it
+    /// still called the generic `plugin_status_line`, which — once Cursor's
+    /// arms were pulled out into `cursor_status_line` — fell into the
+    /// generic `(false, _)` arm and printed the flat "cursor: hooks not
+    /// installed" line even while Claude's plugin definitively covers it.
+    /// This must route through `cursor_status_line` the same way
+    /// `cmd_hooks_status` does.
+    #[test]
+    #[serial]
+    fn cursor_status_does_not_claim_not_installed_when_claude_covers_it() {
+        use crate::hooks::test_helpers::{install_fake_claude_plugin, isolated_test_env};
+        let (_dir, _hcom_dir, home, _guard) = isolated_test_env();
+        // Cursor has no cache of its own here — only Claude's plugin is
+        // installed — so `verify_cursor_plugin_installed()` is false and
+        // `cursor_hooks_covered()` is true only via Claude.
+        install_fake_claude_plugin(&home);
+
+        let tools = get_tool_statuses();
+        let cursor = tools
+            .iter()
+            .find(|t| t.key == "cursor")
+            .expect("cursor in status list");
+        assert!(
+            !cursor.advice.contains("not installed"),
+            "must not claim hooks are not installed for cursor when Claude covers it: {}",
+            cursor.advice
+        );
+        assert!(
+            cursor.advice.contains("Claude") && cursor.advice.contains("no separate"),
+            "must state plainly that no separate Cursor install is needed: {}",
+            cursor.advice
+        );
+        assert_eq!(
+            cursor.advice,
+            super::super::hooks::cursor_status_line(&super::super::hooks::CursorStatus {
+                installed: cursor.hooks,
+                legacy: super::super::hooks::legacy_hooks_present(crate::tool::Tool::Cursor),
+                claude_covers: crate::hooks::plugin::cursor_hooks_covered(),
+                broken_skill_payload:
+                    crate::hooks::plugin::cursor_cache_entry_missing_skill_payload(),
+            }),
+            "must share wording with cmd_hooks_status's cursor_status_line, not a third copy"
+        );
     }
 
     /// A plugin tool with both plugin and legacy hooks present must flag the

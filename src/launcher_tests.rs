@@ -272,6 +272,11 @@ fn validate_pi_rejects_print_but_allows_fork() {
 
 #[test]
 fn omp_extension_args_are_injected_once() {
+    // Holds the same lock as HOME-mutating tests: inject_omp_extension_args
+    // resolves the plugin path through current_home_dir(), so without this a
+    // parallel test swapping HOME out from under us can make the two calls
+    // below disagree on the path and fail the idempotency assert (B2).
+    let _env_lock = crate::hooks::test_helpers::EnvGuard::new();
     let mut args = vec!["--model".to_string(), "opus".to_string()];
     inject_omp_extension_args(&LaunchTool::Omp, &mut args);
     assert!(args.iter().any(|arg| arg == "-e"));
@@ -1527,7 +1532,6 @@ fn launching_reports_the_install_command_when_hooks_are_missing() {
     for (tool, name) in [
         (LaunchTool::Claude, "claude"),
         (LaunchTool::ClaudePty, "claude"),
-        (LaunchTool::Cursor, "cursor"),
         (LaunchTool::Antigravity, "antigravity"),
     ] {
         let warning = super::hooks_missing_warning(&tool);
@@ -1537,4 +1541,77 @@ fn launching_reports_the_install_command_when_hooks_are_missing() {
         );
         assert!(warning.contains("not installed"), "{warning}");
     }
+}
+
+/// Mirrors `plugin_status_line`'s own ban (hooks.rs) on this exact claim:
+/// `cursor-agent` can run hcom's hooks straight out of Claude's plugin cache
+/// with no Cursor marketplace at all (measured 2026-09-08), and
+/// `install_cursor_plugin` leaves the cache-less state on purpose right after
+/// a launch drives the install. Saying "not installed" here would be false in
+/// exactly the same way, right after telling the user the install is
+/// proceeding normally.
+///
+/// Without `hooks_missing_test_env()`, which branch of `hooks_missing_warning`
+/// this test actually exercises (Claude-covered vs. neither-covers) depended
+/// on whatever the real host's Claude plugin state happened to be — a test
+/// isolation regression introduced once Task 1 gave the Cursor branch two
+/// distinct outcomes instead of one constant string. Fixed by sandboxing
+/// `$HOME` the same way `hooks_missing_warning_cursor_is_definitive_when_claude_covers_it`
+/// does, and asserting the original two claims hold on BOTH branches instead
+/// of leaving it to chance which one ran.
+#[test]
+#[serial]
+fn hooks_missing_warning_cursor_does_not_claim_not_installed() {
+    // Branch 1: neither Claude nor Cursor's own cache covers it.
+    {
+        let (_dir, _home, _guard) = hooks_missing_test_env();
+        let warning = super::hooks_missing_warning(&LaunchTool::Cursor);
+        assert!(
+            !warning.contains("not installed"),
+            "must not claim hooks are not installed for cursor. got: {warning:?}"
+        );
+        assert!(
+            warning.contains("hcom hooks add cursor"),
+            "must still point at the Cursor-owned install path. got: {warning:?}"
+        );
+    }
+    // Branch 2: Claude's plugin covers it.
+    {
+        let (_dir, home, _guard) = hooks_missing_test_env();
+        crate::hooks::test_helpers::install_fake_claude_plugin(&home);
+        let warning = super::hooks_missing_warning(&LaunchTool::Cursor);
+        assert!(
+            !warning.contains("not installed"),
+            "must not claim hooks are not installed for cursor. got: {warning:?}"
+        );
+        assert!(
+            warning.contains("hcom hooks add cursor"),
+            "must still point at the Cursor-owned install path. got: {warning:?}"
+        );
+    }
+}
+
+/// Task 8: when `cursor_hooks_covered()` says Claude's plugin covers the
+/// hook, `hooks_missing_warning` must give a definitive answer instead of
+/// the "may still be running" hedge — this is the launcher-hot-path
+/// counterpart to `cursor_status_line`'s Claude-covered branch in hooks.rs.
+#[test]
+#[serial]
+fn hooks_missing_warning_cursor_is_definitive_when_claude_covers_it() {
+    let (_dir, home, _guard) = hooks_missing_test_env();
+    crate::hooks::test_helpers::install_fake_claude_plugin(&home);
+
+    let warning = super::hooks_missing_warning(&LaunchTool::Cursor);
+    assert!(
+        warning.contains("Claude") && warning.contains("no separate"),
+        "must state plainly that no separate Cursor install is needed: {warning:?}"
+    );
+    assert!(
+        warning.contains("Removing hcom from Claude"),
+        "must name the removal consequence: {warning:?}"
+    );
+    assert!(
+        !warning.contains("may still be running"),
+        "cursor_hooks_covered() being true makes this definitive: {warning:?}"
+    );
 }

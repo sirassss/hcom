@@ -192,8 +192,9 @@ pub mod test_helpers {
     /// Claude's hooks now ship in the hcom plugin, so a test that wants "hooks
     /// are installed" can no longer express that by calling the legacy
     /// `setup_claude_hooks` writer — `verify_claude_plugin_installed` reads the
-    /// `enabledPlugins` flag and the cached plugin directory instead. Writing
-    /// both here keeps those tests about what they were testing.
+    /// `enabledPlugins` flag plus Claude's plugin registry
+    /// (`known_marketplaces.json` and `installed_plugins.json`) instead.
+    /// Writing all three here keeps those tests about what they were testing.
     pub fn install_fake_claude_plugin(test_home: &std::path::Path) {
         let settings_path = crate::hooks::claude::get_claude_settings_path();
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
@@ -206,8 +207,44 @@ pub mod test_helpers {
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .unwrap();
-        let _ = test_home;
-        std::fs::create_dir_all(crate::hooks::plugin::claude_plugin_dir().join("1.0.0")).unwrap();
+
+        let plugins_root = crate::hooks::plugin::claude_plugins_root();
+        // The two writes below overwrite `known_marketplaces.json` and
+        // `installed_plugins.json` wholesale (unlike the read-modify-write
+        // above for settings.json). Every current call site pairs with
+        // `isolated_test_env()`, so `plugins_root` always resolves under
+        // `test_home` today — but a future test that forgets the guard would
+        // otherwise clobber the developer's real Claude marketplace registry.
+        assert!(
+            plugins_root.starts_with(test_home),
+            "install_fake_claude_plugin refuses to write outside the isolated test HOME: \
+             resolved claude_plugins_root={} is not under test_home={}",
+            plugins_root.display(),
+            test_home.display()
+        );
+        let install_path = plugins_root
+            .join("cache")
+            .join(crate::hooks::plugin::CLAUDE_MARKETPLACE)
+            .join(crate::hooks::plugin::PLUGIN_NAME)
+            .join("1.0.0");
+        std::fs::create_dir_all(&install_path).unwrap();
+        std::fs::write(
+            plugins_root.join("known_marketplaces.json"),
+            serde_json::json!({crate::hooks::plugin::CLAUDE_MARKETPLACE: {}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            plugins_root.join("installed_plugins.json"),
+            serde_json::json!({
+                "plugins": {
+                    crate::hooks::plugin::CLAUDE_PLUGIN_ID: [
+                        {"scope": "user", "installPath": install_path.display().to_string(), "version": "1.0.0"}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 }
 

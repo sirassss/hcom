@@ -59,8 +59,8 @@
 //! abort at the `?` before verification ever ran.
 //!
 //! Cursor does resolve a plugin declared in a repo subdirectory
-//! (`marketplace.json` → `"source": "./plugin/hcom"`), so the plugin body can
-//! stay where it is.
+//! (`marketplace.json` → `"source": "./hcom"`), so the plugin body can stay
+//! where it is.
 
 use std::path::{Path, PathBuf};
 
@@ -83,18 +83,17 @@ pub(crate) const CLAUDE_PLUGIN_ID: &str = "hcom@hcom";
 /// Marketplace name alone, as it appears in `extraKnownMarketplaces`.
 pub(crate) const CLAUDE_MARKETPLACE: &str = "hcom";
 
-/// Where Claude caches an installed plugin: `<marketplace>/<plugin>/<version>/`.
-/// The version segment varies, so callers check the parent for any child.
-pub(crate) fn claude_plugin_dir() -> PathBuf {
+/// Directory Claude keeps its plugin registry under.
+pub(crate) fn claude_plugins_root() -> PathBuf {
     crate::hooks::claude::get_claude_settings_path()
         .parent()
-        .map(|d| {
-            d.join("plugins")
-                .join("cache")
-                .join(CLAUDE_MARKETPLACE)
-                .join(PLUGIN_NAME)
-        })
+        .map(|d| d.join("plugins"))
         .unwrap_or_default()
+}
+
+/// Read a JSON file, `None` if missing or malformed.
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 /// Directory Antigravity copies an installed plugin into.
@@ -339,16 +338,35 @@ pub(crate) fn agy_hook_state() -> AgyHooks {
     AgyHooks::Malformed
 }
 
-/// Root under which Cursor checks out marketplace repositories:
-/// `marketplaces/<host>/<owner>/<repo>/<commit sha>/`.
-pub(crate) fn cursor_marketplaces_dir() -> PathBuf {
+/// Cursor's config root, the parent of `hooks.json`. Base for everything
+/// Cursor's plugin system writes under `plugins/` (cache, marketplaces).
+fn cursor_plugins_root() -> PathBuf {
     crate::hooks::cursor::get_cursor_hooks_path()
         .parent()
-        .map(|d| d.join("plugins").join("marketplaces"))
+        .map(Path::to_path_buf)
         .unwrap_or_default()
 }
 
-/// True when the tool has the plugin on disk *and* records it as enabled.
+/// Where Cursor materializes an installed plugin:
+/// `plugins/cache/<marketplace>/<plugin>/<id>/`. Same shape as Claude's cache.
+/// The final segment is a changing hash, so callers walk the subdirectories.
+pub(crate) fn cursor_plugin_cache_dir() -> PathBuf {
+    cursor_plugins_root()
+        .join("plugins")
+        .join("cache")
+        .join(CLAUDE_MARKETPLACE)
+        .join(PLUGIN_NAME)
+}
+
+/// True when Claude has the plugin enabled, still has its marketplace
+/// registered, and has a real install on disk.
+///
+/// Measured 2026-09-16: Claude MARKS an orphaned cache
+/// (`cache/hcom/hcom/<ver>/.orphaned_at`) instead of deleting it, so the old
+/// question — "is `cache/hcom/hcom/` a directory" — stayed true long after a
+/// marketplace was removed by hand. `installed_plugins.json` points at the
+/// version actually in use, and `known_marketplaces.json` is the only thing
+/// that witnesses a marketplace removal.
 ///
 /// Reads files only — this runs before every agent spawn, so a subprocess here
 /// would cost a process launch per agent.
@@ -365,58 +383,156 @@ pub(crate) fn verify_claude_plugin_installed() -> bool {
     if !enabled {
         return false;
     }
-    claude_plugin_dir().is_dir()
+
+    let root = claude_plugins_root();
+
+    let marketplace_known = read_json(&root.join("known_marketplaces.json"))
+        .map(|v| v.get(CLAUDE_MARKETPLACE).is_some())
+        .unwrap_or(false);
+    if !marketplace_known {
+        return false;
+    }
+
+    read_json(&root.join("installed_plugins.json"))
+        .and_then(|v| {
+            Some(
+                v.get("plugins")?
+                    .get(CLAUDE_PLUGIN_ID)?
+                    .as_array()?
+                    .iter()
+                    .any(|entry| {
+                        entry
+                            .get("installPath")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|p| Path::new(p).is_dir())
+                    }),
+            )
+        })
+        .unwrap_or(false)
 }
 
-/// True once Antigravity's copy of the plugin carries the hook file it reads.
-/// The directory alone can exist mid-import or from a stale copy; only the
-/// hook file proves hooks are live.
-pub(crate) fn verify_agy_plugin_installed() -> bool {
-    agy_plugin_dir().join(AGY_HOOKS_RELATIVE).is_file()
-}
-
-/// Cursor checks a marketplace out under
-/// `plugins/marketplaces/<host>/<owner>/<repo>/<commit sha>/`, so the plugin
-/// body sits at `<sha>/plugin/hcom/`. Any checkout carrying our Cursor hook
-/// file counts.
+/// True once `import_manifest.json` records hcom's hooks component **and**
+/// the hook file Antigravity actually reads is still on disk.
 ///
-/// This proves the marketplace checkout is present on disk — it does NOT
-/// prove the user finished enabling the plugin in Cursor's `/plugins` TUI.
-/// Cursor's enabled marker could not be measured (see the module doc): there
-/// is no non-interactive install to probe. Callers relying on this as an
-/// "installed" signal are relying on the weaker of the two guarantees.
-pub(crate) fn verify_cursor_plugin_installed() -> bool {
-    let Ok(hosts) = std::fs::read_dir(cursor_marketplaces_dir()) else {
+/// Measured 2026-09-17 (issue doc item 3): the premise this check used to
+/// rest on — "AGY has no registry to check against" — was wrong. `agy
+/// plugin list` reads exactly `import_manifest.json`, so the registry is
+/// real, and it is a plain JSON file on disk: no subprocess is needed to
+/// consult it, which matters because this runs before every agent spawn.
+///
+/// Neither half is sufficient alone. The hook file alone is what the old
+/// check trusted, and it is exactly what an orphan copy of the plugin
+/// directory carries: extracted by hand, left behind after `agy plugin
+/// uninstall` cleared the manifest without deleting the files, or mid-import
+/// before the manifest entry is written. The manifest entry alone would
+/// accept an import that has not finished copying `hooks/hooks.json` yet.
+/// Both together is what an install that is actually live looks like.
+pub(crate) fn verify_agy_plugin_installed() -> bool {
+    if !agy_plugin_dir().join(AGY_HOOKS_RELATIVE).is_file() {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(agy_import_manifest()) else {
         return false;
     };
-    hosts
-        .flatten()
-        .flat_map(|host| {
-            std::fs::read_dir(host.path())
-                .into_iter()
-                .flatten()
-                .flatten()
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    manifest
+        .get("imports")
+        .and_then(|v| v.as_array())
+        .is_some_and(|imports| {
+            imports.iter().any(|entry| {
+                entry.get("name").and_then(|n| n.as_str()) == Some(PLUGIN_NAME)
+                    && entry
+                        .get("components")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|components| {
+                            components.iter().any(|c| c.as_str() == Some("hooks"))
+                        })
+            })
         })
-        .flat_map(|owner| {
-            std::fs::read_dir(owner.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-        })
-        .flat_map(|repo| {
-            std::fs::read_dir(repo.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-        })
-        .any(|sha| {
-            sha.path()
-                .join("plugin")
-                .join(PLUGIN_NAME)
-                .join("hooks")
-                .join("hooks-cursor.json")
-                .is_file()
-        })
+}
+
+/// True when Cursor has materialized the hcom plugin into its cache.
+///
+/// Measured 2026-09-16: an installed plugin lands at
+/// `~/.cursor/plugins/cache/hcom/hcom/<id>/`, carrying `.cache-complete` and
+/// `hooks/hooks-cursor.json` — the same shape as Claude's cache.
+///
+/// Also requires [`verify_plugin_skill_payload`] on that cache entry (M6,
+/// 2026-09-19): a real dev-host cache carried both marker files while
+/// `skills` was a dangling symlink, so the two-file check alone reported an
+/// install whose messaging skill could never actually load. Same three-part
+/// AND shape AGY's install path already uses.
+///
+/// Deliberately NOT `plugins/marketplaces/<host>/<owner>/<repo>/<sha>/`: that
+/// directory only proves `marketplace add` cloned some repo. The old verifier
+/// scanned every repo there, so a leftover checkout of the old
+/// `sirassss/hcom` repo made it return true even after the current
+/// marketplace was removed (issue 2026-09-16, D1), and its hardcoded
+/// `<sha>/plugin/hcom/...` path was already stale once the plugin moved to
+/// its own repo with layout `<sha>/hcom/...` (D2).
+///
+/// Still does NOT prove the user finished enabling the plugin in
+/// `/plugins`: whether this cache entry survives a disable is unmeasured.
+/// Don't use it to unlock stripping legacy hooks (see the doc on
+/// `install_cursor_plugin`).
+///
+/// Reads files only — this runs before every agent spawn.
+pub(crate) fn verify_cursor_plugin_installed() -> bool {
+    let Ok(entries) = std::fs::read_dir(cursor_plugin_cache_dir()) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let root = entry.path();
+        root.join(".cache-complete").is_file()
+            && root.join("hooks").join("hooks-cursor.json").is_file()
+            && verify_plugin_skill_payload(&root).is_ok()
+    })
+}
+
+/// Distinguishes "a Cursor cache entry exists but its skill payload is
+/// broken" from "no cache entry at all" (Task 11) — a split
+/// `verify_cursor_plugin_installed` cannot make itself, because Task 7 folded
+/// the skill-payload check into that single boolean, so both states report
+/// `false`. Status needs the split: a cache entry with the two marker files
+/// present is evidence the hook may still be firing even though the skill
+/// isn't, which is a materially different message from "nothing was ever
+/// installed".
+///
+/// Reads files only, and only from status; not on the hot pre-spawn path.
+pub(crate) fn cursor_cache_entry_missing_skill_payload() -> Option<String> {
+    let entries = std::fs::read_dir(cursor_plugin_cache_dir()).ok()?;
+    entries.flatten().find_map(|entry| {
+        let root = entry.path();
+        let has_markers = root.join(".cache-complete").is_file()
+            && root.join("hooks").join("hooks-cursor.json").is_file();
+        has_markers
+            .then(|| verify_plugin_skill_payload(&root).err())
+            .flatten()
+    })
+}
+
+/// True when Cursor is already running the hcom hook, whether or not Cursor
+/// itself has anything installed.
+///
+/// Measured 2026-09-19 (M1): a Cursor agent spawned with **zero** Cursor-side
+/// artifacts (registry, cache, and all stale marketplace checkouts removed)
+/// still reported `bindings: hooks, pty` and loaded the messaging skill out
+/// of Claude's plugin cache — `cursor-agent` reads Claude's installed plugin
+/// directly. So Cursor's hooks are covered whenever *either* vendor has a
+/// verified install; see `cursor_and_claude_verifier_truth_table` for the
+/// full row-by-row measurement this rests on.
+///
+/// This does **not** replace [`verify_cursor_plugin_installed`]. Uninstall
+/// still needs that narrower meaning — "does Cursor have its own cache
+/// entry" — to decide whether there is anything of Cursor's own left to
+/// strip; borrowing Claude's install here would make `hooks remove cursor`
+/// report a Cursor-owned install that was never there.
+///
+/// Reads files only — this runs before every agent spawn.
+pub(crate) fn cursor_hooks_covered() -> bool {
+    verify_claude_plugin_installed() || verify_cursor_plugin_installed()
 }
 
 /// Install → verify → strip, in that order.
@@ -536,19 +652,23 @@ pub(crate) fn install_claude_plugin() -> Result<(), String> {
 /// the published [`HCOM_PLUGIN_REPOSITORY_URL`].
 ///
 /// **This never strips the legacy hooks, on any pass.** It is tempting to gate
-/// a strip on [`verify_cursor_plugin_installed`], but that verifier only proves
-/// a marketplace checkout exists on disk — and `marketplace add`, the command
-/// immediately above, is what creates that checkout. Gating on it would delete
+/// a strip on [`verify_cursor_plugin_installed`], but that verifier only
+/// proves the plugin materialized into Cursor's plugin cache
+/// (`~/.cursor/plugins/cache/hcom/hcom/<id>/`, complete with
+/// `.cache-complete` and `hooks/hooks-cursor.json`) — not that the user
+/// finished enabling it in the `/plugins` TUI, and whether that cache entry
+/// survives a disable is unmeasured. Gating on it risks deleting
 /// `~/.cursor/hooks.json` (and hcom's Cursor permissions, which
-/// `remove_cursor_hooks` also clears) the instant the marketplace was added,
-/// while the plugin sits un-enabled in the TUI. Cursor would then be running
-/// neither plugin hooks nor legacy hooks, silently.
+/// `remove_cursor_hooks` also clears) while the plugin is disabled or the
+/// cache entry is stale, leaving Cursor running neither plugin hooks nor
+/// legacy hooks, silently.
 ///
-/// Cursor's enabled marker is not readable from disk — Task 1 measured it as
-/// unavailable, since there is no non-interactive install to observe — so no
-/// honest signal exists to gate on. Leaving the legacy hooks in place is the
-/// safe half of the trade: both sets call the same `cursor-*` subcommands, so
-/// the worst case is one redundant hook invocation, never a wrong handler.
+/// No honest signal exists to gate on: Cursor's enabled marker is not
+/// readable from disk (there is no non-interactive install to observe), and
+/// a completed cache entry falls short of proving "enabled" for the reason
+/// above. Leaving the legacy hooks in place is the safe half of the trade:
+/// both sets call the same `cursor-*` subcommands, so the worst case is one
+/// redundant hook invocation, never a wrong handler.
 pub(crate) fn install_cursor_plugin() -> Result<(), String> {
     // Cursor takes a git URL only — a path or file:// URL is mangled into an
     // unresolvable https host (measured 2026-09-09).
@@ -664,11 +784,54 @@ fn agy_uninstall_command() -> (&'static str, Vec<&'static str>) {
     ("agy", vec!["plugin", "uninstall", PLUGIN_NAME])
 }
 
-/// Remove the Claude plugin. Gated on [`verify_claude_plugin_installed`] so a
-/// user who never installed it (the common case today) does not see a CLI
-/// failure on every `hcom hooks remove claude`.
+/// True when *any* of the three vertices [`verify_claude_plugin_installed`]
+/// ANDs together is present, instead of requiring all three.
+///
+/// Deliberately wider than the verifier: `hooks remove` must clean up
+/// whatever is left, not just a fully-healthy install. A user who removed the
+/// marketplace by hand (`known_marketplaces.json` loses `hcom`) while
+/// `enabledPlugins` and the install-path cache survive would otherwise make
+/// `uninstall_claude_plugin` a silent no-op — the exact bug this task exists
+/// to close for Cursor, and Claude has the same three-vertex AND shape Task 5
+/// just built, so it inherits the same gap. `installPath` is checked for
+/// presence only, not directory existence: a dangling path is still a trace
+/// worth telling `claude plugin uninstall` about.
+fn claude_plugin_has_any_trace() -> bool {
+    let settings_path = crate::hooks::claude::get_claude_settings_path();
+    let enabled_entry_present = crate::hooks::claude::load_claude_settings(&settings_path)
+        .and_then(|s| s.get("enabledPlugins")?.get(CLAUDE_PLUGIN_ID).cloned())
+        .is_some();
+    if enabled_entry_present {
+        return true;
+    }
+
+    let root = claude_plugins_root();
+    let marketplace_known = read_json(&root.join("known_marketplaces.json"))
+        .map(|v| v.get(CLAUDE_MARKETPLACE).is_some())
+        .unwrap_or(false);
+    if marketplace_known {
+        return true;
+    }
+
+    read_json(&root.join("installed_plugins.json"))
+        .and_then(|v| {
+            Some(
+                !v.get("plugins")?
+                    .get(CLAUDE_PLUGIN_ID)?
+                    .as_array()?
+                    .is_empty(),
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Remove the Claude plugin. Gated on [`claude_plugin_has_any_trace`] — wider
+/// than [`verify_claude_plugin_installed`] on purpose (see that function's
+/// doc) — so a user who never touched Claude at all (the common case today)
+/// does not see a CLI failure on every `hcom hooks remove claude`, while a
+/// half-installed or half-removed state still gets cleaned up.
 pub(crate) fn uninstall_claude_plugin() -> Result<(), String> {
-    if !verify_claude_plugin_installed() {
+    if !claude_plugin_has_any_trace() {
         return Ok(());
     }
     let mut errors = Vec::new();
@@ -684,18 +847,145 @@ pub(crate) fn uninstall_claude_plugin() -> Result<(), String> {
     }
 }
 
+/// `cursor-agent plugin marketplace list` stdout, or the reason it could not
+/// be produced.
+///
+/// In tests, `HCOM_TEST_CURSOR_MARKETPLACE_LIST` substitutes for the real
+/// CLI — same pattern as `HCOM_TEST_CODEX_HOOKS_LIST_JSON` in `codex.rs` —
+/// so a test never depends on (or mutates) this host's actual Cursor account
+/// state. Absent that override, test builds report an empty listing rather
+/// than spawning the real CLI. Set the override to `"__fail__"` to simulate
+/// a CLI failure.
+fn cursor_marketplace_list_output() -> Result<String, String> {
+    #[cfg(test)]
+    {
+        if let Ok(value) = std::env::var("HCOM_TEST_CURSOR_MARKETPLACE_LIST") {
+            if value == "__fail__" {
+                return Err("test marketplace list failure".to_string());
+            }
+            return Ok(value);
+        }
+        Ok(String::new())
+    }
+
+    #[cfg(not(test))]
+    {
+        let output = std::process::Command::new("cursor-agent")
+            .args(["plugin", "marketplace", "list"])
+            .output()
+            .map_err(|e| {
+                format!("cursor-agent not runnable: {e}. Install it or run the command by hand.")
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "cursor-agent plugin marketplace list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// True when Cursor's marketplace *registry* — not the local disk — actually
+/// lists hcom.
+///
+/// Measured 2026-09-19 against a real `cursor-agent` 2026.09.18-9a7762b with
+/// hcom actually registered. `cursor-agent plugin marketplace list` prints a
+/// whitespace-column table, one marketplace per line — name, scope
+/// (`global`/`user`), and a URL column that is only present for marketplaces
+/// added by URL (a built-in `global` entry like `cursor-public` prints with
+/// no URL column at all):
+/// ```text
+/// cursor-public     global
+/// hcom              user    https://github.com/sirassss/hcom-plugin
+/// i-have-adhd       user    https://github.com/ayghri/i-have-adhd
+/// ```
+/// So a URL-only match (the original, unmeasured version of this function)
+/// works for hcom today, but is one Cursor formatting change away from going
+/// permanently blind if the URL column is ever dropped — matches on EITHER
+/// signal: [`HCOM_PLUGIN_REPOSITORY_URL`] with its scheme stripped
+/// (`github.com/sirassss/hcom-plugin`) as a substring, robust to `http` vs
+/// `https`, a trailing `.git`, or trailing whitespace; OR the literal
+/// marketplace name ([`PLUGIN_NAME`], `"hcom"`) as an exact first column
+/// token on some line — a whole-word match on the name column, not a
+/// substring of the whole table, so it can't false-positive on some other
+/// marketplace whose name or URL merely contains "hcom".
+///
+/// Fails open — returns `true` — when the CLI errors or `cursor-agent` is
+/// not installed: that is missing evidence, not evidence of absence, so
+/// [`uninstall_cursor_plugin`] should still try. This keeps the "still gỡ
+/// nấy" (still attempt to clean up whatever's there) spirit of
+/// `cursor_marketplace_checkout_exists`, the on-disk check this replaces,
+/// without inheriting its actual bug: `cursor-agent plugin marketplace
+/// remove` leaves that on-disk checkout completely untouched even after it
+/// succeeds (measured, plan M3), so the old check stayed stuck at `true`
+/// forever and made `uninstall_cursor_plugin` fail with "No marketplace
+/// matches" in an infinite loop (measured, plan M4). The registry list
+/// reflects the CLI's own removal, so it does not share that failure mode.
+pub(crate) fn cursor_registry_lists_hcom() -> bool {
+    let marker = HCOM_PLUGIN_REPOSITORY_URL
+        .split("://")
+        .nth(1)
+        .unwrap_or(HCOM_PLUGIN_REPOSITORY_URL);
+    match cursor_marketplace_list_output() {
+        Ok(stdout) => {
+            stdout.contains(marker)
+                || stdout
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(PLUGIN_NAME))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Whether [`uninstall_cursor_plugin`] should attempt the removal CLI at all.
+///
+/// Reads the registry alone, not `verify_cursor_plugin_installed() || ...`
+/// — the command this gates (`cursor-agent plugin marketplace remove`) only
+/// ever succeeds or fails based on the marketplace *registry*, so gating it
+/// on cache completeness too reintroduces the exact bug this function was
+/// built to close, just through a different on-disk artifact. Measured
+/// 2026-09-20: `cursor-agent plugin marketplace remove hcom` (real host)
+/// leaves the materialized plugin cache (`.cache-complete`, `hooks/`,
+/// `skills/`) completely untouched, exactly like the marketplace checkout
+/// directory M3 measured. An OR with `verify_cursor_plugin_installed()`
+/// made that surviving cache re-trigger the removal CLI on every single
+/// `hooks remove cursor` forever, each attempt printing the same "No
+/// marketplace matches" note — the M4 infinite loop, unblocked by cache
+/// instead of by checkout. `cursor_registry_lists_hcom` already fails open
+/// (`true`) when the CLI errors or is missing, so "still gỡ nấy" survives
+/// without the cache OR.
+fn cursor_uninstall_should_attempt() -> bool {
+    cursor_registry_lists_hcom()
+}
+
 /// Remove Cursor's marketplace registration. Gated on
-/// [`verify_cursor_plugin_installed`] for the same reason as Claude above.
+/// [`cursor_uninstall_should_attempt`], not the strict verifier — see its doc.
 pub(crate) fn uninstall_cursor_plugin() -> Result<(), String> {
-    if !verify_cursor_plugin_installed() {
+    if !cursor_uninstall_should_attempt() {
         return Ok(());
     }
     let (program, args) = cursor_uninstall_command();
     run_tool_cli(program, &args)
 }
 
-/// Remove the Antigravity plugin. Gated on [`verify_agy_plugin_installed`] for
-/// the same reason as Claude above.
+/// Remove the Antigravity plugin. Gated on [`verify_agy_plugin_installed`]
+/// directly, unlike Claude and Cursor above — deliberately not widened.
+///
+/// Task 6 made [`verify_agy_plugin_installed`] itself a multi-condition AND
+/// (the hook file on disk AND an `import_manifest.json` entry naming hcom's
+/// `hooks` component), the same shape that made Claude's and Cursor's strict
+/// verifiers too narrow for removal — so widening this gate the same way
+/// Cursor's was widened (`cursor_uninstall_should_attempt`) would make sense
+/// in principle. It stays narrow anyway: an orphan hook file with no manifest
+/// entry (e.g. left behind by hand-editing, or a half-finished install) now
+/// makes the verifier — and this gate — read `false`, so `hcom hooks remove
+/// antigravity` no longer cleans it up. That is an accepted, deliberate
+/// narrowing, not a gap to fix: Task 5's `add` escape hatch already handles
+/// reinstalling over such an orphan (`add_antigravity_reinstalls_over_orphan_dir`),
+/// and a real `agy plugin uninstall` would itself fail against a manifest
+/// with no matching entry, so there is nothing this gate could remove that
+/// the underlying CLI would accept anyway.
 pub(crate) fn uninstall_agy_plugin() -> Result<(), String> {
     if !verify_agy_plugin_installed() {
         return Ok(());
@@ -707,6 +997,7 @@ pub(crate) fn uninstall_agy_plugin() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use crate::hooks::test_helpers::EnvGuard;
+    use crate::instance_binding::EnvVarGuard;
     use serde_json::Value;
     use serial_test::serial;
     use std::path::PathBuf;
@@ -1132,11 +1423,13 @@ mod tests {
     }
 
     /// Regression guard for a defect caught in review: gating Cursor's strip on
-    /// `verify_cursor_plugin_installed` deleted the user's hooks the moment the
-    /// marketplace was added, because that verifier only proves a checkout
-    /// exists and `marketplace add` is what creates it. Cursor's enabled marker
-    /// is not readable from disk, so no gate is honest — the source must simply
-    /// never strip.
+    /// `verify_cursor_plugin_installed` risks deleting the user's hooks while
+    /// the plugin is disabled or the cache entry is stale, because that
+    /// verifier only proves the plugin materialized into Cursor's plugin
+    /// cache — not that the user enabled it in `/plugins`, and whether the
+    /// cache entry survives a disable is unmeasured. Cursor's enabled marker
+    /// is not readable from disk either, so no gate is honest — the source
+    /// must simply never strip.
     #[test]
     fn cursor_installer_never_strips_legacy_hooks() {
         let src = include_str!("plugin.rs");
@@ -1247,9 +1540,37 @@ mod tests {
         );
     }
 
+    /// Builds a complete, valid Claude install under `home`. Returns the
+    /// installPath so tests can break each vertex individually.
+    fn write_healthy_claude_install(home: &std::path::Path) -> std::path::PathBuf {
+        let plugins = home.join(".claude/plugins");
+        let install_path = plugins.join("cache/hcom/hcom/1.0.1");
+        std::fs::create_dir_all(&install_path).unwrap();
+
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"hcom@hcom":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugins.join("known_marketplaces.json"),
+            r#"{"hcom":{"source":{"source":"git","url":"https://github.com/sirassss/hcom-plugin"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugins.join("installed_plugins.json"),
+            format!(
+                r#"{{"plugins":{{"hcom@hcom":[{{"scope":"user","installPath":"{}","version":"1.0.1"}}]}}}}"#,
+                install_path.display()
+            ),
+        )
+        .unwrap();
+        install_path
+    }
+
     #[test]
     #[serial]
-    fn claude_verify_needs_both_directory_and_enabled_flag() {
+    fn claude_verify_needs_both_the_registry_and_the_enabled_flag() {
         let (_dir, home, _guard) = plugin_test_env();
 
         let settings = home.join(".claude/settings.json");
@@ -1259,13 +1580,13 @@ mod tests {
         std::fs::write(&settings, r#"{}"#).unwrap();
         assert!(!super::verify_claude_plugin_installed());
 
-        // Enabled flag only, no plugin directory.
+        // Enabled flag only, no registry.
         std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":true}}"#).unwrap();
         assert!(!super::verify_claude_plugin_installed());
 
-        // Directory only, no enabled flag.
+        // Registry only, no enabled flag.
+        write_healthy_claude_install(&home);
         std::fs::write(&settings, r#"{}"#).unwrap();
-        std::fs::create_dir_all(super::claude_plugin_dir().join("1.0.0")).unwrap();
         assert!(!super::verify_claude_plugin_installed());
 
         // Both halves present.
@@ -1275,6 +1596,72 @@ mod tests {
         // Explicitly disabled by the user.
         std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":false}}"#).unwrap();
         assert!(!super::verify_claude_plugin_installed());
+    }
+
+    #[test]
+    #[serial]
+    fn claude_verifier_accepts_a_healthy_install() {
+        let (_dir, home, _guard) = plugin_test_env();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        write_healthy_claude_install(&home);
+        assert!(super::verify_claude_plugin_installed());
+    }
+
+    #[test]
+    #[serial]
+    fn claude_verifier_rejects_a_removed_marketplace() {
+        let (_dir, home, _guard) = plugin_test_env();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        write_healthy_claude_install(&home);
+
+        // The user ran `claude plugin marketplace remove hcom`; the cache and
+        // enabledPlugins are still present.
+        std::fs::write(
+            home.join(".claude/plugins/known_marketplaces.json"),
+            r#"{"superpowers-marketplace":{}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !super::verify_claude_plugin_installed(),
+            "an orphaned cache must not read as an installed plugin"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_verifier_rejects_a_dangling_install_path() {
+        let (_dir, home, _guard) = plugin_test_env();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let install_path = write_healthy_claude_install(&home);
+        std::fs::remove_dir_all(&install_path).unwrap();
+
+        assert!(!super::verify_claude_plugin_installed());
+    }
+
+    /// Writes `import_manifest.json` with a single `hcom` entry carrying the
+    /// given `components`. Matches the real shape (module doc, plugin.rs:181
+    /// and the `agy_state_with` fixture above): `agy plugin install` records
+    /// the import regardless of whether the hook file it points at is
+    /// actually present, which is exactly why the verifier cannot trust this
+    /// file alone.
+    fn write_agy_import_manifest(components: &[&str]) {
+        let manifest_path = super::agy_import_manifest();
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let components_json = serde_json::to_string(components).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"{{"imports":[{{"name":"hcom","source":"claude-code","importedAt":"2026-01-01T00:00:00Z","components":{components_json}}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_agy_hook_file() {
+        let hooks_path = super::agy_plugin_dir().join(super::AGY_HOOKS_RELATIVE);
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(&hooks_path, r#"{"hooks":{}}"#).unwrap();
     }
 
     #[test]
@@ -1289,6 +1676,7 @@ mod tests {
             "empty dir is not installed"
         );
 
+        write_agy_import_manifest(&["hooks"]);
         std::fs::create_dir_all(plugin_dir.join(super::AGY_HOOKS_RELATIVE).parent().unwrap())
             .unwrap();
         std::fs::write(
@@ -1299,35 +1687,275 @@ mod tests {
         assert!(super::verify_agy_plugin_installed());
     }
 
+    /// Regression for the orphan-dir case the old file-only check missed: a
+    /// stale or hand-extracted copy of the plugin directory (no import ever
+    /// ran, or `agy plugin uninstall` cleared the manifest without deleting
+    /// the files) carries the hook file but has no manifest entry backing it.
     #[test]
     #[serial]
-    fn cursor_verify_walks_to_the_hook_file() {
+    fn agy_verifier_rejects_orphan_dir_absent_from_manifest() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        write_agy_hook_file();
+
+        // No import_manifest.json at all.
+        assert!(
+            !super::verify_agy_plugin_installed(),
+            "hook file with no manifest at all must not read as installed"
+        );
+
+        // Manifest exists but has no hcom entry.
+        let manifest_path = super::agy_import_manifest();
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, r#"{"imports":[]}"#).unwrap();
+        assert!(
+            !super::verify_agy_plugin_installed(),
+            "hook file with no hcom entry in the manifest must not read as installed"
+        );
+
+        // hcom entry present, but its components don't include "hooks" (e.g.
+        // only skills were imported).
+        write_agy_import_manifest(&["skills"]);
+        assert!(
+            !super::verify_agy_plugin_installed(),
+            "an hcom entry without a hooks component must not read as installed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agy_verifier_accepts_manifest_entry_with_hooks_component() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        write_agy_hook_file();
+        write_agy_import_manifest(&["hooks"]);
+        assert!(super::verify_agy_plugin_installed());
+
+        // Real installs also carry "skills" alongside "hooks" — order/extra
+        // entries must not matter, only that "hooks" is present.
+        write_agy_import_manifest(&["skills", "hooks"]);
+        assert!(super::verify_agy_plugin_installed());
+    }
+
+    /// Writes a completed Cursor-owned cache entry, the shape measured on a
+    /// real host: `<cache>/<marketplace>/<plugin>/<sha>/` carrying
+    /// `.cache-complete` and `hooks/hooks-cursor.json`.
+    fn write_cursor_cache_entry(home: &std::path::Path) -> std::path::PathBuf {
+        let cache = home
+            .join(".cursor/plugins/cache")
+            .join(super::CLAUDE_MARKETPLACE)
+            .join(super::PLUGIN_NAME)
+            .join("a1511e68");
+        let hooks = cache.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("hooks-cursor.json"), "{}").unwrap();
+        write_complete_skill_payload(&cache);
+        std::fs::write(cache.join(".cache-complete"), "").unwrap();
+        cache
+    }
+
+    /// M6: a real cache entry can carry `.cache-complete` and
+    /// `hooks/hooks-cursor.json` while `skills` is a dangling symlink — the
+    /// old verifier checked neither, so it reported this entry installed
+    /// while the messaging skill was actually unreadable.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn cursor_verifier_rejects_cache_with_dangling_skills_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (_dir, home, _guard) = plugin_test_env();
+        let cache = home
+            .join(".cursor/plugins/cache")
+            .join(super::CLAUDE_MARKETPLACE)
+            .join(super::PLUGIN_NAME)
+            .join("a1511e68");
+        let hooks = cache.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("hooks-cursor.json"), "{}").unwrap();
+        std::fs::write(cache.join(".cache-complete"), "").unwrap();
+        // Never points anywhere real, same shape as the measured M6 host.
+        symlink(cache.join("../../skills"), cache.join("skills")).unwrap();
+
+        assert!(
+            !super::verify_cursor_plugin_installed(),
+            "a cache entry whose skill payload is a dangling symlink must not verify as installed"
+        );
+        assert!(
+            super::cursor_cache_entry_missing_skill_payload().is_some(),
+            "Task 11: a cache entry with both marker files but a broken skill payload must \
+             be distinguishable from no cache entry at all"
+        );
+    }
+
+    /// Task 11: a healthy cache entry, and no cache entry at all, must not be
+    /// reported as "skill payload missing" — that message is for the one
+    /// state in between.
+    #[test]
+    #[serial]
+    fn cursor_cache_entry_missing_skill_payload_is_none_outside_the_broken_state() {
+        let (_dir, home, _guard) = plugin_test_env();
+        assert!(
+            super::cursor_cache_entry_missing_skill_payload().is_none(),
+            "no cache dir at all must not report a broken payload"
+        );
+
+        write_cursor_cache_entry(&home);
+        assert!(
+            super::cursor_cache_entry_missing_skill_payload().is_none(),
+            "a fully healthy cache entry must not report a broken payload"
+        );
+    }
+
+    /// Task 10a — the measured truth table the Cursor/Claude coupling rests on.
+    ///
+    /// Measured on a real host 2026-09-19: a Cursor agent spawned with **zero**
+    /// Cursor-side artifacts (registry, cache and all three stale checkouts
+    /// removed) still reported `bindings: hooks, pty` and loaded the messaging
+    /// skill out of `~/.claude/plugins/cache/hcom/hcom/1.0.1/`. Installing both
+    /// produced no duplicate: the skill appeared once and the delivery/start
+    /// event counts matched the Claude-only case exactly.
+    ///
+    /// So the row that matters is (claude=true, cursor=false): Cursor hooks are
+    /// live there, yet `verify_cursor_plugin_installed` reports false, because
+    /// it only ever looks at Cursor's own cache. This test pins that gap as a
+    /// measured fact rather than an assumption, and is the ground truth the
+    /// planned `cursor_hooks_covered()` has to satisfy — it must be true in
+    /// every row below except (false, false).
+    ///
+    /// Cursor's marketplace registry is account state with no backing file, so
+    /// no file-only verifier can consult it. Borrowing Claude's state is not a
+    /// shortcut here, it is the only signal available on the pre-spawn path,
+    /// which is barred from spawning a subprocess.
+    #[test]
+    #[serial]
+    fn cursor_and_claude_verifier_truth_table() {
+        for (claude, cursor) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (_dir, home, _guard) = plugin_test_env();
+
+            if claude {
+                write_healthy_claude_install(&home);
+                let settings = home.join(".claude/settings.json");
+                std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+                std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":true}}"#).unwrap();
+            }
+            if cursor {
+                write_cursor_cache_entry(&home);
+            }
+
+            assert_eq!(
+                super::verify_claude_plugin_installed(),
+                claude,
+                "claude verifier, row ({claude}, {cursor})"
+            );
+            assert_eq!(
+                super::verify_cursor_plugin_installed(),
+                cursor,
+                "cursor verifier reads only Cursor's own cache, row ({claude}, {cursor})"
+            );
+
+            // What Task 1 will add. Kept as a local expression so the table
+            // records the intended semantics before the function exists.
+            let covered =
+                super::verify_claude_plugin_installed() || super::verify_cursor_plugin_installed();
+            assert_eq!(
+                covered,
+                claude || cursor,
+                "hooks-covered, row ({claude}, {cursor})"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_is_covered_when_claude_plugin_installed() {
+        let (_dir, home, _guard) = plugin_test_env();
+
+        write_healthy_claude_install(&home);
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, r#"{"enabledPlugins":{"hcom@hcom":true}}"#).unwrap();
+
+        assert!(
+            !super::verify_cursor_plugin_installed(),
+            "no Cursor-side artifacts exist in this fixture"
+        );
+        assert!(super::cursor_hooks_covered());
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_not_covered_when_neither_installed() {
         let (_dir, _home, _guard) = plugin_test_env();
 
-        // No marketplaces directory at all.
+        assert!(!super::verify_claude_plugin_installed());
+        assert!(!super::verify_cursor_plugin_installed());
+        assert!(!super::cursor_hooks_covered());
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_covered_by_its_own_cache_without_claude() {
+        let (_dir, home, _guard) = plugin_test_env();
+
+        write_cursor_cache_entry(&home);
+
+        assert!(!super::verify_claude_plugin_installed());
+        assert!(super::cursor_hooks_covered());
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_verify_requires_a_completed_cache_entry() {
+        let (_dir, _home, _guard) = plugin_test_env();
+
+        // No cache directory at all.
         assert!(!super::verify_cursor_plugin_installed());
 
-        let marketplaces = super::cursor_marketplaces_dir();
-        let checkout = marketplaces
-            .join("github.com")
-            .join("hcom-owner")
-            .join("hcom-repo")
-            .join("deadbeef");
-
-        // A nested-but-wrong file: present somewhere under the checkout, but
-        // not at the exact path the verifier requires. Proves the walk
-        // checks the specific file, not "any file exists under a checkout".
-        let wrong = checkout
-            .join("plugin")
+        let cache = _home
+            .join(".cursor/plugins/cache")
+            .join(super::CLAUDE_MARKETPLACE)
             .join(super::PLUGIN_NAME)
-            .join("hooks");
-        std::fs::create_dir_all(&wrong).unwrap();
-        std::fs::write(wrong.join("not-the-hook-file.json"), "{}").unwrap();
+            .join("a1511e68");
+
+        // A nested-but-wrong file: present somewhere under the cache entry,
+        // but not at the exact path the verifier requires, and no
+        // `.cache-complete` either. Proves the walk checks the specific
+        // files, not "any file exists under a cache entry".
+        let hooks = cache.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("not-the-hook-file.json"), "{}").unwrap();
         assert!(!super::verify_cursor_plugin_installed());
 
-        // The real hook file lands the checkout counts.
-        std::fs::write(wrong.join("hooks-cursor.json"), "{}").unwrap();
+        // The real hook file lands but the entry still isn't marked
+        // complete.
+        std::fs::write(hooks.join("hooks-cursor.json"), "{}").unwrap();
+        assert!(!super::verify_cursor_plugin_installed());
+
+        // `.cache-complete` alone still isn't enough without the skill payload.
+        std::fs::write(cache.join(".cache-complete"), "").unwrap();
+        assert!(!super::verify_cursor_plugin_installed());
+
+        // Once the skill payload is complete too, the entry counts.
+        write_complete_skill_payload(&cache);
         assert!(super::verify_cursor_plugin_installed());
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_verifier_reads_the_plugin_cache_not_a_marketplace_checkout() {
+        let (_dir, home, _guard) = plugin_test_env();
+
+        // Checkout of the OLD marketplace repo, in the exact layout the old
+        // verifier accepted.
+        let stale = home
+            .join(".cursor/plugins/marketplaces/github.com/sirassss/hcom/60dc686")
+            .join("plugin/hcom/hooks");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("hooks-cursor.json"), "{}").unwrap();
+
+        assert!(
+            !super::verify_cursor_plugin_installed(),
+            "a stale marketplace checkout must not count as an installed plugin"
+        );
     }
 
     const CLAUDE_MANIFEST: &str = include_str!("../../plugin/hcom/hooks/hooks.json");
@@ -1900,6 +2528,57 @@ mod tests {
         }
     }
 
+    /// Mọi manifest ta ship phải trỏ về repo thật sự chứa chúng. Trước đây cả
+    /// bốn cái đều ghi upstream, nên không có trường nào trên đĩa phân biệt
+    /// được một bản cài từ fork với một bản cài từ upstream.
+    #[test]
+    fn shipped_plugin_manifests_point_at_our_own_repo() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifests = [
+            "plugin/hcom/.cursor-plugin/plugin.json",
+            "plugin/hcom/.claude-plugin/plugin.json",
+            "plugin/hcom/.codex-plugin/plugin.json",
+            "plugin/hcom-agy/.claude-plugin/plugin.json",
+        ];
+
+        for relative in manifests {
+            let path = repo_root.join(relative);
+            let json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+            for field in ["homepage", "repository"] {
+                assert_eq!(
+                    json[field].as_str().unwrap(),
+                    super::HCOM_PLUGIN_REPOSITORY_URL,
+                    "{relative} field `{field}` must name the repo that ships it"
+                );
+            }
+            // Ghi công tác giả gốc không được xoá cùng lúc.
+            assert_eq!(json["author"]["name"].as_str().unwrap(), "aannoo");
+            assert_eq!(json["license"].as_str().unwrap(), "MIT");
+        }
+    }
+
+    /// Marketplace descriptor và plugin được publish cùng một lần bởi
+    /// `scripts/sync-plugin-repo.sh`, nên version của chúng phải khớp.
+    #[test]
+    fn marketplace_and_plugin_versions_agree() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |relative: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(repo_root.join(relative)).unwrap())
+                .unwrap()
+        };
+
+        assert_eq!(
+            read("plugin/.claude-plugin/marketplace.json")["version"]
+                .as_str()
+                .unwrap(),
+            read("plugin/hcom/.claude-plugin/plugin.json")["version"]
+                .as_str()
+                .unwrap(),
+        );
+    }
+
     // ── Uninstall command shapes ──────────────────────────────────────
     //
     // Pure argument-list assertions — no subprocess. The end-to-end effect
@@ -1957,10 +2636,210 @@ mod tests {
     fn uninstall_is_a_noop_when_nothing_is_installed() {
         let (_dir, _home, _guard) = plugin_test_env();
         assert!(!super::verify_claude_plugin_installed());
+        assert!(!super::claude_plugin_has_any_trace());
         assert!(super::uninstall_claude_plugin().is_ok());
         assert!(!super::verify_cursor_plugin_installed());
+        assert!(!super::cursor_uninstall_should_attempt());
         assert!(super::uninstall_cursor_plugin().is_ok());
         assert!(!super::verify_agy_plugin_installed());
         assert!(super::uninstall_agy_plugin().is_ok());
+    }
+
+    /// Regression for the gap this task closes: `hcom hooks add cursor`
+    /// registers the marketplace and returns `Err` telling the user to finish
+    /// in `/plugins` — no cache entry exists yet at that point. Gating
+    /// removal on the strict, cache-only verifier made `hcom hooks remove
+    /// cursor` a silent no-op in exactly this state, leaving the marketplace
+    /// registered forever. The registry list (mocked here via
+    /// `HCOM_TEST_CURSOR_MARKETPLACE_LIST`) is what now proves it, not an
+    /// on-disk checkout.
+    #[test]
+    #[serial]
+    fn cursor_uninstall_attempts_removal_when_marketplace_registered_but_plugin_never_installed() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        let _list = EnvVarGuard::set(
+            "HCOM_TEST_CURSOR_MARKETPLACE_LIST",
+            "hcom  https://github.com/sirassss/hcom-plugin\n",
+        );
+
+        assert!(
+            !super::verify_cursor_plugin_installed(),
+            "no plugin cache exists yet in this state"
+        );
+        assert!(
+            super::cursor_uninstall_should_attempt(),
+            "a registered-but-never-installed marketplace must not read as nothing to clean up"
+        );
+    }
+
+    /// Fixture matches the REAL `cursor-agent plugin marketplace list` shape
+    /// measured 2026-09-19 (cursor-agent 2026.09.18-9a7762b): a whitespace
+    /// table with several other marketplaces, one of them (`cursor-public`)
+    /// a built-in `global` entry with no URL column at all. hcom's own row
+    /// still carries its URL, so the URL-substring match alone would pass
+    /// here too — this test locks in that the name-column match also fires,
+    /// so the check keeps working if Cursor ever drops the URL column.
+    #[test]
+    #[serial]
+    fn cursor_registry_lists_hcom_matches_real_marketplace_list_shape() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        let _list = EnvVarGuard::set(
+            "HCOM_TEST_CURSOR_MARKETPLACE_LIST",
+            "cursor-public     global  \n\
+             hcom              user    https://github.com/sirassss/hcom-plugin\n\
+             i-have-adhd       user    https://github.com/ayghri/i-have-adhd\n\
+             ponytail          user    https://github.com/DietrichGebert/ponytail\n",
+        );
+        assert!(super::cursor_registry_lists_hcom());
+    }
+
+    /// Name-only match must still hold if the URL column is ever dropped —
+    /// simulates that by listing hcom with no URL at all (as `cursor-public`
+    /// actually appears in the real output above).
+    #[test]
+    #[serial]
+    fn cursor_registry_lists_hcom_matches_on_name_alone() {
+        let (_dir, _home, _guard) = plugin_test_env();
+        let _list = EnvVarGuard::set(
+            "HCOM_TEST_CURSOR_MARKETPLACE_LIST",
+            "hcom              user  \n",
+        );
+        assert!(super::cursor_registry_lists_hcom());
+    }
+
+    /// Task 4's red test: `cursor_marketplace_checkout_exists`, the function
+    /// this replaces, matched a leftover on-disk marketplace checkout that a
+    /// successful `cursor-agent plugin marketplace remove` never cleans up
+    /// (plan M3) — so it stayed stuck at `true` forever once a checkout had
+    /// ever existed, making `hcom hooks remove cursor` fail with "No
+    /// marketplace matches" in an infinite loop (plan M4). The registry
+    /// listing is the actual source of truth: a stale directory must not
+    /// override what it says.
+    #[test]
+    #[serial]
+    fn cursor_uninstall_does_not_attempt_when_registry_lacks_hcom() {
+        let (_dir, home, _guard) = plugin_test_env();
+        // Simulates the exact M4 state: a checkout directory survives a
+        // completed removal.
+        let checkout =
+            home.join(".cursor/plugins/marketplaces/github.com/sirassss/hcom-plugin/abc1234");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let _list = EnvVarGuard::set(
+            "HCOM_TEST_CURSOR_MARKETPLACE_LIST",
+            "some-other-marketplace  https://github.com/someone/else\n",
+        );
+
+        assert!(!super::verify_cursor_plugin_installed());
+        assert!(
+            !super::cursor_uninstall_should_attempt(),
+            "a stale on-disk checkout must not override a registry listing that lacks hcom"
+        );
+    }
+
+    /// Same M4 shape, the artifact this test's sibling above didn't cover:
+    /// a fully MATERIALIZED cache (not just a bare checkout dir) survives
+    /// `marketplace remove` untouched (measured 2026-09-20, real host) —
+    /// `verify_cursor_plugin_installed()` reads `true` from that alone. An
+    /// earlier version of `cursor_uninstall_should_attempt` OR'd that verifier
+    /// in, so this exact state made `hcom hooks remove cursor` retry the
+    /// removal CLI and print "No marketplace matches" forever, on every
+    /// single invocation — the loop `cursor_registry_lists_hcom` was built to
+    /// close, reopened through the cache instead of the checkout.
+    #[test]
+    #[serial]
+    fn cursor_uninstall_does_not_attempt_when_cache_survives_but_registry_lacks_hcom() {
+        let (_dir, home, _guard) = plugin_test_env();
+        let cache_root = home.join(".cursor/plugins/cache/hcom/hcom/deadbeef");
+        std::fs::create_dir_all(cache_root.join("hooks")).unwrap();
+        std::fs::write(cache_root.join(".cache-complete"), "").unwrap();
+        std::fs::write(cache_root.join("hooks").join("hooks-cursor.json"), "{}").unwrap();
+        let skill_root = cache_root.join("skills").join("hcom-agent-messaging");
+        for relative in super::PLUGIN_SKILL_FILES {
+            let path = skill_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "content").unwrap();
+        }
+        let _list = EnvVarGuard::set(
+            "HCOM_TEST_CURSOR_MARKETPLACE_LIST",
+            "some-other-marketplace  https://github.com/someone/else\n",
+        );
+
+        assert!(
+            super::verify_cursor_plugin_installed(),
+            "a fully materialized cache must read as installed"
+        );
+        assert!(
+            !super::cursor_uninstall_should_attempt(),
+            "a surviving cache must not override a registry listing that lacks hcom"
+        );
+    }
+
+    /// Same gap, Claude side: the marketplace registration and cache can
+    /// exist while `enabledPlugins` never got a `hcom@hcom` entry (or was
+    /// stripped by hand), which fails the strict verifier's AND but is still
+    /// a marketplace registration `hooks remove claude` must clean up.
+    #[test]
+    #[serial]
+    fn claude_uninstall_attempts_removal_when_marketplace_registered_but_plugin_never_enabled() {
+        let (_dir, home, _guard) = plugin_test_env();
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(
+            home.join(".claude/plugins/known_marketplaces.json"),
+            r#"{"hcom":{"source":{"source":"git","url":"https://github.com/sirassss/hcom-plugin"}}}"#,
+        )
+        .unwrap();
+
+        assert!(!super::verify_claude_plugin_installed());
+        assert!(
+            super::claude_plugin_has_any_trace(),
+            "a registered-but-never-enabled marketplace must not read as nothing to clean up"
+        );
+    }
+
+    /// The other two vertices of `claude_plugin_has_any_trace`'s OR, isolated:
+    /// the function's own doc motivates it with "removed the marketplace by
+    /// hand while enabledPlugins and the install-path cache survive" — this
+    /// covers the `enabledPlugins`-only half of that exact state.
+    #[test]
+    #[serial]
+    fn claude_uninstall_attempts_removal_when_only_the_enabled_flag_remains() {
+        let (_dir, home, _guard) = plugin_test_env();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        // The marketplace and cache are already gone; only a leftover
+        // enabledPlugins entry remains (even disabled, its presence alone is
+        // a trace worth telling `claude plugin uninstall` about).
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"hcom@hcom":false}}"#,
+        )
+        .unwrap();
+
+        assert!(!super::verify_claude_plugin_installed());
+        assert!(
+            super::claude_plugin_has_any_trace(),
+            "an enabledPlugins entry alone must not read as nothing to clean up"
+        );
+    }
+
+    /// The install-path cache half of the same state: no enabledPlugins
+    /// entry, no known marketplace, only a leftover `installed_plugins.json`
+    /// record.
+    #[test]
+    #[serial]
+    fn claude_uninstall_attempts_removal_when_only_the_installed_plugins_registry_remains() {
+        let (_dir, home, _guard) = plugin_test_env();
+        let plugins = home.join(".claude/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(
+            plugins.join("installed_plugins.json"),
+            r#"{"plugins":{"hcom@hcom":[{"scope":"user","installPath":"/nonexistent","version":"1.0.1"}]}}"#,
+        )
+        .unwrap();
+
+        assert!(!super::verify_claude_plugin_installed());
+        assert!(
+            super::claude_plugin_has_any_trace(),
+            "an installed_plugins.json entry alone must not read as nothing to clean up"
+        );
     }
 }

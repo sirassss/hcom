@@ -556,6 +556,31 @@ fn generate_process_id() -> String {
 /// machine, and that should happen because they asked, not as a side effect of
 /// starting an agent.
 fn hooks_missing_warning(tool: &LaunchTool) -> String {
+    // Cursor gets its own phrasing. The call site only reaches here when
+    // `verify_cursor_plugin_installed()` already said false, but that alone
+    // doesn't mean no hooks are firing: `cursor_hooks_covered()` (Task 1,
+    // subprocess-free, safe on this pre-spawn path) also checks Claude's
+    // plugin, which `cursor-agent` reads directly (measured M1, 2026-09-19).
+    // When it says yes, this is now a definitive answer, not a hedge. When it
+    // says no, `install_cursor_plugin` can still be mid-flight right after a
+    // launch triggers the install (marketplace add succeeds but the cache
+    // doesn't exist until the user finishes in `/plugins`), so this still
+    // avoids the flat "not installed" claim `cursor_status_line` (hooks.rs)
+    // also refuses to make in its equivalent uncovered state.
+    if matches!(tool, LaunchTool::Cursor) {
+        return if crate::hooks::plugin::cursor_hooks_covered() {
+            "hcom hooks for cursor are running via Claude's installed plugin — no separate \
+             Cursor install needed. Removing hcom from Claude removes this too.\n  \
+             To install a separate copy for Cursor anyway:  hcom hooks add cursor --own"
+                .to_string()
+        } else {
+            "hcom cannot confirm hcom hooks are set up for cursor — neither Claude's plugin \
+             nor a Cursor-owned cache covers it yet. Messages may not be delivered this \
+             session.\n  For a Cursor-owned install:  hcom hooks add cursor, then /plugins → \
+             install \"hcom\"."
+                .to_string()
+        };
+    }
     let name = match tool {
         LaunchTool::ClaudePty => "claude",
         other => other.as_str(),
@@ -795,7 +820,16 @@ fn ensure_hooks_installed(
             Ok(())
         }
         LaunchTool::Cursor => {
-            if !crate::hooks::plugin::verify_cursor_plugin_installed() {
+            // Gate on `cursor_hooks_covered()`, not `verify_cursor_plugin_installed()`
+            // alone: the plan's intended default state (Claude's plugin
+            // installed, Cursor with no cache of its own) is supposed to be
+            // quiet (no noise) — but `verify_cursor_plugin_installed()` is
+            // `false` in exactly that healthy state too, since Cursor has no
+            // cache of its own to verify. Gating the print on it fired this
+            // warning on every single Cursor spawn even when Claude fully
+            // covers the hook. `cursor_hooks_covered()` is subprocess-free
+            // (two file checks) and safe on this pre-spawn hot path.
+            if !crate::hooks::plugin::cursor_hooks_covered() {
                 eprintln!("{}", hooks_missing_warning(tool));
             }
             Ok(())

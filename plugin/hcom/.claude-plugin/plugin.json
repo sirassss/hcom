@@ -5,8 +5,8 @@
   "author": {
     "name": "aannoo"
   },
-  "homepage": "https://github.com/aannoo/hcom",
-  "repository": "https://github.com/aannoo/hcom",
+  "homepage": "https://github.com/sirassss/hcom-plugin",
+  "repository": "https://github.com/sirassss/hcom-plugin",
   "license": "MIT",
   "keywords": ["hcom", "multi-agent", "communication", "claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot"]
 }
