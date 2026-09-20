@@ -446,8 +446,8 @@ impl HcomDb {
     }
 
     /// Same as [`Self::finalize_instance_stop`], but the delete additionally
-    /// requires the instance's *current* `pid`/`status` to still match
-    /// `expected_pid`/`expected_status`.
+    /// requires the instance's current PID, PID namespace and status to
+    /// still match the probed snapshot.
     ///
     /// A dead-process reaper reads a PID snapshot, probes it out-of-band, and
     /// only then decides to finalize — so identity (name/created_at/session/
@@ -464,6 +464,7 @@ impl HcomDb {
         session_id: Option<&str>,
         agent_id: Option<&str>,
         expected_pid: Option<i64>,
+        expected_pid_namespace: &str,
         expected_status: &str,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
@@ -472,7 +473,7 @@ impl HcomDb {
             created_at,
             session_id,
             agent_id,
-            Some((expected_pid, expected_status)),
+            Some((expected_pid, expected_pid_namespace, expected_status)),
             event_data,
         )
     }
@@ -483,7 +484,7 @@ impl HcomDb {
         created_at: f64,
         session_id: Option<&str>,
         agent_id: Option<&str>,
-        pid_status_guard: Option<(Option<i64>, &str)>,
+        pid_status_guard: Option<(Option<i64>, &str, &str)>,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
         let timestamp = chrono_now_iso();
@@ -491,18 +492,21 @@ impl HcomDb {
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
-            let deleted = if let Some((expected_pid, expected_status)) = pid_status_guard {
+            let deleted = if let Some((expected_pid, expected_pid_namespace, expected_status)) =
+                pid_status_guard
+            {
                 tx.execute(
                     "DELETE FROM instances
                      WHERE name = ? AND created_at = ?
                        AND session_id IS ? AND agent_id IS ?
-                       AND pid IS ? AND status = ?",
+                       AND pid IS ? AND COALESCE(pid_namespace, '') = ? AND status = ?",
                     params![
                         name,
                         created_at,
                         session_id,
                         agent_id,
                         expected_pid,
+                        expected_pid_namespace,
                         expected_status
                     ],
                 )?
@@ -1385,6 +1389,7 @@ mod tests {
                 None,
                 None,
                 Some(111),
+                "",
                 "active",
                 &serde_json::json!({"action": "stopped"}),
             )
@@ -1412,6 +1417,7 @@ mod tests {
                 None,
                 None,
                 Some(222),
+                "",
                 "active",
                 &serde_json::json!({"action": "stopped"}),
             )
@@ -1436,6 +1442,7 @@ mod tests {
                 None,
                 None,
                 Some(333),
+                "",
                 "active",
                 &serde_json::json!({"action": "stopped"}),
             )
@@ -1454,6 +1461,7 @@ mod tests {
                 None,
                 None,
                 Some(333),
+                "",
                 "listening",
                 &serde_json::json!({"action": "stopped"}),
             )
@@ -1482,6 +1490,7 @@ mod tests {
             None,
             None,
             Some(444),
+            "",
             "active",
             &serde_json::json!({"action": "stopped"}),
         );
@@ -1504,6 +1513,7 @@ mod tests {
                 None,
                 None,
                 Some(444),
+                "",
                 "active",
                 &serde_json::json!({"action": "stopped"}),
             )
@@ -1543,6 +1553,7 @@ mod tests {
                 None,
                 None,
                 Some(555),
+                "",
                 "active",
                 &serde_json::json!({"action": "stopped", "reason": "exit:dead_process"}),
             )
@@ -1569,6 +1580,7 @@ mod tests {
                 None,
                 None,
                 Some(666),
+                "",
                 "active",
                 &serde_json::json!({"action": "stopped", "reason": "exit:dead_process"}),
             )

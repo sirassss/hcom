@@ -286,72 +286,33 @@ pub fn record_pid(rec: &PidRecord<'_>) {
 ///
 /// Auto-prunes dead PIDs from the file. If `active_pids` is provided,
 /// also prunes PIDs that are now active from the file and filters them
-/// from the result.
+/// from the result. Foreign/unknown namespaces stay on disk but are never
+/// returned: callers use this list to kill or adopt local processes.
 pub fn get_orphan_processes(
     hcom_dir: &Path,
     active_pids: Option<&std::collections::HashSet<u32>>,
 ) -> Vec<OrphanProcess> {
-    let data = read_raw(hcom_dir);
-
-    // Keep everything except PIDs we watched die. An entry recorded in another
-    // PID namespace reads as unknown, not dead: pruning it would throw away the
-    // pane/session metadata a live host agent needs to be recovered.
-    let mut alive: HashMap<String, PidEntry> = HashMap::new();
-    for (pid_str, entry) in &data {
+    let mut data = read_raw(hcom_dir);
+    let original_len = data.len();
+    let mut result = Vec::new();
+    data.retain(|pid_str, entry| {
         let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
+            return false;
         };
-        if entry_liveness(pid, entry) == Some(false) {
-            continue;
-        }
-        alive.insert(pid_str.clone(), entry.clone());
-    }
-
-    // Write back pruned data if anything was removed
-    if alive.len() != data.len() {
-        write_raw(hcom_dir, &alive);
-    }
-
-    // Build result
-    let mut result: Vec<OrphanProcess> = alive
-        .iter()
-        .filter_map(|(pid_str, entry)| {
-            pid_str
-                .parse::<u32>()
-                .ok()
-                .map(|pid| OrphanProcess::from((pid, entry)))
-        })
-        .collect();
-
-    // Prune active PIDs from file and filter from result.
-    //
-    // `active` holds bare PID numbers, which are only unique within one PID
-    // namespace. Removal is therefore limited to entries recorded in *our*
-    // namespace, so a host PID that happens to collide numerically with a
-    // sandbox PID cannot delete the other's metadata.
-    //
-    // ponytail: the `retain` below stays on bare PIDs — a collision there only
-    // hides an entry from this listing (display, and what `hcom` offers to
-    // adopt), and a foreign-namespace entry is not adoptable from here anyway.
-    // Widen to (namespace, pid) if adoption ever spans namespaces.
-    if let Some(active) = active_pids {
-        let active_in_file: Vec<String> = result
-            .iter()
-            .filter(|p| {
-                active.contains(&p.pid)
-                    && crate::sys::process::is_alive_in(p.pid, Some(p.pid_namespace.as_str()))
-                        .is_some()
-            })
-            .map(|p| p.pid.to_string())
-            .collect();
-        if !active_in_file.is_empty() {
-            let mut pruned = alive;
-            for k in &active_in_file {
-                pruned.remove(k);
+        match entry_liveness(pid, entry) {
+            None => true, // Preserve metadata without offering an unsafe PID.
+            Some(false) => false,
+            Some(true) => {
+                if active_pids.is_some_and(|active| active.contains(&pid)) {
+                    return false;
+                }
+                result.push(OrphanProcess::from((pid, &*entry)));
+                true
             }
-            write_raw(hcom_dir, &pruned);
         }
-        result.retain(|p| !active.contains(&p.pid));
+    });
+    if data.len() != original_len {
+        write_raw(hcom_dir, &data);
     }
 
     result
@@ -661,16 +622,35 @@ mod tests {
             "a pid we cannot inspect is not evidence of death"
         );
         assert!(!data.contains_key("99999999"), "our own dead pid is pruned");
-        assert!(orphans.iter().any(|o| o.pid == 99_999_998));
-        assert_eq!(
-            orphans
-                .iter()
-                .find(|o| o.pid == 99_999_998)
-                .unwrap()
-                .pid_namespace,
-            "pid:[foreign]",
-            "the marker travels with the orphan so adoption can copy it"
+        assert!(
+            orphans.is_empty(),
+            "foreign PIDs must not reach kill/adopt callers"
         );
+        assert_eq!(data["99999998"].pid_namespace, "pid:[foreign]");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn orphan_scan_does_not_offer_foreign_or_unknown_live_pid_collisions() {
+        let dir = make_temp_dir();
+        let pid = std::process::id();
+        record_foreign(dir.path(), pid, "host_agent");
+        for namespace in ["pid:[foreign]", ""] {
+            let mut data = read_raw(dir.path());
+            data.get_mut(&pid.to_string()).unwrap().pid_namespace = namespace.into();
+            write_raw(dir.path(), &data);
+            assert!(get_orphan_processes(dir.path(), None).is_empty());
+            assert_eq!(
+                read_raw(dir.path())[&pid.to_string()].pid_namespace,
+                namespace
+            );
+        }
+        let mut data = read_raw(dir.path());
+        data.get_mut(&pid.to_string()).unwrap().pid_namespace = current_namespace();
+        write_raw(dir.path(), &data);
+        let local = get_orphan_processes(dir.path(), None);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].pid, pid);
     }
 
     /// Bare PID numbers are only unique inside one namespace, so an active

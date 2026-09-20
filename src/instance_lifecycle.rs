@@ -1035,6 +1035,7 @@ fn reconcile_dead_instances_with_probe(
             inst.session_id.as_deref(),
             inst.agent_id.as_deref(),
             inst.pid,
+            inst.pid_namespace.as_deref().unwrap_or(""),
             &inst.status,
             &event_data,
         ) {
@@ -1975,6 +1976,46 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn reconcile_preserves_row_rebound_to_another_pid_namespace() {
+        let (db, path) = setup_test_db();
+        insert_active_with_session(&db, "rebound", "session", 1.0, 4242);
+        crate::hooks::common::claim_stop_reason(&db, "rebound", 1.0, "user", "killed");
+        let reconciled =
+            reconcile_dead_instances_with_probe(&db, DeadProcessDetector::Tui, |inst, _| {
+                // Rebind between the reaper's snapshot/probe and DELETE,
+                // keeping the numeric PID and every other guarded field.
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET pid_namespace = 'pid:[foreign]' WHERE name = ?",
+                        [&inst.name],
+                    )
+                    .unwrap();
+                ProcessProbe::Dead
+            })
+            .unwrap();
+        assert_eq!(reconciled, 0);
+        assert_eq!(
+            db.get_instance_full("rebound")
+                .unwrap()
+                .unwrap()
+                .pid_namespace
+                .as_deref(),
+            Some("pid:[foreign]")
+        );
+        assert!(crate::hooks::common::read_stop_reason(&db, "rebound", 1.0).is_some());
+        let events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'rebound'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0);
+        cleanup(path);
     }
 
     /// Step 1 regression fixture: a probe-injected pass over every row shape
