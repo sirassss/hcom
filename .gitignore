@@ -6,3 +6,6 @@
 # code-graph tool cache
 .codegraph/
 .idea
+
+# subagent-driven-development scratch workspace
+.superpowers/
