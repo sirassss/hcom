@@ -68,9 +68,26 @@ fn resolve_shell_env_uncached() -> Option<HashMap<String, String>> {
     }
 
     let marker = format!("hcom-shell-env-{}", uuid::Uuid::new_v4());
-    let cmd = format!("printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\"");
+    let env_bin = env_binary();
+    let cmd = format!("printf %s \"${MARKER_VAR}\"; {env_bin} -0; printf %s \"${MARKER_VAR}\"");
     let output = timed_shell_output(&shell, &cmd, &marker)?;
     parse_shell_env_output(&output.stdout, &marker, MARKER_VAR)
+}
+
+/// Absolute path to the real `env(1)`, bypassing PATH.
+///
+/// Tools like uv/rye install a 3-line `env` shim earlier in PATH
+/// (`~/.local/bin/env`) that only re-exports PATH and prints nothing, so
+/// a login shell resolving bare `env` via PATH can silently produce no
+/// output instead of a var dump. `/usr/bin/env` is the real coreutils/BSD
+/// binary on every supported platform; fall back to bare `env` only if
+/// it's missing.
+fn env_binary() -> &'static str {
+    if Path::new("/usr/bin/env").is_file() {
+        "/usr/bin/env"
+    } else {
+        "env"
+    }
 }
 
 fn shell_path() -> Option<PathBuf> {
@@ -435,7 +452,8 @@ mod tests {
         let cmd = format!(
             "chunk=x; i=0; while [ \"$i\" -lt 12 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
              i=0; while [ \"$i\" -lt 64 ]; do echo \"$chunk\" >&2; i=$((i + 1)); done; \
-             printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
+             printf %s \"${MARKER_VAR}\"; {env_bin} -0; printf %s \"${MARKER_VAR}\"",
+            env_bin = env_binary()
         );
 
         let output =

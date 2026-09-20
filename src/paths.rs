@@ -374,8 +374,17 @@ mod tests {
 
     #[test]
     fn test_is_test_temp_path_rejects_non_temp() {
+        // Not CARGO_MANIFEST_DIR: a worktree checked out under /tmp (a normal
+        // thing for an agent to do) makes the repo path itself a temp path,
+        // producing a false failure unrelated to any real regression. Derive
+        // a guaranteed-non-temp fixture from temp_dir()'s own parent instead,
+        // so the assertion holds regardless of where the repo happens to sit.
+        let temp = std::env::temp_dir();
+        let parent = temp
+            .parent()
+            .expect("the OS temp dir has a parent directory");
         assert!(!is_test_temp_path(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hcom.db")
+            &parent.join("hcom-test-non-temp-fixture").join("hcom.db")
         ));
     }
 
