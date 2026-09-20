@@ -898,7 +898,10 @@ impl ScreenTracker {
         for (row_idx, line) in lines.iter().enumerate().rev() {
             let trimmed = line.trim_start();
             if let Some(text) = trimmed.strip_prefix("› ") {
-                let text = trim_with_nbsp(text);
+                // Codex paints Braille spinner cells after the input on this row.
+                let text = trim_with_nbsp(text).trim_end_matches(|c: char| {
+                    c.is_whitespace() || matches!(c, '\u{2800}'..='\u{28FF}')
+                });
 
                 if text.is_empty() {
                     return Some(String::new());
@@ -1597,6 +1600,27 @@ mod tests {
         let mut t = make_tracker(24, 80, "? for shortcuts");
         t.process("› hello world\r\n".as_bytes());
         assert_eq!(t.get_codex_input_text(), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn codex_ignores_spinner_glyphs_after_input() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› <hcom>  ⠄  ⠠⡀⠀\r\n".as_bytes());
+        assert_eq!(t.get_codex_input_text(), Some("<hcom>".to_string()));
+    }
+
+    #[test]
+    fn codex_keeps_braille_within_input() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› <hcom>⠄user  ⠠\r\n".as_bytes());
+        assert_eq!(t.get_codex_input_text(), Some("<hcom>⠄user".to_string()));
+    }
+
+    #[test]
+    fn codex_keeps_unknown_prompt_suffix() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› <hcom>  ⚙\r\n".as_bytes());
+        assert_eq!(t.get_codex_input_text(), Some("<hcom>  ⚙".to_string()));
     }
 
     #[test]
