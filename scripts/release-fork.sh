@@ -14,7 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO="$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 TAG="${1:-v${VERSION}-fork.$(git rev-parse --short HEAD)}"
-HOST_TARGET="$(rustc -print host-tuple)"
+HOST_TARGET="$(rustc --print host-tuple)"
 
 echo "[release-fork] repo=$REPO tag=$TAG target=$HOST_TARGET"
 
@@ -22,6 +22,24 @@ if ! git merge-base --is-ancestor HEAD "origin/$(git branch --show-current)" 2>/
     echo "[release-fork] HEAD isn't on origin yet — push the branch first (git push origin $(git branch --show-current))" >&2
     exit 1
 fi
+
+COMMIT_SHA="$(git rev-parse HEAD)"
+echo "[release-fork] checking CI status for $COMMIT_SHA..."
+runs="$(gh run list --repo "$REPO" -c "$COMMIT_SHA" --json status,conclusion,name,url)"
+if [ "$(echo "$runs" | jq 'length')" -eq 0 ]; then
+    echo "[release-fork] no CI runs found for $COMMIT_SHA — push may not have triggered CI yet" >&2
+    exit 1
+fi
+if echo "$runs" | jq -e '.[] | select(.status != "completed")' >/dev/null; then
+    echo "[release-fork] CI still running for $COMMIT_SHA — wait for it to finish" >&2
+    exit 1
+fi
+if echo "$runs" | jq -e '.[] | select(.conclusion != "success")' >/dev/null; then
+    echo "[release-fork] CI failed for $COMMIT_SHA:" >&2
+    echo "$runs" | jq -r '.[] | select(.conclusion != "success") | "  - \(.name): \(.conclusion) (\(.url))"' >&2
+    exit 1
+fi
+echo "[release-fork] CI passed for $COMMIT_SHA"
 
 # dist bakes the repo owner/repo into the installer from Cargo.toml's
 # `repository` field, which points at upstream. Patch it just for this build,

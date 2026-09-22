@@ -561,10 +561,16 @@ fn write_healthy_claude_install(home: &std::path::Path) -> std::path::PathBuf {
     .unwrap();
     std::fs::write(
         plugins.join("installed_plugins.json"),
-        format!(
-            r#"{{"plugins":{{"hcom@hcom":[{{"scope":"user","installPath":"{}","version":"1.0.1"}}]}}}}"#,
-            install_path.display()
-        ),
+        serde_json::json!({
+            "plugins": {
+                "hcom@hcom": [{
+                    "scope": "user",
+                    "installPath": install_path.to_string_lossy(),
+                    "version": "1.0.1"
+                }]
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     install_path
@@ -1559,7 +1565,7 @@ fn shipped_plugin_manifests_point_at_our_own_repo() {
 }
 
 /// Marketplace descriptor và plugin được publish cùng một lần bởi
-/// `scripts/sync-plugin-repo.sh`, nên version của chúng phải khớp.
+/// `scripts/sync-plugin-skills.sh --publish`, nên version của chúng phải khớp.
 #[test]
 fn marketplace_and_plugin_versions_agree() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -61,6 +61,7 @@ fn insert_stale_active(db: &HcomDb, name: &str, status_age: i64, heartbeat_age: 
         .unwrap();
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn set_pid_namespace(db: &HcomDb, name: &str, namespace: Option<&str>) {
     db.conn()
         .execute(

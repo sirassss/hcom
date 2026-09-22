@@ -612,7 +612,7 @@ where
     install_then_strip(|| install(&source), verify, strip)
 }
 
-/// A dedicated repository, kept in sync by `scripts/sync-plugin-repo.sh`, so
+/// A dedicated repository, kept in sync by `scripts/sync-plugin-skills.sh --publish`, so
 /// no vendor's marketplace/install has to clone the whole monorepo (`src/`,
 /// `tests/`, `docs/`...) just to reach `plugin/`. Its root is
 /// `plugin/hcom-agy`'s content; a `hcom` subdirectory holds `plugin/hcom`'s
@@ -756,7 +756,15 @@ pub(crate) fn install_codex_plugin() -> Result<(), String> {
 /// Uninstall the Codex plugin. Deliberately does **not** touch Claude's plugin
 /// or Claude's marketplace registration: one shared package, but each vendor
 /// installs and removes its own copy.
+///
+/// No `codex` binary on PATH means no Codex plugin could exist to remove —
+/// same "not installed, not unverified" read `codex_plugin_status_at` uses —
+/// so this returns `Ok(())` instead of running the CLI into a "not runnable"
+/// error that would otherwise fail `hooks remove` on any machine without Codex.
 pub(crate) fn uninstall_codex_plugin() -> Result<(), String> {
+    if crate::terminal::which_bin("codex").is_none() {
+        return Ok(());
+    }
     run_tool_cli("codex", &["plugin", "remove", CLAUDE_PLUGIN_ID])
 }
 

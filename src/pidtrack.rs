@@ -600,6 +600,7 @@ mod tests {
 
     /// Writes an entry the way another PID namespace would have: same shape,
     /// a marker this process cannot match, and a PID number that is dead here.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn record_foreign(dir: &Path, pid: u32, name: &str) {
         record_pid(&rec(dir, pid, "claude", name));
         let mut data = read_raw(dir);
