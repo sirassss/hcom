@@ -618,6 +618,42 @@ fn kill_single(
                     },
                 );
             }
+            // Entry with unknown liveness (no `pid_namespace` on record, e.g.
+            // written before that field existed): `get_orphan_processes` never
+            // surfaces these since it can't confirm they're alive. But the
+            // caller named this exact PID, so try the real signal — no pane
+            // cleanup, since a stale/reused pane_id could close someone else's
+            // live pane (terminal::kill_process doesn't verify pane occupancy).
+            if let Some(pid) = target_pid
+                && pidtrack::get_tracked_entry(hcom_dir, pid).is_some()
+            {
+                use crate::sys::process::{GroupSignal, terminate_group};
+                match terminate_group(pid) {
+                    GroupSignal::Sent => {
+                        println!("Sent SIGTERM to process group {} for '{}'", pid, target);
+                    }
+                    #[cfg(unix)]
+                    GroupSignal::PermissionDenied => {
+                        eprintln!("Permission denied to kill process group {}", pid);
+                        return Ok(1);
+                    }
+                    GroupSignal::NotFound => {
+                        println!(
+                            "PID {} not visible from this namespace; removed from tracking",
+                            pid
+                        );
+                    }
+                    #[cfg(unix)]
+                    GroupSignal::Other => {
+                        println!(
+                            "PID {} not visible from this namespace; removed from tracking",
+                            pid
+                        );
+                    }
+                }
+                pidtrack::remove_pid(hcom_dir, pid);
+                return Ok(0);
+            }
             bail!("Agent '{}' not found", target);
         }
     };
@@ -759,6 +795,32 @@ fn kill_instance(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_kill_single_removes_unknown_namespace_orphan() {
+        // Regression: an orphan entry with no `pid_namespace` on record (e.g.
+        // written before that field existed) used to be un-killable — the TUI
+        // showed it forever, and `hcom kill <pid>` always bailed "not found"
+        // because `get_orphan_processes` never surfaces unknown-liveness
+        // entries. See docs/issues/2026-09-21-orphan-no-pid-namespace-stuck-unkillable.md
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let db_path = dir.path().join("hcom.db");
+        let db = HcomDb::open_at(&db_path).unwrap();
+
+        // Matches the convention in pidtrack's own orphan tests: a PID this
+        // large is never a real running process during a test run.
+        let dead_pid = 99999999;
+
+        pidtrack::record_pid(&pidtrack::PidRecord {
+            pid_namespace: Some(""), // unknown, as legacy entries read
+            ..pidtrack::PidRecord::new(dir.path(), dead_pid, "claude", "ghost", "/tmp")
+        });
+
+        let exit = kill_single(&db, dir.path(), &dead_pid.to_string(), "test").unwrap();
+        assert_eq!(exit, 0);
+        assert!(pidtrack::get_tracked_entry(dir.path(), dead_pid).is_none());
+    }
 
     #[test]
     fn test_kill_no_target_fails() {

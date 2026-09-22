@@ -318,6 +318,17 @@ pub fn get_orphan_processes(
     result
 }
 
+/// Look up a tracked entry by PID regardless of liveness. Read-only — unlike
+/// [`get_orphan_processes`], never prunes or writes. For an explicit,
+/// user-targeted `hcom kill <pid>`: the caller supplied the exact PID, so an
+/// unknown-liveness entry (no `pid_namespace` on record) is still a valid kill
+/// target, just one the automatic orphan scan won't surface on its own.
+pub fn get_tracked_entry(hcom_dir: &Path, pid: u32) -> Option<OrphanProcess> {
+    let data = read_raw(hcom_dir);
+    data.get(&pid.to_string())
+        .map(|entry| OrphanProcess::from((pid, entry)))
+}
+
 /// Remove a PID from tracking (after kill).
 pub fn remove_pid(hcom_dir: &Path, pid: u32) {
     let mut data = read_raw(hcom_dir);
@@ -580,6 +591,25 @@ mod tests {
         let data = read_raw(dir.path());
         assert!(!data.contains_key("99999999"));
         assert!(orphans.iter().all(|o| o.pid != 99999999));
+    }
+
+    #[test]
+    fn test_unknown_namespace_orphan_excluded_but_still_tracked_by_pid() {
+        let dir = make_temp_dir();
+        record_pid(&PidRecord {
+            pid_namespace: Some(""), // explicit "I don't know" marker
+            ..rec(dir.path(), 99999999, "claude", "dead")
+        });
+
+        // Unknown liveness: never offered as an automatic orphan...
+        let orphans = get_orphan_processes(dir.path(), None);
+        assert!(orphans.iter().all(|o| o.pid != 99999999));
+        // ...but a caller targeting this exact PID can still find it, and it
+        // was never pruned from disk (liveness genuinely unknown, not dead).
+        let data = read_raw(dir.path());
+        assert!(data.contains_key("99999999"));
+        assert!(get_tracked_entry(dir.path(), 99999999).is_some());
+        assert!(get_tracked_entry(dir.path(), 424242).is_none());
     }
 
     #[test]
