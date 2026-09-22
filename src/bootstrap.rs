@@ -59,12 +59,11 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - Message: send {target_name_s} [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- 'plain text'
   Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send {target_luna} {target_nova} --intent ack --reply-to 82 --name {instance_name} -- 'ok'
-- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
-- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search 'text' [--all]
+- See who's active: list [-v] [--json] [name]
+- Read another's conversation: transcript [name] [--last N] | transcript search 'text'
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
-  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
+  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN | --file PATH
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
-- Handoff context: bundle prepare
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
@@ -72,7 +71,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
-- Other commands: status (diagnostics), config (set terminal, etc), relay (remote)
+- Other: status | config | relay
 
 If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
@@ -80,7 +79,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 1. Task via hcom → ack immediately, do work, report via hcom
 2. No filler messages (greetings, thanks, congratulations).
-3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
+3. Always set --intent: request=reply needed, inform=FYI, ack=receipt.
 4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
@@ -393,8 +392,8 @@ fn build_context(
 }
 
 /// Apply string substitutions on template text.
-/// Replaces {key} patterns with context values, then unescapes {{ → { and }} → }
-/// then unescapes {{ → { and }} → } (template uses {{name}} to produce literal {name}).
+/// Replaces {key} patterns with context values. A brace run that is not a known
+/// key passes through untouched, so templates write literal braces as-is.
 fn render_template(template: &str, ctx: &BootstrapContext) -> String {
     template
         .replace("{display_name}", &ctx.display_name)
@@ -409,8 +408,6 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{target_luna}", &recipient_token("luna"))
         .replace("{target_nova}", &recipient_token("nova"))
         .replace("{target_tag}", &recipient_token(&format!("{}-", ctx.tag)))
-        .replace("{{", "{")
-        .replace("}}", "}")
 }
 
 // PUBLIC API
@@ -509,7 +506,8 @@ pub fn get_bootstrap(
 
     let mut result = render_template(&joined, &ctx);
 
-    // User notes (appended after render to avoid brace issues in user text)
+    // User notes: appended after render so a `{...}` in user text is never
+    // mistaken for a template key.
     if !ctx.notes.is_empty() {
         result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
     }

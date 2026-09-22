@@ -248,6 +248,28 @@ fn test_get_bootstrap_with_notes() {
     assert!(result.contains("Remember to use bun"));
 }
 
+/// Notes are appended after template rendering, so a brace run in user text
+/// survives verbatim even when it looks like a template key.
+#[test]
+fn test_notes_braces_are_not_substituted() {
+    let (tmp, db) = setup_test_db();
+
+    let result = get_bootstrap(
+        &db,
+        tmp.path(),
+        "luna",
+        "claude",
+        false,
+        true,
+        "format is {instance_name} then {display_name}",
+        "",
+        false,
+        None,
+    );
+
+    assert!(result.contains("format is {instance_name} then {display_name}"));
+}
+
 #[test]
 fn test_get_subagent_bootstrap() {
     let result = get_subagent_bootstrap("luna_reviewer_1", "luna");
@@ -552,28 +574,6 @@ fn test_get_bootstrap_display_name_with_tag() {
     assert!(result.contains("Your name: p0c-luna"));
 }
 
-#[test]
-fn test_get_bootstrap_unescapes_double_braces() {
-    // Template uses {{name}} {{status}} (escaped braces).
-    // render_template unescapes to {name} {status} in final output.
-    let (tmp, db) = setup_test_db();
-
-    let result = get_bootstrap(
-        &db,
-        tmp.path(),
-        "luna",
-        "claude",
-        false,
-        true,
-        "",
-        "",
-        false,
-        None,
-    );
-
-    assert!(result.contains("{name}"));
-    assert!(!result.contains("{{name}}"));
-}
 
 /// Catch drift between scripts::SCRIPTS const and actual files in scripts/bundled/.
 #[test]

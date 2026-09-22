@@ -127,6 +127,7 @@ const PLUGIN_SKILL_FILES: &[&str] = &[
     "references/scripts/cross-tool-duo.sh",
     "references/scripts/ensemble-consensus.sh",
     "references/scripts/review-loop.sh",
+    "references/setup-troubleshooting.md",
 ];
 
 /// Verify a staged or installed plugin has the complete canonical skill and

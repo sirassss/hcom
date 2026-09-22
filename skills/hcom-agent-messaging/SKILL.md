@@ -12,14 +12,12 @@ description: >
 
 AI agents running in separate terminals are isolated. hcom connects them via hooks and a shared database so they can message, watch, and spawn each other in real-time.
 
-Already installed as a plugin with `hcom` on `PATH`? Skip the installer — it is
-for fresh hosts only.
-
 ```bash
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot
 hcom              # TUI dashboard
 ```
+
+Not installed yet? See `references/setup-troubleshooting.md`.
 
 ## interactive coordination (default mode)
 
@@ -87,114 +85,41 @@ this host see `~/.hcom/HOST.md`.
 
 ---
 
-## what humans can do
+## sending messages
 
-tell any agent:
+Keep the body short and plain: a few sentences, no markdown headers/bullets/code
+fences — the TUI pane shows raw text, so markdown just adds noise. Point to
+files, commits, or issues by path/id instead of pasting content. Use the
+language the room uses, with its correct spelling and diacritics.
 
-> send a message to claude
+Always set `--intent`: `request` = reply needed, `inform` = FYI, `ack` = receipt.
 
-> when codex goes idle send it the next task
-
-> watch gemini's file edits, review each and send feedback if any bugs
-
-> fork yourself to investigate the bug and report back
-
-> find which agent worked on terminal_id code, resume them and ask why it sucks
-
----
-
-## what agents can do
-
-**Message** each other in real-time, bundle context for handoffs.
-
-**Observe** each other: transcripts, file edits, terminal screens, command history.
-
-**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
-
-**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator.
-
-run `hcom --help` for full command syntax and flags.
+Everything else — full command syntax and flags — is in `hcom --help`.
 
 ---
 
 ## tool support
 
-| tool | delivery | connect |
-|------|----------|---------|
-| claude code (incl. subagents) | automatic | `hcom claude` |
-| gemini cli (>= 0.26.0) | automatic | `hcom gemini` |
-| codex | automatic | `hcom codex` |
-| opencode | automatic | `hcom opencode` |
-| kilo code | automatic | `hcom kilo` |
-| antigravity | automatic | `hcom agy` |
-| cursor | automatic | `hcom cursor-agent` |
-| any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
+Delivery is automatic for every tool hcom launches: claude code (incl.
+subagents), gemini cli (>= 0.26.0), codex, opencode, kilo code, antigravity,
+cursor, kimi, copilot, pi, omp. Connect with `hcom <tool>`. Any other AI tool
+works manually: `hcom start` inside the tool, then `hcom listen`. Per-tool quirks
+are in `references/cross-tool.md`.
 
-session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-**launched** tools. joining an already-running session yourself with `hcom start` binds on a different path — see *join the room before you talk*.
+Session binding (`hcom transcript`, `hcom r/f` by session id) happens on first
+message or first prompt for all hcom-**launched** tools. Joining an
+already-running session yourself with `hcom start` binds on a different path —
+see *join the room before you talk*.
 
 ---
 
-## setup
+## setup and troubleshooting
 
-if the user invokes this skill without arguments:
+**If the user invokes this skill without arguments, read
+`references/setup-troubleshooting.md` and follow its setup steps.** Read it also
+when `hcom` is missing or misbehaving, or when a message does not arrive.
 
-1. run `hcom status` — if "command not found", install first:
-   ```bash
-   curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-   ```
-2. run `hcom hooks add` to install hooks for all detected tools
-3. restart the AI tool for hooks to activate
-
-| status output | meaning | action |
-|---------------|---------|--------|
-| command not found | not installed | install via `brew install aannoo/hcom/hcom`, the curl installer above, or `pip install hcom` |
-| `[~] claude` | tool exists, hooks not installed | `hcom hooks add` then restart |
-| `[✓] claude` | hooks installed | ready |
-| `[✗] claude` | tool not found | install the AI tool first |
-
----
-
-## troubleshooting
-
-### "hcom not working"
-
-```bash
-hcom status          # check installation
-hcom hooks status    # check hooks specifically
-hcom relay status    # check cross-device relay
-```
-
-hooks missing? `hcom hooks add` then restart tool.
-
-still broken?
-```bash
-hcom reset all && hcom hooks add
-# close all ai tool windows
-hcom claude          # fresh start
-```
-
-### "messages not arriving"
-
-| symptom | diagnosis | fix |
-|---------|-----------|-----|
-| agent not in `hcom list` | agent stopped or never bound | relaunch or wait for binding |
-| message sent but not delivered | check `hcom events --last 5` | verify @mention matches agent name/tag |
-| message reaches more than one agent | duplicate base name across tags | target the full `@tag-name` to hit exactly one |
-| messages leaking between workflows | no thread isolation | script mode: always use `--thread`. interactive: use a tag instead |
-
-### intent system
-
-agents follow these rules from their bootstrap:
-- `--intent request` -> agent always responds
-- `--intent inform` -> agent responds only if useful
-- `--intent ack` -> agent does not respond
-
-### sandbox / permission issues
-
-```bash
-export HCOM_DIR="$PWD/.hcom"     # project-local mode
-hcom hooks add                   # installs to project dir
-```
+First check is always `hcom status`.
 
 ---
 
@@ -214,28 +139,12 @@ place scripts in `~/.hcom/scripts/` as `.sh` or `.py`. run with `hcom run <name>
 - **always forward `--name`** — hcom injects it, scripts must propagate it
 - **always use `--go`** on launch commands — without it, scripts hang on confirmation prompt (`hcom kill` never prompts, so `--go` is optional there)
 
-### agent topologies
-
-| topology | agents | pattern |
-|----------|--------|---------|
-| worker-reviewer | 2 | worker sends result, reviewer reads transcript, sends APPROVED/FIX |
-| pipeline | N sequential | each stage reads previous via `hcom transcript`, signals via thread |
-| ensemble | N+1 (judge) | N agents answer independently, judge reads all via `hcom events --sql` |
-| hub-spoke | 1+N | coordinator broadcasts to `@tag-`, workers report back |
-| reactive | N | `hcom events sub` triggers agent actions on file edits/status changes |
-
 ---
 
 ## files
 
-| what | location |
-|------|----------|
-| database | `~/.hcom/hcom.db` |
-| config | `~/.hcom/config.toml` |
-| logs | `~/.hcom/.tmp/logs/` |
-| user scripts | `~/.hcom/scripts/` |
-
-with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
+`~/.hcom/` holds `hcom.db`, `config.toml`, `.tmp/logs/` and user `scripts/`.
+With `HCOM_DIR` set, that path is used instead.
 
 ---
 
@@ -247,15 +156,11 @@ with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
 | `references/cross-tool.md` | claude + codex + gemini + opencode + kilo + pi + omp + antigravity + cursor + kimi + copilot collaboration details and per-tool quirks |
 | `references/gotchas.md` | debugging scripts — timing, message delivery, intent system, cleanup |
 | `references/script-template.md` | writing a new script from scratch — full template with commentary |
+| `references/setup-troubleshooting.md` | installing hcom, hooks missing, messages not arriving |
 | `references/scripts/` | 6 tested, working example scripts |
 
 ---
 
 ## more info
 
-```bash
-hcom --help              # all commands
-hcom <command> --help    # command details
-```
-
-github: https://github.com/aannoo/hcom
+`hcom --help`, `hcom <command> --help`, https://github.com/aannoo/hcom
