@@ -574,7 +574,6 @@ fn test_get_bootstrap_display_name_with_tag() {
     assert!(result.contains("Your name: p0c-luna"));
 }
 
-
 /// Catch drift between scripts::SCRIPTS const and actual files in scripts/bundled/.
 #[test]
 fn test_bundled_scripts_matches_directory() {
