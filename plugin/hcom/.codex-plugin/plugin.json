@@ -1,6 +1,6 @@
 {
   "name": "hcom",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Multi-agent messaging skills and Codex lifecycle hooks",
   "author": {
     "name": "aannoo"
