@@ -184,9 +184,10 @@ fn run_inner(viewport_height: u16) -> Result<()> {
     // Auto-spawn relay-worker if relay is configured
     crate::relay::worker::ensure_worker(true);
 
-    // HCOM_TUI_FULLSCREEN=1 starts directly in alternate screen (fullscreen) mode,
-    // bypassing inline viewport which requires cursor position queries.
-    if std::env::var("HCOM_TUI_FULLSCREEN").as_deref() == Ok("1") {
+    // Default: alternate-screen mode, message pane pinned to bottom (auto-follows
+    // like Claude Code) unless the user scrolls up. HCOM_TUI_FULLSCREEN=0 opts
+    // back into the inline viewport, which prints to normal terminal scrollback.
+    if std::env::var("HCOM_TUI_FULLSCREEN").as_deref() != Ok("0") {
         prepare_vertical_viewport(&mut app);
     }
 
@@ -372,9 +373,9 @@ mod tests {
         app.ui.help_open = true;
 
         let out = render_to_string(&mut app, 80, 40);
-        assert!(out.contains("compact / normal / verbose"), "\n{out}");
+        assert!(out.contains("compact/normal/verbose"), "\n{out}");
         assert!(out.contains("to:<bigboss>"), "\n{out}");
-        assert!(out.contains("recent window"), "\n{out}");
+        assert!(out.contains("searches last 200"), "\n{out}");
     }
 }
 

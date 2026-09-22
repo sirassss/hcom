@@ -1737,41 +1737,28 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
             key("\u{2191}\u{2193} / \u{2190}\u{2192}"),
             desc("move cursor"),
         ]),
-        Line::from(vec![
-            key("enter/space"),
-            desc("filter by agent (keeps detail)"),
-        ]),
-        Line::from(vec![key("a"), desc("filter by all agents")]),
+        Line::from(vec![key("enter/space"), desc("filter by agent")]),
+        Line::from(vec![key("a"), desc("show all agents")]),
         Line::from(vec![key("b"), desc("broadcast to all")]),
         Line::from(vec![key("ctrl+r"), desc("relay settings")]),
-        Line::from(vec![key("ctrl+s"), desc("all stopped agents")]),
+        Line::from(vec![key("ctrl+s"), desc("stopped agents")]),
+        Line::from(vec![key("\\"), desc("toggle inline/fullscreen view")]),
         Line::from(vec![key("ctrl+d"), desc("quit")]),
         Line::raw(""),
         section("Detail & filter"),
-        Line::from(vec![key("v"), desc("detail: compact / normal / verbose")]),
-        Line::from(vec![
-            key("/"),
-            desc("filter: text + tag: thread: to: from:"),
-        ]),
-        Line::from(vec![
-            key("B"),
-            desc("toggle to:<bigboss> coordinator filter"),
-        ]),
+        Line::from(vec![key("v"), desc("detail: compact/normal/verbose")]),
+        Line::from(vec![key("/"), desc("filter: text tag: thread: to: from:")]),
+        Line::from(vec![key("B"), desc("toggle to:<bigboss> filter")]),
         Line::from(vec![
             key("esc"),
             desc("clear: text \u{2192} tokens \u{2192} agents"),
         ]),
         Line::raw(""),
         section("Notes"),
-        Line::from(desc("  / searches the recent window only")),
-        Line::from(desc("  (limit 200 inline / 5000 vertical,")),
-        Line::from(desc("   or HCOM_TUI_TIMELINE_LIMIT).")),
-        Line::from(desc("  Search: enter commits, esc keeps the filter.")),
-        Line::from(desc("  Agent selection is still the target for")),
-        Line::from(desc("  m / t / k / r actions.")),
-        Line::from(desc("  Inline replay is append-only \u{2014} a filter")),
-        Line::from(desc("  change adds a labelled block, old")),
-        Line::from(desc("  scrollback stays.")),
+        Line::from(desc("  / searches last 200 (5000 vertical)")),
+        Line::from(desc("  enter commits search, esc keeps it")),
+        Line::from(desc("  m/t/k/r act on the selected agent")),
+        Line::from(desc("  filter change appends a new block")),
         Line::raw(""),
         section("Compose"),
         Line::from(vec![key("enter"), desc("send message")]),
@@ -1781,7 +1768,7 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
 
     let total = help_lines.len() as u16;
     // Size popup to content (+ 2 for border), clamped to terminal
-    let w = 52u16.min(area.width.saturating_sub(4));
+    let w = 68u16.min(area.width.saturating_sub(4));
     let h = (total + 2).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
