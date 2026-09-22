@@ -4,7 +4,6 @@
 //! - Identity gating (`REQUIRE_IDENTITY`)
 //! - `set_hookless_command_status` — status for non-hook CLI commands
 //! - `maybe_deliver_pending_messages` — append unread for codex/adhoc
-//! - `format_messages_human` — human-readable message formatting
 
 use crate::claude_actor;
 use crate::db::HcomDb;
@@ -13,10 +12,7 @@ use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 #[cfg(test)]
 use crate::shared::SenderIdentity;
-use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
-use crate::shared::{
-    CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind, status_fg, status_icon,
-};
+use crate::shared::{CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind};
 
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
@@ -260,80 +256,6 @@ pub fn maybe_deliver_pending_messages(
     Some(output)
 }
 
-/// Format messages for human terminal display.
-///
-/// Shared by list (display), send (recipient feedback), listen (human output).
-/// Adds ANSI color, timestamps, and layout suitable for terminal viewing.
-///
-/// Format: `[intent:thread #id] sender → recipient: text`
-/// With colors: status icon colored, sender bold, metadata dim.
-#[allow(dead_code)]
-pub fn format_messages_human(
-    db: &HcomDb,
-    messages: &[serde_json::Value],
-    instance_name: &str,
-) -> String {
-    if messages.is_empty() {
-        return String::new();
-    }
-
-    let recipient_display = identity::get_display_name(db, instance_name);
-    let mut parts = Vec::new();
-
-    for msg in messages {
-        let from = msg
-            .get("from")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let text = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let intent = msg.get("intent").and_then(|v| v.as_str());
-        let thread = msg.get("thread").and_then(|v| v.as_str());
-        let event_id = msg.get("event_id").and_then(|v| v.as_i64());
-
-        // Build prefix
-        let prefix = build_message_prefix(intent, thread, event_id, msg);
-
-        // Sender display name with status
-        let sender_display = identity::get_display_name(db, from);
-        let sender_status = db
-            .get_instance_full(from)
-            .ok()
-            .flatten()
-            .map(|d| d.status.clone())
-            .unwrap_or_else(|| "inactive".to_string());
-        let icon = status_icon(&sender_status);
-        let fg = status_fg(&sender_status);
-
-        // Others count
-        let others = msg
-            .get("delivered_to")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len().saturating_sub(1))
-            .unwrap_or(0);
-
-        let recipient = if others > 0 {
-            let plural = if others > 1 { "s" } else { "" };
-            format!("{recipient_display} (+{others} other{plural})")
-        } else {
-            recipient_display.clone()
-        };
-
-        parts.push(format!(
-            "{DIM}{prefix}{RESET} {fg}{icon}{RESET} {BOLD}{sender_display}{RESET} → {FG_CYAN}{recipient}{RESET}: {text}"
-        ));
-    }
-
-    if parts.len() == 1 {
-        parts[0].clone()
-    } else {
-        format!(
-            "{DIM}[{} messages]{RESET}\n{}",
-            parts.len(),
-            parts.join("\n")
-        )
-    }
-}
-
 /// Build message prefix from envelope fields.
 ///
 /// Format: `[intent:thread #id]` or `[intent #id]` or `[thread:name #id]` or `[new message #id]`
@@ -377,82 +299,6 @@ fn build_message_prefix(
         format!("[{prefix}]")
     } else {
         format!("[{prefix} {id_ref}]")
-    }
-}
-
-/// Simple format for hook-style messages (no ANSI colors).
-///
-#[allow(dead_code)]
-fn format_hook_messages_simple(
-    db: &HcomDb,
-    messages: &[serde_json::Value],
-    instance_name: &str,
-) -> String {
-    if messages.is_empty() {
-        return String::new();
-    }
-
-    let recipient_display = identity::get_display_name(db, instance_name);
-
-    if messages.len() == 1 {
-        let msg = &messages[0];
-        let from = msg
-            .get("from")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let text = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let intent = msg.get("intent").and_then(|v| v.as_str());
-        let thread = msg.get("thread").and_then(|v| v.as_str());
-        let event_id = msg.get("event_id").and_then(|v| v.as_i64());
-
-        let prefix = build_message_prefix(intent, thread, event_id, msg);
-        let sender_display = identity::get_display_name(db, from);
-
-        let others = msg
-            .get("delivered_to")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len().saturating_sub(1))
-            .unwrap_or(0);
-        let recipient = if others > 0 {
-            let plural = if others > 1 { "s" } else { "" };
-            format!("{recipient_display} (+{others} other{plural})")
-        } else {
-            recipient_display
-        };
-
-        format!("{prefix} {sender_display} → {recipient}: {text}")
-    } else {
-        let parts: Vec<String> = messages
-            .iter()
-            .map(|msg| {
-                let from = msg
-                    .get("from")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let text = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                let intent = msg.get("intent").and_then(|v| v.as_str());
-                let thread = msg.get("thread").and_then(|v| v.as_str());
-                let event_id = msg.get("event_id").and_then(|v| v.as_i64());
-
-                let prefix = build_message_prefix(intent, thread, event_id, msg);
-                let sender_display = identity::get_display_name(db, from);
-
-                let others = msg
-                    .get("delivered_to")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len().saturating_sub(1))
-                    .unwrap_or(0);
-                let recipient = if others > 0 {
-                    format!("{recipient_display} (+{others})")
-                } else {
-                    recipient_display.clone()
-                };
-
-                format!("{prefix} {sender_display} → {recipient}: {text}")
-            })
-            .collect();
-
-        format!("[{} new messages] | {}", parts.len(), parts.join(" | "))
     }
 }
 
@@ -847,79 +693,6 @@ mod tests {
         });
         let prefix = build_message_prefix(Some("request"), None, Some(42), &msg);
         assert_eq!(prefix, "[request #99:BOXE]");
-    }
-
-    // ── format_messages_human tests ──
-
-    #[test]
-    fn test_format_human_single_message() {
-        let (db, _dir) = make_test_db();
-        insert_instance(&db, "luna", "claude");
-        insert_instance(&db, "nova", "claude");
-        let messages = vec![serde_json::json!({
-            "from": "luna",
-            "message": "hello world",
-            "event_id": 42,
-        })];
-        let result = format_messages_human(&db, &messages, "nova");
-        assert!(result.contains("luna"));
-        assert!(result.contains("nova"));
-        assert!(result.contains("hello world"));
-        assert!(result.contains("#42"));
-    }
-
-    #[test]
-    fn test_format_human_multiple_messages() {
-        let (db, _dir) = make_test_db();
-        insert_instance(&db, "luna", "claude");
-        insert_instance(&db, "nova", "claude");
-        let messages = vec![
-            serde_json::json!({
-                "from": "luna",
-                "message": "msg1",
-                "event_id": 1,
-            }),
-            serde_json::json!({
-                "from": "nova",
-                "message": "msg2",
-                "event_id": 2,
-            }),
-        ];
-        let result = format_messages_human(&db, &messages, "luna");
-        assert!(result.contains("2 messages"));
-        assert!(result.contains("msg1"));
-        assert!(result.contains("msg2"));
-    }
-
-    // ── format_hook_messages_simple tests ──
-
-    #[test]
-    fn test_format_simple_single() {
-        let (db, _dir) = make_test_db();
-        insert_instance(&db, "luna", "claude");
-        let messages = vec![serde_json::json!({
-            "from": "luna",
-            "message": "test",
-            "intent": "request",
-            "event_id": 1,
-        })];
-        let result = format_hook_messages_simple(&db, &messages, "luna");
-        assert!(result.contains("[request #1]"));
-        assert!(result.contains("test"));
-    }
-
-    #[test]
-    fn test_format_simple_multiple() {
-        let (db, _dir) = make_test_db();
-        insert_instance(&db, "luna", "claude");
-        let messages = vec![
-            serde_json::json!({"from": "luna", "message": "a", "event_id": 1}),
-            serde_json::json!({"from": "luna", "message": "b", "event_id": 2}),
-        ];
-        let result = format_hook_messages_simple(&db, &messages, "luna");
-        assert!(result.starts_with("[2 new messages]"));
-        assert!(result.contains("a"));
-        assert!(result.contains("b"));
     }
 
     // ── maybe_deliver_pending_messages tests ──

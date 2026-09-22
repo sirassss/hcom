@@ -3,7 +3,7 @@
 use crate::shared::{MAX_MESSAGE_SIZE, SENDER, extract_mentions};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 /// Precompiled regex for @[hcom-*] system notification mentions.
@@ -91,16 +91,6 @@ pub struct ScopeResult {
     pub scope: MessageScope,
     /// For Mentions scope: list of base names targeted.
     pub mentions: Vec<String>,
-}
-
-/// Read receipt for a sent message.
-#[derive(Debug, Clone)]
-pub struct ReadReceipt {
-    pub id: i64,
-    pub age: String,
-    pub text: String,
-    pub read_by: Vec<String>,
-    pub total_recipients: usize,
 }
 
 /// Instance info for scope computation (name + optional tag).
@@ -723,151 +713,6 @@ pub fn unescape_bash(text: &str) -> String {
         .replace("\\`", "`")
         .replace("\\\"", "\"")
         .replace("\\'", "'")
-}
-
-/// Check if instance data represents an external sender.
-///
-/// External senders have empty/null session_id, no parent_session_id,
-/// and no origin_device_id.
-fn is_external_sender_data(data: &Value) -> bool {
-    // Remote instances are not external
-    if data
-        .get("origin_device_id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
-        return false;
-    }
-    // Subagents have parent_session_id, so are not external
-    if data
-        .get("parent_session_id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
-        return false;
-    }
-    // External = no session_id
-    let session_id = data
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    session_id.is_empty()
-}
-
-/// Compute read receipts from pre-fetched data.
-///
-/// This is a pure function that takes all needed data as parameters
-/// (no DB access). The caller is responsible for querying the DB.
-///
-/// # Arguments
-/// * `sent_messages` - Messages sent by this identity: (id, timestamp, data_json)
-/// * `active_instances` - All active instances except sender: {name: {tag, origin_device_id, ...}}
-/// * `deliver_events` - Set of instance names that have deliver events after each message
-/// * `remote_msg_ts` - For remote instances: {name: latest msg_ts}
-/// * `max_text_length` - Max text length before truncation
-/// * `format_age_fn` - Function to format seconds as age string
-#[allow(clippy::too_many_arguments)]
-pub fn compute_read_receipts(
-    sent_messages: &[(i64, String, Value)],
-    active_instances: &HashMap<String, Value>,
-    deliver_events_by_msg: &HashMap<i64, HashSet<String>>,
-    remote_msg_ts: &HashMap<String, String>,
-    max_text_length: usize,
-    format_age_fn: &dyn Fn(f64) -> String,
-    now_secs: f64,
-    parse_timestamp_fn: &dyn Fn(&str) -> Option<f64>,
-) -> Vec<ReadReceipt> {
-    let mut receipts = Vec::new();
-
-    for (msg_id, msg_timestamp, msg_data) in sent_messages {
-        // Validate scope field present
-        if msg_data.get("scope").is_none() {
-            continue;
-        }
-
-        // Use delivered_to for read receipt denominator
-        let delivered_to = match msg_data.get("delivered_to").and_then(|v| v.as_array()) {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>(),
-            None => continue,
-        };
-
-        let explicit_mentions: HashSet<&str> = msg_data
-            .get("mentions")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str())
-            .collect();
-        let msg_text = msg_data.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-        let delivered_instances = deliver_events_by_msg
-            .get(msg_id)
-            .cloned()
-            .unwrap_or_default();
-
-        let mut read_by = Vec::new();
-        for inst_name in &delivered_to {
-            let inst_data = active_instances.get(inst_name);
-
-            // Remote instance: compare msg_ts (timestamp-based)
-            if let Some(data) = inst_data
-                && data
-                    .get("origin_device_id")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty())
-            {
-                if let Some(ts) = remote_msg_ts.get(inst_name)
-                    && ts >= msg_timestamp
-                {
-                    read_by.push(inst_name.clone());
-                }
-                continue;
-            }
-
-            // Local instance: check for deliver event after message
-            if delivered_instances.contains(inst_name) {
-                // External senders (no session_id, no parent, not remote) only count
-                // as "read" if they were an explicitly resolved recipient.
-                // This prevents false-positive read receipts for external watchers.
-                if let Some(data) = inst_data
-                    && is_external_sender_data(data)
-                    && !explicit_mentions.contains(inst_name.as_str())
-                {
-                    continue;
-                }
-                read_by.push(inst_name.clone());
-            }
-        }
-
-        let total_recipients = delivered_to.len();
-        if total_recipients > 0 {
-            let age_str = parse_timestamp_fn(msg_timestamp)
-                .map(|msg_time| format_age_fn(now_secs - msg_time))
-                .unwrap_or_else(|| "?".to_string());
-
-            let truncated_text = if msg_text.len() > max_text_length {
-                format!(
-                    "{}...",
-                    crate::delivery::truncate_chars(msg_text, max_text_length.saturating_sub(3))
-                )
-            } else {
-                msg_text.to_string()
-            };
-
-            receipts.push(ReadReceipt {
-                id: *msg_id,
-                age: age_str,
-                text: truncated_text,
-                read_by,
-                total_recipients,
-            });
-        }
-    }
-
-    receipts
 }
 
 /// Max length for message preview in PTY trigger.

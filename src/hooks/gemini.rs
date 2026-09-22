@@ -1172,44 +1172,6 @@ fn remove_hcom_hooks_from_settings(settings: &mut serde_json::Map<String, Value>
     }
 }
 
-/// Ensure hooksConfig.enabled = true, migrating from legacy hooks.enabled if needed.
-///
-/// Call this on any hcom gemini command to auto-fix settings.
-/// Skips mutation if Gemini version < 0.26.0.
-pub fn ensure_hooks_enabled() -> bool {
-    let version = get_gemini_version();
-    if let Some(v) = version
-        && v < GEMINI_MIN_VERSION
-    {
-        return false;
-    }
-
-    let settings_path = get_gemini_settings_path();
-    if !settings_path.exists() {
-        return true; // setup_gemini_hooks will handle it
-    }
-
-    let mut settings = match load_gemini_settings(&settings_path) {
-        Some(s) => s,
-        None => serde_json::Map::new(),
-    };
-
-    let needs_migration = settings
-        .get("hooks")
-        .and_then(|v| v.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .is_some();
-
-    if is_hooks_enabled(&settings) && !needs_migration {
-        return true;
-    }
-
-    set_hooks_enabled(&mut settings);
-
-    let json_str = serde_json::to_string_pretty(&Value::Object(settings)).unwrap_or_default();
-    crate::paths::atomic_write(&settings_path, &json_str)
-}
-
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VerifyFailReason {
     #[error("settings.json missing, empty, or not parseable as JSON")]

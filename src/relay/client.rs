@@ -159,7 +159,7 @@ impl MqttRelay {
         let lwt_topic = state_topic(&relay_id, &device_uuid);
         let lwt = rumqttc::v5::mqttbytes::v5::LastWill {
             topic: lwt_topic.clone().into(),
-            message: bytes::Bytes::new(),
+            message: Default::default(),
             qos: QoS::AtLeastOnce,
             retain: true,
             properties: None,
