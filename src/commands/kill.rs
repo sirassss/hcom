@@ -796,6 +796,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Linux/Android only: `sys::process::is_alive_in` returns "unknown" solely
+    // when a recorded namespace differs from the current one. Elsewhere there
+    // is no namespace to differ, so a dead PID reads as plainly dead and the
+    // entry is pruned before `kill_single` ever sees it - correct behavior,
+    // just not the case this regression covers.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn test_kill_single_removes_unknown_namespace_orphan() {
         // Regression: an orphan entry with no `pid_namespace` on record (e.g.

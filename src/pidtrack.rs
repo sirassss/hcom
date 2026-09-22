@@ -593,6 +593,8 @@ mod tests {
         assert!(orphans.iter().all(|o| o.pid != 99999999));
     }
 
+    // Linux/Android only - see the note on the matching test in commands/kill.rs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn test_unknown_namespace_orphan_excluded_but_still_tracked_by_pid() {
         let dir = make_temp_dir();
