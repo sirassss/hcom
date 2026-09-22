@@ -25,7 +25,14 @@ fi
 
 COMMIT_SHA="$(git rev-parse HEAD)"
 echo "[release-fork] checking CI status for $COMMIT_SHA..."
-runs="$(gh run list --repo "$REPO" -c "$COMMIT_SHA" --json status,conclusion,name,url)"
+# dist's own "Release" workflow fires on any tag matching **N.N.N* and then
+# refuses a fork tag: the workspace is version 0.7.27, the tag is
+# v0.7.27-siras, so `dist host` reports "This workspace doesn't have anything
+# for dist to Release!". That run is upstream's publisher, not a test of this
+# code, and it can never go green here - this script is what publishes the
+# fork. Judge the gate on everything else.
+runs="$(gh run list --repo "$REPO" -c "$COMMIT_SHA" --json status,conclusion,name,url \
+    | jq '[.[] | select(.name != "Release")]')"
 if [ "$(echo "$runs" | jq 'length')" -eq 0 ]; then
     echo "[release-fork] no CI runs found for $COMMIT_SHA — push may not have triggered CI yet" >&2
     exit 1
