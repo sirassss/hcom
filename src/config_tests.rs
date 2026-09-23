@@ -1118,3 +1118,19 @@ fn test_save_toml_config_sets_mode_600_for_secret_bearing_config() {
         & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+#[test]
+fn write_default_config_keeps_a_preseeded_env_file() {
+    let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+    let env_path = hcom_dir.join("env");
+    std::fs::write(&env_path, "ANTHROPIC_BASE_URL=http://127.0.0.1:1\n").unwrap();
+
+    write_default_config().unwrap();
+
+    assert!(hcom_dir.join("config.toml").exists());
+    assert_eq!(
+        std::fs::read_to_string(&env_path).unwrap(),
+        "ANTHROPIC_BASE_URL=http://127.0.0.1:1\n",
+        "first-run config creation must not clobber an existing env passthrough"
+    );
+}

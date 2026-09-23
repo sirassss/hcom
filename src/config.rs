@@ -1453,10 +1453,14 @@ pub fn load_config_snapshot() -> ConfigSnapshot {
     ConfigSnapshot { core }
 }
 
-/// Write default config.toml + env file.
+/// Write default config.toml, plus the env file unless one already exists
+/// (a pre-seeded passthrough must survive first-run config creation).
 pub fn write_default_config() -> std::io::Result<()> {
     let config = HcomConfig::default();
     save_toml_config(&config, None)?;
+    if Config::get().hcom_dir.join("env").exists() {
+        return Ok(());
+    }
     save_env_file(&HashMap::new())
 }
 

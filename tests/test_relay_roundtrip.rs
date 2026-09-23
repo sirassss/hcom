@@ -1051,6 +1051,16 @@ fn test_relay_roundtrip() {
         MockHttp::start(relay_claude_mock_response).expect("start localhost Claude mock provider");
     let mock_base_url = format!("http://127.0.0.1:{}", claude_mock.port());
     write_claude_mock_env(&dir_b_path, &mock_base_url);
+    // Claude's hooks ship through the plugin, not an auto-installed
+    // settings.json entry. Without this Device B's claude never emits the
+    // status events Phase 10 waits on. Mirrors `support::claude_mock`.
+    let hooks_out = hcom_with_dir("hooks add claude", &path_b);
+    assert!(
+        hooks_out.status.success(),
+        "hcom hooks add claude failed on Device B: stdout={} stderr={}",
+        String::from_utf8_lossy(&hooks_out.stdout),
+        String::from_utf8_lossy(&hooks_out.stderr)
+    );
 
     let log = TestLog::new();
 
