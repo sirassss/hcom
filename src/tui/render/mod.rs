@@ -196,10 +196,11 @@ struct WrapLayout {
 
 impl WrapLayout {
     fn new(total_width: u16, prefix_w: usize) -> Self {
-        let w = total_width as usize;
+        // Continuation lines get a hanging indent matching the prompt prefix.
+        let avail = (total_width as usize).saturating_sub(prefix_w);
         Self {
-            first_avail: w.saturating_sub(prefix_w),
-            cont_avail: w,
+            first_avail: avail,
+            cont_avail: avail,
         }
     }
 
@@ -213,6 +214,7 @@ impl WrapLayout {
             offset: 0,
             cur_avail: self.first_avail,
             cont_avail: self.cont_avail,
+            prev_space: true,
         }
     }
 }
@@ -224,6 +226,7 @@ struct WrapWalker<'a> {
     offset: usize,
     cur_avail: usize,
     cont_avail: usize,
+    prev_space: bool,
 }
 
 struct WrapPos<'a> {
@@ -240,7 +243,26 @@ impl<'a> Iterator for WrapWalker<'a> {
     fn next(&mut self) -> Option<WrapPos<'a>> {
         let g = self.graphemes.next()?;
         let gw = UnicodeWidthStr::width(g);
-        if self.col + gw > self.cur_avail && self.col > 0 {
+        let is_space = |g: &str| g.chars().all(char::is_whitespace);
+        // Word wrap: at a word start, break before the word if it won't fit on
+        // this line but would fit on a fresh one. Longer words fall back to
+        // character wrapping below.
+        let word_w = if !is_space(g) && self.prev_space {
+            gw + self
+                .graphemes
+                .clone()
+                .take_while(|g| !is_space(g))
+                .map(UnicodeWidthStr::width)
+                .sum::<usize>()
+        } else {
+            gw
+        };
+        // A space landing exactly at the edge hangs off the line end instead of
+        // starting the next line misaligned.
+        let hang = is_space(g) && self.col == self.cur_avail;
+        self.prev_space = is_space(g);
+        let overflow = self.col + word_w > self.cur_avail && word_w <= self.cont_avail;
+        if self.col > 0 && !hang && (overflow || self.col + gw > self.cur_avail) {
             self.line += 1;
             self.cur_avail = self.cont_avail;
             self.col = 0;
@@ -259,8 +281,8 @@ impl<'a> Iterator for WrapWalker<'a> {
 }
 
 /// Number of visual wrapped lines for text with given available width.
-/// Prefix width (e.g. "  ❯ " = 4) is subtracted from the first line's width.
-/// Continuation lines use the full terminal width (ratatui wraps flush left).
+/// Prefix width (e.g. "  ❯ " = 4) is subtracted from every line's width:
+/// continuation lines are indented to align under the first line's text.
 fn wrap_line_count(text: &str, total_width: u16, prefix_w: usize) -> usize {
     if text.is_empty() {
         return 1;
@@ -310,10 +332,9 @@ fn cursor_wrap_line(text: &str, cursor: usize, total_width: u16, prefix_w: usize
     if layout.first_avail == 0 {
         return 0;
     }
-    let clamped = cursor.min(text.len());
-    let before = &text[..clamped];
+    // Walk the full text: word-wrap lookahead needs the rest of the word.
     let mut last_line = 0;
-    for pos in layout.walk(before) {
+    for pos in layout.walk(text).take_while(|p| p.offset < cursor) {
         last_line = pos.line;
     }
     last_line
@@ -346,10 +367,8 @@ fn cursor_wrap_col(text: &str, cursor: usize, total_width: u16, prefix_w: usize)
     if layout.first_avail == 0 {
         return 0;
     }
-    let clamped = cursor.min(text.len());
-    let before = &text[..clamped];
     let mut col = 0;
-    for pos in layout.walk(before) {
+    for pos in layout.walk(text).take_while(|p| p.offset < cursor) {
         col = pos.col + pos.width;
     }
     col
@@ -656,8 +675,7 @@ fn position_cursor(
         // Word-wrapped cursor positioning
         let wrap_line = cursor_wrap_line(&app.ui.input, app.ui.input_cursor, width, 4);
         let wrap_col = cursor_wrap_col(&app.ui.input, app.ui.input_cursor, width, 4);
-        let prefix_w: usize = if wrap_line == 0 { 4 } else { 0 }; // "  ❯ " on first line, flush left on continuations
-        let cursor_x = prefix_w + wrap_col;
+        let cursor_x = 4 + wrap_col; // "  ❯ " on first line, same indent on continuations
         let visible_line = wrap_line.saturating_sub(app.ui.input_scroll);
         let cursor_y = input_area.y + 1 + visible_line as u16;
         frame.set_cursor_position(Position::new(
@@ -1062,7 +1080,9 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                     spans.extend(text_spans);
                     lines.push(Line::from(spans));
                 } else {
-                    lines.push(Line::from(text_spans));
+                    let mut spans = vec![Span::raw("    ")];
+                    spans.extend(text_spans);
+                    lines.push(Line::from(spans));
                 }
             }
             if lines.is_empty() {
@@ -1807,3 +1827,7 @@ fn render_help(frame: &mut Frame, help_scroll: u16) {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
