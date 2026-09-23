@@ -567,7 +567,7 @@ where
 
 /// Run a tool CLI, returning its stderr on failure.
 fn run_tool_cli(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = std::process::Command::new(program)
+    let output = crate::terminal::executable_command(program)
         .args(args)
         .output()
         .map_err(|e| {
@@ -879,7 +879,7 @@ fn cursor_marketplace_list_output() -> Result<String, String> {
 
     #[cfg(not(test))]
     {
-        let output = std::process::Command::new("cursor-agent")
+        let output = crate::terminal::executable_command("cursor-agent")
             .args(["plugin", "marketplace", "list"])
             .output()
             .map_err(|e| {
