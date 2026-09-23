@@ -411,16 +411,20 @@ fn activity_label(e: &Event) -> String {
 /// `to:X` (spec §3). `to:*` = explicitly addressed, rejecting every broadcast.
 /// `to:X` uses recorded `delivered` when delivery is known (empty included, no
 /// fallback); only unknown delivery falls back to explicit mentions, and an
-/// unknown broadcast proves nothing.
+/// unknown broadcast proves nothing. `delivered_to` only ever records roster
+/// instances, so a name outside the roster (the human, e.g. `bigboss`) also
+/// matches by explicit mentions.
 fn to_matches(data: &DataState, m: &Message, to: &str) -> bool {
     if to == "*" {
         return m.scope == MessageScope::Mentions && !m.recipients.is_empty();
     }
-    if m.delivery_known {
-        m.delivered.iter().any(|d| name_eq(data, d, to))
-    } else {
-        m.scope == MessageScope::Mentions && m.recipients.iter().any(|r| name_eq(data, r, to))
+    let mentioned =
+        || m.scope == MessageScope::Mentions && m.recipients.iter().any(|r| name_eq(data, r, to));
+    if !m.delivery_known {
+        return mentioned();
     }
+    m.delivered.iter().any(|d| name_eq(data, d, to))
+        || (data.resolve_agent(to).is_none() && mentioned())
 }
 
 // ── tests ───────────────────────────────────────────────────────────
@@ -621,11 +625,23 @@ mod tests {
 
     #[test]
     fn to_known_empty_delivery_never_falls_back() {
-        let data = DataState::empty();
-        let mut m = mk_msg(1, "ligo", &["bigboss"], "hey", MessageScope::Mentions);
+        let mut data = DataState::empty();
+        data.agents.push(make_test_agent("bono", 60.0));
+        let mut m = mk_msg(1, "ligo", &["bono"], "hey", MessageScope::Mentions);
         m.delivered = vec![];
         m.delivery_known = true; // explicit empty array
-        assert!(!to_matches(&data, &m, "bigboss"));
+        assert!(!to_matches(&data, &m, "bono"));
+    }
+
+    #[test]
+    fn to_non_roster_name_matches_mentions_despite_known_delivery() {
+        // Real shape of `hcom send @bigboss`: the human is never a delivery
+        // target, so `delivered_to` is an explicit empty array.
+        let data = DataState::empty();
+        let mut m = mk_msg(1, "ligo", &["bigboss"], "hey", MessageScope::Mentions);
+        m.delivery_known = true;
+        assert!(to_matches(&data, &m, "bigboss"));
+        assert!(MsgFilter::parse("to:BIGBOSS").matches(&FeedItem::Msg(&m), &data));
     }
 
     #[test]

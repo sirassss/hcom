@@ -53,7 +53,7 @@ impl DataState {
     /// case-insensitive. An unqualified base never matches a device-qualified
     /// remote agent, and exact storage identity wins over a display alias when
     /// two records would otherwise both match.
-    fn resolve_agent(&self, name: &str) -> Option<&Agent> {
+    pub(crate) fn resolve_agent(&self, name: &str) -> Option<&Agent> {
         let roster = || {
             self.agents
                 .iter()
