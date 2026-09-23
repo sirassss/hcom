@@ -1464,6 +1464,22 @@ fn should_escalate_block(blocked_for: Duration, threshold: Duration) -> bool {
     blocked_for >= threshold
 }
 
+fn gate_status_publication_delay(reason: &str) -> Duration {
+    if matches!(
+        reason,
+        "not_ready"
+            | "prompt_has_text"
+            | "user_active"
+            | "approval"
+            | "nav_overlay"
+            | "wake_unacknowledged"
+    ) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
 /// The gate-block context `hcom list` renders: `tui:<reason>`, and
 /// `tui:<reason>:stalled` once the block has run past the threshold.
 ///
@@ -1500,6 +1516,18 @@ fn release_gate_context(db: &HcomDb, name: &str, marker: &mut String) {
     }
 }
 
+/// A rebind must release the old row before claiming a context on the new row.
+fn reconcile_gate_owner(db: &HcomDb, name: &str, owner: &mut String, marker: &mut String) -> bool {
+    if owner != name {
+        release_gate_context(db, owner, marker);
+        if !marker.is_empty() {
+            return false;
+        }
+        name.clone_into(owner);
+    }
+    true
+}
+
 /// Keep ownership of the previous context until its replacement is persisted.
 fn update_gate_context(
     db: &HcomDb,
@@ -1508,8 +1536,7 @@ fn update_gate_context(
     detail: &str,
     marker: &mut String,
 ) -> anyhow::Result<()> {
-    if context != marker {
-        db.set_gate_status(name, context, detail)?;
+    if context != marker && db.set_gate_status(name, context, detail)? {
         *marker = context.to_string();
     }
     Ok(())
@@ -1810,6 +1837,7 @@ pub fn run_delivery_loop(
         // Gate block tracking for TUI status updates
         let mut block_since: Option<BlockClock> = None;
         let mut last_block_context: String = String::new();
+        let mut gate_owner = current_name.clone();
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1826,6 +1854,18 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
+            if gate_owner != current_name {
+                if !reconcile_gate_owner(
+                    db,
+                    &current_name,
+                    &mut gate_owner,
+                    &mut last_block_context,
+                ) {
+                    notify.wait(RETRY_DELAY);
+                    continue;
+                }
+                block_since = None;
+            }
             drive_launch_outcome(
                 db,
                 state,
@@ -2127,7 +2167,7 @@ pub fn run_delivery_loop(
                             }
                             // Fall through to TUI status update
                             if let Some(clock) = block_since.as_ref()
-                                && clock.elapsed().as_secs_f64() >= 2.0
+                                && clock.elapsed() >= gate_status_publication_delay(gate.reason)
                             {
                                 match db.get_status(&current_name) {
                                     Ok(Some((status, _))) if status == ST_LISTENING => {
@@ -2161,7 +2201,7 @@ pub fn run_delivery_loop(
                             }
                         } else if let Some(clock) = block_since.as_ref() {
                             // After 2 seconds of blocking, update TUI status context
-                            if clock.elapsed().as_secs_f64() >= 2.0 {
+                            if clock.elapsed() >= gate_status_publication_delay(gate.reason) {
                                 // Only update if status is "listening" (don't overwrite active/blocked)
                                 match db.get_status(&current_name) {
                                     Ok(Some((status, _))) if status == ST_LISTENING => {
@@ -2495,19 +2535,18 @@ pub fn run_delivery_loop(
                             VerifyTimeoutDecision::FastFail => {
                                 let context = "tui:wake-unacknowledged".to_string();
                                 let detail = "delivery paused; kill and resume this agent to retry";
-                                if let Err(e) = db.set_gate_status(&current_name, &context, detail)
-                                {
+                                if let Err(e) = update_gate_context(
+                                    db,
+                                    &current_name,
+                                    &context,
+                                    detail,
+                                    &mut last_block_context,
+                                ) {
                                     log_warn(
                                         "native",
                                         "delivery.gate_status_fail",
-                                        &format!("{}", e),
+                                        &format!("{e}"),
                                     );
-                                } else {
-                                    // Only claim the context once the row holds
-                                    // it. Overwriting a marker a failed clear is
-                                    // still carrying would strand that row's
-                                    // stalled context permanently.
-                                    last_block_context = context;
                                 }
                                 block_since = Some(BlockClock::start());
                                 log_warn(
@@ -2541,6 +2580,17 @@ pub fn run_delivery_loop(
                 }
 
                 State::WakeUnacknowledged => {
+                    // A hook may have owned status at FastFail. Retry publication
+                    // once it returns to listening, without overwriting hook status.
+                    if let Err(e) = update_gate_context(
+                        db,
+                        &current_name,
+                        "tui:wake-unacknowledged",
+                        "delivery paused; kill and resume this agent to retry",
+                        &mut last_block_context,
+                    ) {
+                        log_warn("native", "delivery.gate_status_fail", &format!("{e}"));
+                    }
                     // Keep the delivery loop and its endpoints alive, but do not
                     // submit another prompt. A valid hook from the bound Claude
                     // session consumes the pending rows and/or advances the

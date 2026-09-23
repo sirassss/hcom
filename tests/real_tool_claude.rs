@@ -223,6 +223,10 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
         send_code, 0,
         "held-message send failed: stdout={send_stdout} stderr={send_stderr}"
     );
+    assert!(
+        send_stdout.contains("Queued; delivery"),
+        "a message held behind approval must be reported as queued: {send_stdout}"
+    );
 
     h.eventually(
         "blocked(approval) to latch from Claude's PermissionRequest hook",
@@ -256,6 +260,24 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
     assert!(
         !approval_result.exists(),
         "gated command ran while still blocked on approval"
+    );
+
+    // Send after the latch to distinguish paused feedback from ordinary pending.
+    let (code, stdout, stderr) = h.run_as_process(
+        &sender_process_id,
+        [
+            "send",
+            &format!("@{name}"),
+            "--intent",
+            "inform",
+            "--",
+            "Approval feedback probe",
+        ],
+    );
+    assert_eq!(code, 0, "paused send failed: {stdout} {stderr}");
+    assert!(
+        stdout.contains("Queued; delivery paused:"),
+        "expected paused feedback: {stdout}"
     );
 
     // Approve. Claude's permission prompt defaults to "1. Yes", so a bare Enter

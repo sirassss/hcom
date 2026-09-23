@@ -874,3 +874,99 @@ fn a_failed_gate_clear_is_retried_and_still_respects_ownership() {
 
     drop(db); // tempdir cleans up behind it
 }
+
+#[test]
+fn gate_publication_does_not_clobber_a_hook_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+    db.conn().execute("INSERT INTO instances (name, tool, created_at, status, status_context, status_detail) VALUES ('nova', 'claude', 1, 'active', 'tool:Bash', 'running tests')", []).unwrap();
+    let mut marker = String::new();
+    update_gate_context(
+        &db,
+        "nova",
+        "tui:wake-unacknowledged",
+        "not ready",
+        &mut marker,
+    )
+    .unwrap();
+    assert!(
+        marker.is_empty(),
+        "a skipped write must not claim ownership"
+    );
+    assert_eq!(db.get_status("nova").unwrap().unwrap().1, "tool:Bash");
+    assert_eq!(
+        db.get_instance_status("nova").unwrap().unwrap().detail,
+        "running tests"
+    );
+    db.set_status("nova", ST_LISTENING, "stop").unwrap();
+    update_gate_context(
+        &db,
+        "nova",
+        "tui:wake-unacknowledged",
+        "not ready",
+        &mut marker,
+    )
+    .unwrap();
+    assert_eq!(marker, "tui:wake-unacknowledged");
+}
+
+#[test]
+fn durable_gate_feedback_is_immediate_and_transient_gates_are_debounced() {
+    for reason in [
+        "not_ready",
+        "prompt_has_text",
+        "user_active",
+        "approval",
+        "nav_overlay",
+        "wake_unacknowledged",
+    ] {
+        assert_eq!(
+            gate_status_publication_delay(reason),
+            Duration::ZERO,
+            "{reason}"
+        );
+    }
+    for reason in ["not_idle", "output_unstable", "cooldown", "unknown"] {
+        assert_eq!(
+            gate_status_publication_delay(reason),
+            Duration::from_secs(2),
+            "{reason}"
+        );
+    }
+    assert_eq!(
+        gate_block_context("prompt_has_text", Duration::from_secs(60)),
+        "tui:prompt-has-text:stalled"
+    );
+}
+
+#[test]
+fn gate_rebind_clears_the_old_owner_and_retries_failed_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+    for name in ["old", "new"] {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, status) VALUES (?1, 1, 'listening')",
+                [name],
+            )
+            .unwrap();
+        db.set_gate_status(name, "tui:not-ready", "not ready")
+            .unwrap();
+    }
+    let mut owner = "old".to_string();
+    let mut marker = "tui:not-ready".to_string();
+    db.conn().execute_batch("PRAGMA query_only=ON").unwrap();
+    assert!(!reconcile_gate_owner(&db, "new", &mut owner, &mut marker));
+    assert_eq!(owner, "old");
+    assert_eq!(marker, "tui:not-ready");
+    db.conn().execute_batch("PRAGMA query_only=OFF").unwrap();
+    assert!(reconcile_gate_owner(&db, "new", &mut owner, &mut marker));
+    assert_eq!(owner, "new");
+    assert!(marker.is_empty());
+    assert_eq!(db.get_status("old").unwrap().unwrap().1, "");
+    assert_eq!(
+        db.get_status("new").unwrap().unwrap().1,
+        "tui:not-ready",
+        "the new owner's equal context was written by someone else"
+    );
+}

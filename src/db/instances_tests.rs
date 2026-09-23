@@ -587,6 +587,7 @@ fn clear_gate_status_only_clears_our_own_context() {
     );
 
     // A hand-joined instance keeps its cmd:listen detail, as set_gate_status does.
+    db.set_status("nova", "listening", "start").unwrap();
     db.set_gate_status("nova", "tui:not-idle:stalled", "gate blocked 60s")
         .unwrap();
     db.conn

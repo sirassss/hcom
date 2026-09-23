@@ -203,14 +203,15 @@ impl HcomDb {
     ///   detail: Human-readable description like "user is typing"
     /// Preserve status_detail when it's "cmd:listen" — gate diagnostics must not
     /// overwrite the flag that blocks PTY injection during `hcom listen`.
-    pub fn set_gate_status(&self, name: &str, context: &str, detail: &str) -> Result<()> {
-        self.conn.execute(
+    /// Returns false if a hook has already moved the instance out of listening.
+    pub fn set_gate_status(&self, name: &str, context: &str, detail: &str) -> Result<bool> {
+        let changed = self.conn.execute(
             "UPDATE instances SET status_context = ?,
                 status_detail = CASE WHEN status_detail = 'cmd:listen' THEN status_detail ELSE ? END
-             WHERE name = ?",
-            params![context, detail, name],
+             WHERE name = ? AND status = ?",
+            params![context, detail, name, ST_LISTENING],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// Clear a gate-block context, but only if it is still the one we wrote.

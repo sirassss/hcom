@@ -271,9 +271,9 @@ impl Agent {
         format_duration_short((epoch_now() - self.created_at).max(0.0) as u64)
     }
 
-    /// True when PTY delivery is gate-blocked (daemon wrote a `tui:*` context).
+    /// True when PTY delivery is held by a TUI gate or an approval prompt.
     pub fn is_pty_blocked(&self) -> bool {
-        self.status_context.starts_with("tui:")
+        crate::shared::is_delivery_paused_status_context(&self.status_context)
     }
 }
 

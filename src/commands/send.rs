@@ -223,21 +223,47 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     if delivered_to.is_empty() {
         return format!("Sent to: {SENDER}");
     }
-    if delivered_to.len() > 10 {
-        return format!("Sent to {} agents", delivered_to.len());
-    }
-
-    let mut parts = Vec::new();
+    let mut healthy = Vec::new();
+    let mut paused = Vec::new();
+    let mut pending = Vec::new();
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
             let display = identity::get_display_name(db, name);
-            parts.push(format!("{icon} {display}"));
+            let recipient = format!("{icon} {display}");
+            if crate::shared::is_delivery_paused_status_context(&data.status_context) {
+                paused.push(recipient);
+            } else if data.tcp_mode != 0
+                && data.origin_device_id.as_deref().is_none_or(str::is_empty)
+                && db.has_pending(name)
+            {
+                // The wake is asynchronous. Report its current disposition;
+                // don't delay every send while waiting for the PTY to consume it.
+                pending.push(recipient);
+            } else {
+                healthy.push(recipient);
+            }
         } else {
-            parts.push(format!("◌ {name}"));
+            healthy.push(format!("◌ {name}"));
         }
     }
-    format!("Sent to: {}", parts.join(", "))
+    let mut lines = Vec::new();
+    if healthy.len() > 10 {
+        lines.push(format!("Sent to {} agents", healthy.len()));
+    } else if !healthy.is_empty() {
+        lines.push(format!("Sent to: {}", healthy.join(", ")));
+    }
+    for (state, recipients) in [("paused", paused), ("pending", pending)] {
+        if !recipients.is_empty() {
+            let summary = if recipients.len() > 10 {
+                format!("{} agents", recipients.len())
+            } else {
+                recipients.join(", ")
+            };
+            lines.push(format!("Queued; delivery {state}: {summary}"));
+        }
+    }
+    lines.join("\n")
 }
 
 struct ResolvedDelivery {

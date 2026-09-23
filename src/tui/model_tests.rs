@@ -591,3 +591,12 @@ fn launch_tag_auto_edits() {
     assert_eq!(ls.options_cursor, Some(LaunchField::Tag));
     assert_eq!(ls.editing, Some(LaunchField::Tag));
 }
+
+#[test]
+fn pty_blocked_for_hook_and_pty_approvals() {
+    let mut a = test_agent("nova");
+    for context in ["approval", "pty:approval"] {
+        a.status_context = context.into();
+        assert!(a.is_pty_blocked(), "{context}");
+    }
+}
