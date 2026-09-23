@@ -941,6 +941,10 @@ impl ScreenTracker {
     /// The agy TUI uses a `>` prompt (with or without a trailing space). Only the
     /// bottommost prompt line is considered; scrollback may contain older `> …` lines.
     fn get_antigravity_input_text(&self) -> Option<String> {
+        // Antigravity paints this placeholder without dim styling. Accept a
+        // truncated banner, but never a draft that continues past its end.
+        const ACCEPT_EDITS_BANNER: &str =
+            "Accept-edits mode: file edits auto-approved (shift+tab to cycle)";
         let lines = self.get_screen_lines();
 
         if let Some((row_idx, text)) = lines.iter().enumerate().rev().find_map(|(row_idx, line)| {
@@ -948,6 +952,20 @@ impl ScreenTracker {
             let after = trimmed.strip_prefix('>')?.trim_start();
             Some((row_idx, trim_with_nbsp(after)))
         }) {
+            if self.is_ready() && text.starts_with("Accept-edits mode:") {
+                // Check the whole logical line: a matching first physical row
+                // may wrap into a real draft extending the banner.
+                let screen = self.parser.screen();
+                let mut end_row = row_idx;
+                while end_row + 1 < lines.len() && screen.row_wrapped(end_row as u16) {
+                    end_row += 1;
+                }
+                let prompt = screen.contents_between(row_idx as u16, 0, end_row as u16, self.cols);
+                let banner = prompt.trim_start().strip_prefix('>').unwrap_or("").trim();
+                if ACCEPT_EDITS_BANNER.starts_with(banner) {
+                    return Some(String::new());
+                }
+            }
             if text.is_empty() {
                 return Some(String::new());
             }

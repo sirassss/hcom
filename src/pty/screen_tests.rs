@@ -945,3 +945,89 @@ fn output_stable_zero_always_true() {
     let t = make_tracker(24, 80, "");
     assert!(t.is_output_stable(0));
 }
+
+// ---- Antigravity accept-edits banner ----
+
+#[test]
+fn antigravity_accept_edits_banner_with_ready_is_empty() {
+    let mut t = make_tracker(24, 192, "? for shortcuts");
+    t.process(
+        "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             ? for shortcuts\r\n"
+            .as_bytes(),
+    );
+    assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    assert!(t.is_prompt_empty("antigravity"));
+}
+
+#[test]
+fn antigravity_accept_edits_banner_wrapped_is_empty() {
+    let mut t = make_tracker(24, 40, "? for shortcuts");
+    t.process(
+        "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             ? for shortcuts\r\n"
+            .as_bytes(),
+    );
+    assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+}
+
+#[test]
+fn antigravity_banner_in_scrollback_then_real_draft_blocks() {
+    let mut t = make_tracker(24, 80, "? for shortcuts");
+    t.process("> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes());
+    t.process("some agent output\r\n".as_bytes());
+    t.process("> deploy to prod\r\n? for shortcuts\r\n".as_bytes());
+    assert_eq!(
+        t.get_antigravity_input_text(),
+        Some("deploy to prod".to_string())
+    );
+    assert!(!t.is_prompt_empty("antigravity"));
+}
+
+// Ready footer absent: the banner must still block, or hcom would deliver
+// into a session that cannot act.
+#[test]
+fn antigravity_banner_without_ready_footer_is_not_empty() {
+    let mut t = make_tracker(24, 192, "? for shortcuts");
+    t.process(
+        "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             AI: Out of credits\r\n"
+            .as_bytes(),
+    );
+    assert_eq!(
+        t.get_antigravity_input_text(),
+        Some("Accept-edits mode: file edits auto-approved (shift+tab to cycle)".to_string())
+    );
+}
+
+#[test]
+fn antigravity_banner_text_with_trailing_draft_is_not_empty() {
+    let mut t = make_tracker(24, 192, "? for shortcuts");
+    t.process(
+        "> Accept-edits mode: file edits auto-approved (shift+tab to cycle) and also ship it\r\n             ? for shortcuts\r\n"
+            .as_bytes(),
+    );
+    assert_ne!(t.get_antigravity_input_text(), Some(String::new()));
+}
+
+#[test]
+fn antigravity_accept_edits_banner_cut_inside_marker_still_blocks() {
+    let mut t = make_tracker(24, 12, "? for shortcuts");
+    t.process(
+        "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n? for shortcuts\r\n"
+            .as_bytes(),
+    );
+    assert_eq!(
+        t.get_antigravity_input_text(),
+        Some("Accept-edi".to_string())
+    );
+}
+
+#[test]
+fn antigravity_wrapped_banner_with_trailing_draft_blocks() {
+    for cols in [40, 60, 80] {
+        let mut t = make_tracker(24, cols, "? for shortcuts");
+        t.process(b"> Accept-edits mode: file edits auto-approved (shift+tab to cycle) and also ship it\r\n? for shortcuts\r\n");
+        assert!(
+            !t.is_prompt_empty("antigravity"),
+            "wrapped draft at {cols} columns must not be treated as a placeholder"
+        );
+    }
+}
