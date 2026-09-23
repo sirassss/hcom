@@ -206,6 +206,79 @@ fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
     Ok(0)
 }
 
+/// Reclaim a surviving row only when its process/session evidence is consistent.
+fn orphan_can_reuse_name(
+    db: &HcomDb,
+    preferred_name: &str,
+    orphan: &pidtrack::OrphanProcess,
+) -> Result<bool> {
+    // A different session/process owner is stronger evidence than the name in
+    // an old pidfile. Even minting here would steal its session via rebind.
+    if !orphan.session_id.is_empty()
+        && let Some(owner) = db.get_session_binding(&orphan.session_id)?
+        && owner != preferred_name
+    {
+        bail!("Orphan session is already owned by '{}'.", owner);
+    }
+    let bound_name = db
+        .get_process_binding_full(&orphan.process_id)?
+        .map(|(_, name)| name);
+    if let Some(owner) = bound_name.as_deref()
+        && owner != preferred_name
+    {
+        bail!("Orphan process is already owned by '{}'.", owner);
+    }
+    if preferred_name.is_empty() || !identity::is_valid_base_name(preferred_name) {
+        return Ok(false);
+    }
+    let Some(row) = db.get_instance_full(preferred_name)? else {
+        return Ok(true);
+    };
+    let same_session = !orphan.session_id.is_empty()
+        && row.session_id.as_deref() == Some(orphan.session_id.as_str());
+    let same_process = bound_name.as_deref() == Some(preferred_name);
+    if same_process
+        && row.session_id.as_deref().is_some_and(|sid| !sid.is_empty())
+        && !orphan.session_id.is_empty()
+        && !same_session
+    {
+        bail!(
+            "Orphan identity '{}' has moved to another session.",
+            preferred_name
+        );
+    }
+    if !same_session && !same_process {
+        return Ok(false);
+    }
+    if row.tool != orphan.tool {
+        bail!(
+            "Orphan identity '{}' belongs to a different tool.",
+            preferred_name
+        );
+    }
+    if let Some(pid) = row.pid {
+        let same_pid = pid == i64::from(orphan.pid)
+            && row.pid_namespace.as_deref().unwrap_or("") == orphan.pid_namespace;
+        if !same_pid
+            && u32::try_from(pid)
+                .ok()
+                .and_then(|pid| crate::sys::process::is_alive_in(pid, row.pid_namespace.as_deref()))
+                != Some(false)
+        {
+            bail!(
+                "Orphan identity '{}' still has another owner (or its liveness is unknown).",
+                preferred_name
+            );
+        }
+    } else if !same_process && db.has_process_binding_for_instance(preferred_name) {
+        bail!(
+            "Orphan identity '{}' has a different process binding.",
+            preferred_name
+        );
+    }
+    Ok(true)
+}
+
 /// Recover orphaned PTY process by PID or name.
 fn start_from_orphan(
     db: &HcomDb,
@@ -259,17 +332,27 @@ fn start_from_orphan(
     }
 
     let preferred_name = orphan.names.last().cloned().unwrap_or_default();
-    let can_reuse = !preferred_name.is_empty()
-        && identity::is_valid_base_name(&preferred_name)
-        && db.get_instance_full(&preferred_name)?.is_none();
+    // Match launch lock order: name-generation lock, then DB write lock.
+    let name_lock = instance_names::lock_name_generation(db)?;
+    // Hold ownership stable between the checks and the recovery writes.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(db.conn(), rusqlite::TransactionBehavior::Immediate)?;
+    let can_reuse = orphan_can_reuse_name(db, &preferred_name, orphan)?;
     let name = if can_reuse {
         preferred_name
     } else {
-        instance_names::generate_unique_name(db)?
+        instance_names::reserve_generated_name_locked(db)?
     };
 
     // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    pidtrack::recover_single_orphan_to_db(db, orphan, &name).map_err(anyhow::Error::msg)?;
+    transaction.commit()?;
+    drop(name_lock);
+    // Other connections can now see the restored binding and status.
+    crate::notify::wake(db, &name, crate::notify::WakeKind::DELIVERY_LOOPS);
+
+    // Recovery may run in a management pane. Do not rename the caller's TTY;
+    // the recovered PTY refreshes its own title through its delivery loop.
 
     db.log_event(
         "life",
@@ -522,6 +605,8 @@ fn start_rebind(
 
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
+
+    crate::runtime_env::set_terminal_title(&target_name);
 
     // Print bootstrap
     let hcom_config = HcomConfig::load(None).unwrap_or_else(|_| {

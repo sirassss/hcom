@@ -650,6 +650,21 @@ pub fn set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) {
+    if let Err(error) = try_set_status(db, instance_name, status, context, upd) {
+        eprintln!("[hcom] warn: set_status failed for {instance_name}: {error}");
+    }
+}
+
+/// Fallible status transition for operations that cannot report success until
+/// registration is persisted, such as orphan recovery.
+#[track_caller]
+pub fn try_set_status(
+    db: &HcomDb,
+    instance_name: &str,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+) -> anyhow::Result<()> {
     let StatusUpdate {
         detail,
         msg_ts,
@@ -658,13 +673,7 @@ pub fn set_status(
     } = upd;
     let writer = std::panic::Location::caller();
 
-    let current_data = match db.get_instance_full(instance_name) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("[hcom] warn: set_status DB read failed for {instance_name}: {e}");
-            None
-        }
-    };
+    let current_data = db.get_instance_full(instance_name)?;
     let now = now_epoch_i64();
     let mut updates = serde_json::Map::new();
     updates.insert("status".into(), serde_json::json!(status));
@@ -682,7 +691,7 @@ pub fn set_status(
         d.status != status || d.status_context != context || d.status_detail != detail
     });
 
-    crate::instances::update_instance_position(db, instance_name, &updates);
+    db.update_instance_fields(instance_name, &updates)?;
 
     if status_changed {
         crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
@@ -698,7 +707,7 @@ pub fn set_status(
         Some("pi") | Some("omp")
     );
     if is_pi_family && !status_event_changed && msg_ts.is_empty() {
-        return;
+        return Ok(());
     }
 
     let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
@@ -736,6 +745,7 @@ pub fn set_status(
         data["tool_use_id"] = serde_json::json!(tool_use_id);
     }
     let _ = db.log_event("status", instance_name, &data);
+    Ok(())
 }
 
 /// Delete placeholder instances that have been launching too long.

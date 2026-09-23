@@ -351,7 +351,6 @@ pub fn recover_single_orphan_to_db(
     orphan: &OrphanProcess,
     instance_name: &str,
 ) -> Result<(), String> {
-    use crate::instances;
     use crate::shared::constants::ST_LISTENING;
 
     let now = crate::shared::time::now_epoch_i64();
@@ -412,7 +411,8 @@ pub fn recover_single_orphan_to_db(
             ),
         );
     }
-    instances::update_instance_position(db, instance_name, &updates);
+    db.update_instance_fields(instance_name, &updates)
+        .map_err(|e| format!("failed to restore process fields: {e}"))?;
 
     // Create process binding
     if !orphan.process_id.is_empty() {
@@ -431,7 +431,8 @@ pub fn recover_single_orphan_to_db(
             .map_err(|e| format!("failed to rebind session: {}", e))?;
         let mut sid_update = serde_json::Map::new();
         sid_update.insert("session_id".into(), serde_json::json!(orphan.session_id));
-        instances::update_instance_position(db, instance_name, &sid_update);
+        db.update_instance_fields(instance_name, &sid_update)
+            .map_err(|e| format!("failed to restore session fields: {e}"))?;
     }
 
     // Restore notify endpoints
@@ -445,13 +446,14 @@ pub fn recover_single_orphan_to_db(
     }
 
     // Set listening so PTY delivery gate allows message injection
-    lifecycle::set_status(
+    lifecycle::try_set_status(
         db,
         instance_name,
         ST_LISTENING,
         "recovered",
         Default::default(),
-    );
+    )
+    .map_err(|e| format!("failed to restore listening status: {e}"))?;
 
     Ok(())
 }
