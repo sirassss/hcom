@@ -1901,6 +1901,12 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
     }
     base_env.remove("HCOM_TERMINAL");
+    // Plugin hook commands resolve `${HCOM:-hcom}`. The legacy settings.json
+    // env block used to set this; plugins have none, and Claude's Git Bash on
+    // Windows does not reliably see the launcher's PATH, so hand it over here.
+    base_env
+        .entry("HCOM".to_string())
+        .or_insert_with(crate::runtime_env::build_hcom_command);
     ensure_tool_config_env(&normalized, &mut base_env);
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
