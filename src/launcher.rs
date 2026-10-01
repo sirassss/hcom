@@ -774,6 +774,17 @@ fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     if tool == "antigravity" {
         m.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
     }
+    // herdr classifies an agent pane from its *foreground* process, which under
+    // PTY mode is `hcom pty`, not the tool — so the pane never enters `herdr
+    // agent list` and `agent.rename` keeps failing with "agent target not
+    // found". HERDR_AGENT is herdr's documented hint for exactly this wrapper
+    // case ("set HERDR_AGENT=<agent> on the wrapper command"); it names the
+    // screen manifest to evaluate. Routed through the sidecar (non-HCOM_ key),
+    // so it reaches `hcom pty` and dies with it rather than leaking into the
+    // login shell the launch script drops to afterwards. Set unconditionally:
+    // outside herdr nothing reads it, and on a nested spawn it must *overwrite*
+    // the parent pane's inherited value so claude → codex names codex.
+    m.insert("HERDR_AGENT".to_string(), tool.to_string());
     m
 }
 
@@ -3614,6 +3625,35 @@ mod tests {
         assert!(sidecar.contains("HERDR_SOCKET_PATH="));
         assert!(sidecar.contains("GEMINI_API_KEY"));
         assert!(sidecar.contains("RORI_MY_VAR"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
+    /// herdr classifies an agent pane from its foreground process, which under PTY
+    /// mode is `hcom pty`. The `HERDR_AGENT` hint names the tool for it, so it has
+    /// to name the tool being launched (not the one that inherited the parent
+    /// pane's value) and has to survive the sidecar's strip list.
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_forwards_herdr_agent_hint() {
+        // Overwrites an inherited value: a claude pane spawning codex names codex.
+        let mut env = HashMap::from([("HERDR_AGENT".to_string(), "claude".to_string())]);
+        env.extend(tool_extra_env("codex"));
+        assert_eq!(env.get("HERDR_AGENT").map(String::as_str), Some("codex"));
+
+        let script = create_runner_script("codex", "/tmp", "test", &env, &[], false).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+        assert!(
+            sidecar.contains("HERDR_AGENT=codex"),
+            "sidecar should carry the herdr agent hint, got: {sidecar}"
+        );
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
