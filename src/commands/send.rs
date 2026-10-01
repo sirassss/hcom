@@ -230,21 +230,47 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String], thread: Option<&
             None => format!("Sent to: {SENDER} only (no other agents are active)"),
         };
     }
-    if delivered_to.len() > 10 {
-        return format!("Sent to {} agents", delivered_to.len());
-    }
-
-    let mut parts = Vec::new();
+    let mut healthy = Vec::new();
+    let mut paused = Vec::new();
+    let mut pending = Vec::new();
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
             let display = identity::get_display_name(db, name);
-            parts.push(format!("{icon} {display}"));
+            let recipient = format!("{icon} {display}");
+            if crate::shared::is_delivery_paused_status_context(&data.status_context) {
+                paused.push(recipient);
+            } else if data.tcp_mode != 0
+                && data.origin_device_id.as_deref().is_none_or(str::is_empty)
+                && db.has_pending(name)
+            {
+                // The wake is asynchronous. Report its current disposition;
+                // don't delay every send while waiting for the PTY to consume it.
+                pending.push(recipient);
+            } else {
+                healthy.push(recipient);
+            }
         } else {
-            parts.push(format!("◌ {name}"));
+            healthy.push(format!("◌ {name}"));
         }
     }
-    format!("Sent to: {}", parts.join(", "))
+    let mut lines = Vec::new();
+    if healthy.len() > 10 {
+        lines.push(format!("Sent to {} agents", healthy.len()));
+    } else if !healthy.is_empty() {
+        lines.push(format!("Sent to: {}", healthy.join(", ")));
+    }
+    for (state, recipients) in [("paused", paused), ("pending", pending)] {
+        if !recipients.is_empty() {
+            let summary = if recipients.len() > 10 {
+                format!("{} agents", recipients.len())
+            } else {
+                recipients.join(", ")
+            };
+            lines.push(format!("Queued; delivery {state}: {summary}"));
+        }
+    }
+    lines.join("\n")
 }
 
 struct ResolvedDelivery {
@@ -2318,6 +2344,247 @@ mod tests {
         assert_eq!(resolve_reply_to_local(&db, "999"), None);
         assert_eq!(resolve_reply_to_local(&db, "notanumber"), None);
 
+        cleanup_test_db(path);
+    }
+
+    fn insert_feedback_recipient(db: &HcomDb, name: &str, status_context: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES (?1, 'listening', ?2, 1000.0)",
+                rusqlite::params![name, status_context],
+            )
+            .unwrap();
+    }
+
+    fn insert_pty_feedback_recipient(db: &HcomDb, name: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, created_at, tcp_mode)
+                 VALUES (?1, 'listening', '', 1000.0, 1)",
+                rusqlite::params![name],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_preserves_healthy_success_wording() {
+        let (db, path, _env) = setup_test_db();
+        let recipients = [
+            ("idle", ""),
+            ("using-tool", "tool:Bash"),
+            ("receiving", "deliver:rune"),
+            ("stopped-hook", "stop"),
+        ];
+        for (name, status_context) in recipients {
+            insert_feedback_recipient(&db, name, status_context);
+        }
+
+        let delivered_to = recipients
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<Vec<_>>();
+        let feedback = get_recipient_feedback(&db, &delivered_to, None);
+
+        assert_eq!(
+            feedback,
+            "Sent to: ◉ idle, ◉ using-tool, ◉ receiving, ◉ stopped-hook"
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_preserves_large_healthy_recipient_count() {
+        let (db, path, _env) = setup_test_db();
+        let recipients: Vec<String> = (0..11).map(|index| format!("agent{index}")).collect();
+        for recipient in &recipients {
+            insert_feedback_recipient(&db, recipient, "");
+        }
+
+        let feedback = get_recipient_feedback(&db, &recipients, None);
+
+        assert_eq!(feedback, "Sent to 11 agents");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_warns_for_delivery_paused_status_family() {
+        let (db, path, _env) = setup_test_db();
+        let recipients = [
+            ("not-ready", "tui:not-ready"),
+            ("draft", "tui:prompt-has-text"),
+            ("wake", "tui:wake-unacknowledged"),
+        ];
+        for (name, status_context) in recipients {
+            insert_feedback_recipient(&db, name, status_context);
+        }
+
+        let delivered_to = recipients
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<Vec<_>>();
+        let feedback = get_recipient_feedback(&db, &delivered_to, None);
+
+        assert_eq!(
+            feedback,
+            "Queued; delivery paused: ◉ not-ready, ◉ draft, ◉ wake"
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_warns_for_approval_block() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('approval', 'blocked', 'pty:approval', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let feedback = get_recipient_feedback(&db, &["approval".to_string()], None);
+
+        assert_eq!(feedback, "Queued; delivery paused: ■ approval");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_warns_for_hook_approval_block() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('hook-approval', 'blocked', 'approval', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let feedback = get_recipient_feedback(&db, &["hook-approval".to_string()], None);
+
+        assert_eq!(feedback, "Queued; delivery paused: ■ hook-approval");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_lists_healthy_before_paused_recipients() {
+        let (db, path, _env) = setup_test_db();
+        insert_feedback_recipient(&db, "paused", "tui:user-active");
+        insert_feedback_recipient(&db, "healthy", "");
+
+        let feedback =
+            get_recipient_feedback(&db, &["paused".to_string(), "healthy".to_string()], None);
+
+        assert_eq!(
+            feedback,
+            "Sent to: ◉ healthy\nQueued; delivery paused: ◉ paused"
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_send_message_persists_paused_recipient_once() {
+        let (db, path, _env) = setup_test_db();
+        insert_feedback_recipient(&db, "paused", "tui:not-ready");
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let (_, delivered) =
+            send_message(&db, &sender, "ping", None, Some(&["paused".to_string()])).unwrap();
+
+        assert_eq!(delivered, vec!["paused".to_string()]);
+        let message_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 1);
+        let delivered_to: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.delivered_to')
+                 FROM events
+                 WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivered_to, "[\"paused\"]");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_reports_unread_local_pty_as_pending() {
+        let (db, path, _env) = setup_test_db();
+        for name in ["local", "remote"] {
+            insert_pty_feedback_recipient(&db, name);
+        }
+        db.conn()
+            .execute(
+                "UPDATE instances SET origin_device_id='other-device' WHERE name='remote'",
+                [],
+            )
+            .unwrap();
+        let event = db
+            .log_event(
+                "message",
+                "bigboss",
+                &serde_json::json!({
+                    "from": "bigboss", "scope": "mentions", "text": "probe",
+                    "mentions": ["local", "remote"], "delivered_to": ["local", "remote"]
+                }),
+            )
+            .unwrap();
+        let feedback = get_recipient_feedback(&db, &["local".into(), "remote".into()], None);
+        assert!(
+            feedback.contains("Queued; delivery pending: ◉ local"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("Sent to: ◉ remote"),
+            "remote consumption is not tracked locally: {feedback}"
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id=?1 WHERE name='local'",
+                [event],
+            )
+            .unwrap();
+        assert_eq!(
+            get_recipient_feedback(&db, &["local".into()], None),
+            "Sent to: ◉ local"
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn recipient_feedback_collapses_large_paused_broadcast() {
+        let (db, path, _env) = setup_test_db();
+        let recipients: Vec<String> = (0..11).map(|index| format!("agent{index}")).collect();
+        for recipient in &recipients {
+            insert_feedback_recipient(&db, recipient, "tui:approval");
+        }
+        assert_eq!(
+            get_recipient_feedback(&db, &recipients, None),
+            "Queued; delivery paused: 11 agents"
+        );
         cleanup_test_db(path);
     }
 }

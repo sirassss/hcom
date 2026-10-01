@@ -279,9 +279,9 @@ impl Agent {
         format_duration_short((epoch_now() - self.created_at).max(0.0) as u64)
     }
 
-    /// True when PTY delivery is gate-blocked (daemon wrote a `tui:*` context).
+    /// True when PTY delivery is held by a TUI gate or an approval prompt.
     pub fn is_pty_blocked(&self) -> bool {
-        self.status_context.starts_with("tui:")
+        crate::shared::is_delivery_paused_status_context(&self.status_context)
     }
 }
 
@@ -1530,5 +1530,14 @@ mod tests {
         ls.cursor_down(); // → Tag
         assert_eq!(ls.options_cursor, Some(LaunchField::Tag));
         assert_eq!(ls.editing, Some(LaunchField::Tag));
+    }
+
+    #[test]
+    fn pty_blocked_for_hook_and_pty_approvals() {
+        let mut a = test_agent("nova");
+        for context in ["approval", "pty:approval"] {
+            a.status_context = context.into();
+            assert!(a.is_pty_blocked(), "{context}");
+        }
     }
 }
