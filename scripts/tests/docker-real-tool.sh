@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Run one real-tool integration test in a clean Docker container, with no
+# account, subscription or API key. Each test drives a genuine, pinned CLI
+# against a localhost mock provider.
+#
+#   scripts/tests/docker-real-tool.sh                      # claude -> cursor scenario
+#   scripts/tests/docker-real-tool.sh real_tool_claude     # any other test binary
+#
+# Needs: docker; for the Cursor scenario, cursor-agent installed on the host
+# (the matching version directory is mounted read-only; it carries its own node).
+#
+# Two phases. PREPARE has network: build the image, fetch crates, install the
+# pinned Claude CLI, compile the tests. RUN has none (`--network none`), which
+# proves the scenario needs no outside service. Caches live in named volumes, so
+# the host's target/ is never touched.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST="${1:-real_tool_claude_cursor}"
+IMAGE="${HCOM_RT_IMAGE:-hcom-real-tool:local}"
+CURSOR_VERSION="${HCOM_RT_CURSOR_VERSION:-2026.09.28-64d2043}"
+CURSOR_DIR="${HCOM_RT_CURSOR_DIR:-$HOME/.local/share/cursor-agent/versions/$CURSOR_VERSION}"
+RUST_VERSION="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")"
+NODE_VERSION="$(tr -d '[:space:]' < "$ROOT/.node-version")"
+
+mounts=(
+  -v "$ROOT:/work"
+  -v hcom-rt-target:/work/target
+  -v hcom-rt-cargo:/home/hcom/.cargo/registry
+  -v hcom-rt-cargo-git:/home/hcom/.cargo/git
+)
+env_args=(-e CARGO_TARGET_DIR=/work/target -e HCOM_RT_TEST="$TEST")
+# Pass the CLI path to the tests; the cursor scenario needs the host install.
+if [[ "$TEST" == *cursor* ]]; then
+  if [[ ! -x "$CURSOR_DIR/cursor-agent" ]]; then
+    echo "cursor-agent $CURSOR_VERSION not found at $CURSOR_DIR" >&2
+    echo "set HCOM_RT_CURSOR_DIR to its version directory" >&2
+    exit 1
+  fi
+  mounts+=(-v "$CURSOR_DIR:/opt/cursor-agent:ro")
+  env_args+=(-e HCOM_RT_CURSOR=1)
+fi
+
+echo "== image $IMAGE (rust $RUST_VERSION, node $NODE_VERSION)"
+docker build -q -t "$IMAGE" \
+  --build-arg "RUST_VERSION=$RUST_VERSION" \
+  --build-arg "NODE_VERSION=$NODE_VERSION" \
+  --build-arg "UID=$(id -u)" \
+  "$ROOT/docker/real-tool" >/dev/null
+
+# Volumes are created root-owned; hand them to the container user once.
+for v in hcom-rt-target hcom-rt-cargo hcom-rt-cargo-git; do docker volume create "$v" >/dev/null; done
+docker run --rm -u root "${mounts[@]}" "$IMAGE" \
+  chown -R hcom:hcom /work/target /home/hcom/.cargo
+
+prepare='
+set -euo pipefail
+cd /work
+./scripts/install-mock-tools.sh claude
+cargo test --locked --test "$HCOM_RT_TEST" --no-run
+'
+echo "== prepare (network)"
+docker run --rm "${mounts[@]}" "${env_args[@]}" "$IMAGE" bash -c "$prepare"
+
+run='
+set -euo pipefail
+cd /work
+export PATH="/work/target/mock-tools/bin:$PATH"
+if [ -n "${HCOM_RT_CURSOR:-}" ]; then
+  mkdir -p "$HOME/bin"
+  ln -sf /opt/cursor-agent/cursor-agent "$HOME/bin/cursor-agent"
+  export PATH="$HOME/bin:$PATH"
+fi
+cargo test --locked --offline --test "$HCOM_RT_TEST" -- --ignored --nocapture --test-threads=1
+'
+echo "== run $TEST (no network)"
+docker run --rm --network none "${mounts[@]}" "${env_args[@]}" "$IMAGE" bash -c "$run"
