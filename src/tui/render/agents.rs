@@ -165,7 +165,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     for i in scroll..end {
         let agent = &app.data.agents[i];
         let is_cursor = app.ui.cursor == i;
-        let is_selected = app.ui.selected.contains(&agent.name);
+        let is_selected = app.ui.msg_filter.agents.contains(&agent.name);
 
         if lines.len() >= max_visible {
             break;
@@ -212,7 +212,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             .enumerate()
             .map(|(i, ragent)| {
                 let ic = matches!(ct, CursorTarget::RemoteAgent(idx) if idx == i);
-                let is = app.ui.selected.contains(&ragent.display_name());
+                let is = app.ui.msg_filter.agents.contains(&ragent.display_name());
                 vec![remote_agent_line(
                     ragent,
                     ic,
@@ -239,7 +239,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             .enumerate()
             .map(|(i, agent)| {
                 let ic = matches!(ct, CursorTarget::StoppedAgent(idx) if idx == i);
-                let is = app.ui.selected.contains(&agent.name);
+                let is = app.ui.msg_filter.agents.contains(&agent.name);
                 let mut item = vec![stopped_agent_line(
                     agent, ic, is, width, multi_tool, name_width,
                 )];
@@ -729,7 +729,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
     // Live agents
     for (i, agent) in app.data.agents.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
-        let is_selected = app.ui.selected.contains(&agent.name);
+        let is_selected = app.ui.msg_filter.agents.contains(&agent.name);
         let icon = agent_icon(agent, app.ui.tick);
         let name = agent.display_name();
         let indicator = tab_indicator_color(agent);
@@ -763,7 +763,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
         if app.ui.remote_expanded {
             for (i, ragent) in app.data.remote_agents.iter().enumerate() {
                 let is_cursor = app.ui.cursor == offset + i;
-                let is_selected = app.ui.selected.contains(&ragent.display_name());
+                let is_selected = app.ui.msg_filter.agents.contains(&ragent.display_name());
                 let icon = agent_icon(ragent, app.ui.tick);
                 let indicator = tab_indicator_color(ragent);
                 tabs.push(TabEntry {
@@ -811,11 +811,11 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
         return Line::from(Span::styled("  No agents", Theme::dim()));
     }
 
-    // Compute tab widths (text + 1 padding each side)
+    // Text plus borders, cursor/selection markers, and unread indicator.
     let gap = 2usize;
     let tab_widths: Vec<usize> = tabs
         .iter()
-        .map(|t| UnicodeWidthStr::width(t.text.as_str()) + 2)
+        .map(|t| UnicodeWidthStr::width(t.text.as_str()) + 5)
         .collect();
 
     let cursor_tab = tabs.iter().position(|t| t.is_cursor).unwrap_or(0);
@@ -839,58 +839,37 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
             spans.push(Span::raw("  "));
         }
 
-        // Background: cursor takes SELECTION; selected gets strong blue bg; indicator gets tint.
-        let bg = if tab.is_cursor && tab.is_selected {
-            ratatui::style::Color::Rgb(55, 70, 135) // cursor + selected
-        } else if tab.is_cursor {
-            palette::SELECTION
-        } else if tab.is_selected {
-            ratatui::style::Color::Rgb(45, 60, 120)
+        let is_target = tab.is_selected || (tab.is_cursor && app.ui.msg_filter.agents.is_empty());
+        let bg = if is_target {
+            Color::Rgb(35, 65, 125)
         } else {
-            match tab.indicator {
-                Some(c) if c == palette::ORANGE => ratatui::style::Color::Rgb(48, 28, 8),
-                Some(_) => ratatui::style::Color::Rgb(46, 42, 14), // yellow tint for unread
-                None => ratatui::style::Color::Reset,
-            }
+            Color::Reset
         };
-        let use_bg = tab.is_cursor || tab.is_selected || tab.indicator.is_some();
+        let base = Style::default().bg(bg);
+        let edge = base.fg(palette::CYAN).add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(if tab.is_cursor { "▏" } else { " " }, edge));
+        spans.push(Span::styled(if tab.is_cursor { "▶" } else { " " }, edge));
+        spans.push(Span::styled(
+            if tab.is_selected { "●" } else { " " },
+            base.fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            if tab.indicator.is_some() { "▏" } else { " " },
+            base.fg(tab.indicator.unwrap_or(palette::FG)),
+        ));
 
-        // Left edge: ▏ in indicator/selection color, or plain space
-        let ind_span = if let Some(fg) = tab.indicator {
-            let s = if use_bg {
-                Style::default().fg(fg).bg(bg)
-            } else {
-                Style::default().fg(fg)
-            };
-            Span::styled("\u{258f}", s)
-        } else if tab.is_selected || use_bg {
-            Span::styled(" ", Style::default().bg(bg))
+        // Keep the status icon's color independently of the selected name.
+        let (icon, name) = tab.text.split_once(' ').unwrap_or(("", &tab.text));
+        if !icon.is_empty() {
+            spans.push(Span::styled(format!("{icon} "), tab.style.bg(bg)));
+        }
+        let name_style = if is_target {
+            base.fg(Color::White).add_modifier(Modifier::BOLD)
         } else {
-            Span::raw(" ")
-        };
-        spans.push(ind_span);
-
-        // Text + trailing space
-        let text_style = if tab.is_cursor {
-            if tab.is_selected {
-                Style::default()
-                    .fg(palette::BLUE)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(bg)
-            } else {
-                tab.style.bg(bg)
-            }
-        } else if tab.is_selected {
-            let s = Style::default()
-                .fg(palette::BLUE)
-                .add_modifier(Modifier::BOLD);
-            if use_bg { s.bg(bg) } else { s }
-        } else if use_bg {
             tab.style.bg(bg)
-        } else {
-            tab.style
         };
-        spans.push(Span::styled(format!("{} ", tab.text), text_style));
+        spans.push(Span::styled(name.to_string(), name_style));
+        spans.push(Span::styled(if tab.is_cursor { "▕" } else { " " }, edge));
     }
 
     // Right overflow indicator
@@ -966,8 +945,8 @@ fn compute_tab_scroll(
 
 fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, width: usize) {
     let w = width as u16;
-    let is_selected =
-        app.ui.selected.contains(&agent.name) || app.ui.selected.contains(&agent.display_name());
+    let is_selected = app.ui.msg_filter.agents.contains(&agent.name)
+        || app.ui.msg_filter.agents.contains(&agent.display_name());
 
     // Line 1: icon name · tool · age · context                 created Xm
     let icon = agent_icon(agent, app.ui.tick);
@@ -1088,4 +1067,45 @@ fn build_orphan_detail(orphan: &OrphanProcess, lines: &mut Vec<Line<'static>>, _
         Span::styled(" \u{00b7} ", Theme::separator()),
         Span::styled(orphan.age_display(), Theme::dim()),
     ]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_cursor_and_selected_group_are_distinct() {
+        let mut app = App::new();
+        app.data.agents = vec![
+            crate::tui::test_helpers::make_test_agent("nova", 0.0),
+            crate::tui::test_helpers::make_test_agent("ligo", 0.0),
+        ];
+        app.data.remote_agents.clear();
+        app.data.orphans.clear();
+        app.ui.cursor = 0;
+        for selected in [false, true] {
+            app.ui.msg_filter.agents.clear();
+            if selected {
+                app.ui.msg_filter.agents.insert("ligo".into());
+            }
+            let line = build_tab_strip(&app, 100);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.contains('▶'), "{text}");
+            assert_eq!(text.contains('●'), selected, "{text}");
+            let nova = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains("nova"))
+                .unwrap();
+            let ligo = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains("ligo"))
+                .unwrap();
+            let target = if selected { ligo } else { nova };
+            assert_eq!(target.style.fg, Some(ratatui::style::Color::White));
+            assert!(target.style.add_modifier.contains(Modifier::BOLD));
+            assert_ne!(nova.style.bg, ligo.style.bg);
+        }
+    }
 }

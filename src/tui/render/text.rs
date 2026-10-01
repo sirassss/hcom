@@ -154,7 +154,12 @@ fn push_token(
     }
 }
 
-pub(crate) fn render_body(text: &str, width: usize, query: Option<&str>) -> Vec<Line<'static>> {
+pub(crate) fn render_body(
+    text: &str,
+    width: usize,
+    query: Option<&str>,
+    bigboss: &str,
+) -> Vec<Line<'static>> {
     let indent = 4usize;
     let max_w = width.saturating_sub(indent);
     if max_w == 0 {
@@ -163,37 +168,27 @@ pub(crate) fn render_body(text: &str, width: usize, query: Option<&str>) -> Vec<
 
     // Parse text into styled segments (handling @mentions)
     let mut segments: Vec<Span<'static>> = Vec::new();
-    let mut chars = text.chars().peekable();
-    let mut current = String::new();
-
-    while let Some(ch) = chars.next() {
-        if ch == '@' {
-            if !current.is_empty() {
-                segments.push(Span::styled(
-                    current.clone(),
-                    Style::default().fg(palette::FG),
-                ));
-                current.clear();
-            }
-            let mut mention = String::from("@");
-            while let Some(&next) = chars.peek() {
-                if next.is_alphanumeric() || next == '-' || next == '_' || next == ':' {
-                    mention.push(chars.next().unwrap());
-                } else {
-                    break;
-                }
-            }
-            if mention.len() > 1 {
-                segments.push(Span::styled(mention, Theme::mention()));
-            } else {
-                current.push('@');
-            }
+    let mut end = 0;
+    for capture in crate::shared::MENTION_PATTERN.captures_iter(text) {
+        let name = capture.get(1).unwrap();
+        let start = name.start() - 1; // include @, exclude the regex's boundary
+        segments.push(Span::styled(
+            text[end..start].to_string(),
+            Style::default().fg(palette::FG),
+        ));
+        let style = if name.as_str() == bigboss {
+            Theme::mention().fg(palette::RED)
         } else {
-            current.push(ch);
-        }
+            Theme::mention()
+        };
+        segments.push(Span::styled(text[start..name.end()].to_string(), style));
+        end = name.end();
     }
-    if !current.is_empty() {
-        segments.push(Span::styled(current, Style::default().fg(palette::FG)));
+    if end < text.len() {
+        segments.push(Span::styled(
+            text[end..].to_string(),
+            Style::default().fg(palette::FG),
+        ));
     }
 
     // Apply search highlighting
@@ -387,19 +382,19 @@ mod tests {
     #[test]
     fn render_body_wraps_long_text() {
         let text = "a ".repeat(30); // 60 chars
-        let lines = render_body(&text, 20, None);
+        let lines = render_body(&text, 20, None, "bigboss");
         assert!(lines.len() > 1, "should wrap into multiple lines");
     }
 
     #[test]
     fn render_body_empty_produces_one_line() {
-        let lines = render_body("", 40, None);
+        let lines = render_body("", 40, None, "bigboss");
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn render_body_highlights_mention() {
-        let lines = render_body("hello @nova", 40, None);
+        let lines = render_body("hello @nova", 40, None, "bigboss");
         // Flatten spans to check @nova gets mention style
         let all_text: String = lines
             .iter()
