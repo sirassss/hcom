@@ -57,3 +57,21 @@ curl -fsSL https://github.com/<fork>/releases/latest/download/hcom-installer.sh 
 
 `/latest/` chỉ resolve nếu release không bị đánh dấu prerelease — `gh release edit <tag>
 --prerelease=false` nếu cần (script không tự làm việc này).
+
+## Plugin Antigravity — khi nào gỡ
+
+Fork chỉ đóng gói plugin cho **Antigravity (AGY)** (`plugin/hcom-agy`), vì upstream
+mới nạp hook per-run cho Claude, Codex, Copilot, Pi, OMP, OpenCode, Kilo. AGY vẫn dùng
+hook cài global (`hcom hooks add antigravity`).
+
+Cursor **không** có plugin hook: đo trên cursor-agent 2026.09.28 và 2026.10.01, hook của
+plugin chỉ bắn cho event đã được khai trong một `hooks.json`, và khi đứng cạnh `hooks.json`
+của hcom thì mỗi hook bắn hai lần. Hook Cursor chỉ ghi vào `~/.cursor/hooks.json`.
+
+Khi upstream ra bản hỗ trợ per-run hook cho AGY (kiểm tra `HookMode::of` trong
+`src/hooks/runtime.rs`), gỡ phần này:
+
+```bash
+git tag -l 'siras/agy-plugin*'            # commit gói plugin AGY
+git revert <commit của tag>               # hoặc: git show <tag> --stat để xem cần xoá gì
+```
