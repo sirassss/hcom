@@ -48,6 +48,12 @@ pub enum Reply {
     Sse(Vec<u8>),
     /// A `200 OK` `application/json` body (e.g. Anthropic `count_tokens`).
     Json(String),
+    /// A `200 OK` body with an explicit content type, for non-JSON wire formats
+    /// (e.g. Cursor's `application/proto` Connect unary responses).
+    Raw {
+        content_type: &'static str,
+        body: Vec<u8>,
+    },
     /// A benign empty-body status that is NOT flagged unexpected — for legitimate
     /// auxiliary requests (e.g. Claude's `HEAD /` reachability probe).
     Empty(u16),
@@ -247,6 +253,15 @@ fn handle_conn(
             );
             writer.write_all(head.as_bytes())?;
             writer.write_all(json.as_bytes())?;
+        }
+        Reply::Raw { content_type, body } => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            writer.write_all(head.as_bytes())?;
+            writer.write_all(&body)?;
         }
         Reply::Empty(code) => {
             let head =

@@ -4080,4 +4080,78 @@ mod tests {
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
     }
+    /// `CI` alone marks the parent contaminated. A tool launched from such a parent
+    /// must get the resolved clean shell env, not the parent's `CI`/`NO_COLOR`:
+    /// cursor-agent treats any `CI` as a non-interactive run and never draws a
+    /// styled prompt, so hcom could not tell an empty prompt from a draft.
+    #[test]
+    #[serial]
+    fn test_ci_parent_is_contaminated_and_ci_does_not_reach_tool() {
+        let _guard = EnvVarGuard::clean_detection_env();
+        // Created before the set_var calls: it clears the keys now and restores them
+        // on drop.
+        let _no_color = EnvVarGuard::remove(vec!["NO_COLOR".to_string()]);
+        unsafe {
+            std::env::set_var("CI", "1");
+            std::env::set_var("NO_COLOR", "1");
+        }
+
+        assert!(contaminated_parent_with_inside_ai_tool(false));
+        assert_eq!(
+            launch_env_regime(false, false),
+            LaunchEnvRegime::ContaminatedParent
+        );
+
+        let config = crate::config::HcomConfig::default();
+        let env =
+            build_launch_env_with_resolver(&config, LaunchEnvRegime::ContaminatedParent, || {
+                Some(HashMap::from([(
+                    "PATH".to_string(),
+                    "/usr/bin".to_string(),
+                )]))
+            });
+
+        assert!(!env.contains_key("CI"), "parent CI leaked: {env:?}");
+        assert!(
+            !env.contains_key("NO_COLOR"),
+            "parent NO_COLOR leaked: {env:?}"
+        );
+    }
+
+    /// Pins today's fail-open path: when the clean shell env cannot be resolved the
+    /// launch falls back to the parent env, so a `CI`/`NO_COLOR` the parent carries
+    /// DOES reach the tool. This is how a test harness that clears its env (no
+    /// SHELL) ends up launching cursor-agent with `CI=1`. If hcom later strips these
+    /// on the fallback path, flip this test and drop the `CI` shim in
+    /// `tests/support/cursor_mock.rs`.
+    #[test]
+    #[serial]
+    fn test_ci_reaches_tool_when_clean_shell_env_cannot_be_resolved() {
+        let _guard = EnvVarGuard::clean_detection_env();
+        // Created before the set_var calls: it clears the keys now and restores them
+        // on drop.
+        let _no_color = EnvVarGuard::remove(vec!["NO_COLOR".to_string()]);
+        unsafe {
+            std::env::set_var("CI", "1");
+            std::env::set_var("NO_COLOR", "1");
+        }
+
+        let config = crate::config::HcomConfig::default();
+        let env =
+            build_launch_env_with_resolver(&config, LaunchEnvRegime::ContaminatedParent, || None);
+
+        assert_eq!(env.get("CI").map(String::as_str), Some("1"));
+        assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
+    }
+
+    /// Without any contamination marker the parent is a plain human shell, so the
+    /// regime is `HumanShell` and the tool inherits the user's own env untouched.
+    #[test]
+    #[serial]
+    fn test_plain_parent_without_ci_is_a_human_shell() {
+        let _guard = EnvVarGuard::clean_detection_env();
+
+        assert!(!contaminated_parent_with_inside_ai_tool(false));
+        assert_eq!(launch_env_regime(false, false), LaunchEnvRegime::HumanShell);
+    }
 }
