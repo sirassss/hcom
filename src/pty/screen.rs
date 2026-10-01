@@ -979,7 +979,10 @@ impl ScreenTracker {
             } else {
                 continue;
             };
-            let text = trim_with_nbsp(text);
+            // Codex paints Braille spinner cells after the input on this row.
+            let text = trim_with_nbsp(text).trim_end_matches(|c: char| {
+                c.is_whitespace() || matches!(c, '\u{2800}'..='\u{28FF}')
+            });
 
             if text.is_empty() {
                 return Some(String::new());
@@ -1012,6 +1015,10 @@ impl ScreenTracker {
     /// The agy TUI uses a `>` prompt (with or without a trailing space). Only the
     /// bottommost prompt line is considered; scrollback may contain older `> …` lines.
     fn get_antigravity_input_text(&self) -> Option<String> {
+        // Antigravity paints this placeholder without dim styling. Accept a
+        // truncated banner, but never a draft that continues past its end.
+        const ACCEPT_EDITS_BANNER: &str =
+            "Accept-edits mode: file edits auto-approved (shift+tab to cycle)";
         let lines = self.get_screen_lines();
 
         if let Some((row_idx, text)) = lines.iter().enumerate().rev().find_map(|(row_idx, line)| {
@@ -1019,6 +1026,20 @@ impl ScreenTracker {
             let after = trimmed.strip_prefix('>')?.trim_start();
             Some((row_idx, trim_with_nbsp(after)))
         }) {
+            if self.is_ready() && text.starts_with("Accept-edits mode:") {
+                // Check the whole logical line: a matching first physical row
+                // may wrap into a real draft extending the banner.
+                let screen = self.parser.screen();
+                let mut end_row = row_idx;
+                while end_row + 1 < lines.len() && screen.row_wrapped(end_row as u16) {
+                    end_row += 1;
+                }
+                let prompt = screen.contents_between(row_idx as u16, 0, end_row as u16, self.cols);
+                let banner = prompt.trim_start().strip_prefix('>').unwrap_or("").trim();
+                if ACCEPT_EDITS_BANNER.starts_with(banner) {
+                    return Some(String::new());
+                }
+            }
             if text.is_empty() {
                 return Some(String::new());
             }
@@ -1026,20 +1047,16 @@ impl ScreenTracker {
             return match self.is_dim_after_prompt(row_idx as u16, ">") {
                 Some(true) => Some(String::new()),
                 Some(false) => Some(text.to_string()),
-                None => {
-                    if self.is_ready() {
-                        Some(String::new())
-                    } else {
-                        Some(text.to_string())
-                    }
-                }
+                // Readiness answers "is the TUI up", not "is the prompt empty":
+                // agy's status bar renders while it is busy too. When dimness is
+                // undecidable, treat the glyphs as the user's text — reporting
+                // "empty" here would let a wake overwrite what they typed.
+                None => Some(text.to_string()),
             };
         }
 
-        if self.is_ready() {
-            return Some(String::new());
-        }
-
+        // Prompt row not located. Unknown is not empty; `is_prompt_empty`
+        // treats None as "not safe", which is the answer we want.
         None
     }
 
@@ -1691,6 +1708,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_ignores_spinner_glyphs_after_input() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› <hcom>  ⠄  ⠠⡀⠀\r\n".as_bytes());
+        assert_eq!(t.get_codex_input_text(), Some("<hcom>".to_string()));
+    }
+
+    #[test]
+    fn codex_keeps_braille_within_input() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› <hcom>⠄user  ⠠\r\n".as_bytes());
+        assert_eq!(t.get_codex_input_text(), Some("<hcom>⠄user".to_string()));
+    }
+
+    #[test]
+    fn codex_keeps_unknown_prompt_suffix() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› <hcom>  ⚙\r\n".as_bytes());
+        assert_eq!(t.get_codex_input_text(), Some("<hcom>  ⚙".to_string()));
+    }
+
+    #[test]
     fn codex_empty_prompt() {
         let mut t = make_tracker(24, 80, "? for shortcuts");
         t.process("› \r\n".as_bytes());
@@ -2277,5 +2315,165 @@ mod tests {
     fn output_stable_zero_always_true() {
         let t = make_tracker(24, 80, "");
         assert!(t.is_output_stable(0));
+    }
+
+    // ---- Antigravity accept-edits banner ----
+
+    #[test]
+    fn antigravity_accept_edits_banner_with_ready_is_empty() {
+        let mut t = make_tracker(24, 192, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_wrapped_is_empty() {
+        let mut t = make_tracker(24, 40, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_banner_in_scrollback_then_real_draft_blocks() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        t.process("some agent output\r\n".as_bytes());
+        t.process("> deploy to prod\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("deploy to prod".to_string())
+        );
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    // Ready footer absent: the banner must still block, or hcom would deliver
+    // into a session that cannot act.
+    #[test]
+    fn antigravity_banner_without_ready_footer_is_not_empty() {
+        let mut t = make_tracker(24, 192, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n             AI: Out of credits\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("Accept-edits mode: file edits auto-approved (shift+tab to cycle)".to_string())
+        );
+    }
+
+    #[test]
+    fn antigravity_banner_text_with_trailing_draft_is_not_empty() {
+        let mut t = make_tracker(24, 192, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle) and also ship it\r\n             ? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_ne!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_cut_inside_marker_still_blocks() {
+        let mut t = make_tracker(24, 12, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n? for shortcuts\r\n"
+                .as_bytes(),
+        );
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("Accept-edi".to_string())
+        );
+    }
+
+    #[test]
+    fn antigravity_wrapped_banner_with_trailing_draft_blocks() {
+        for cols in [40, 60, 80] {
+            let mut t = make_tracker(24, cols, "? for shortcuts");
+            t.process(b"> Accept-edits mode: file edits auto-approved (shift+tab to cycle) and also ship it\r\n? for shortcuts\r\n");
+            assert!(
+                !t.is_prompt_empty("antigravity"),
+                "wrapped draft at {cols} columns must not be treated as a placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_no_prompt_line_is_unknown_not_empty() {
+        // Only the status bar is on screen — the prompt row is not located.
+        // "Unknown" must not be reported as "empty", or the delivery gate would
+        // inject over whatever the user has typed.
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process(" Ctx 6% (66k/1048k) |  5h 0% |  ~/workspaces/hcom\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), None);
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    // ---- Antigravity readiness ----
+
+    #[test]
+    fn antigravity_idle_frame_is_ready() {
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process(
+            concat!(
+                "> \r\n",
+                " Gemini 3.8 Flash (High) |  high |  65ce493d\r\n",
+                " Ctx 6% (66k/1048k) |  5h 0% |  ~/workspaces/hcom | branch\r\n",
+            )
+            .as_bytes(),
+        );
+        assert!(t.is_ready(), "agy idle frame must satisfy the ready gate");
+    }
+
+    #[test]
+    fn antigravity_busy_frame_is_also_ready() {
+        // The status bar renders while agy is running a command. Readiness answers
+        // "is the TUI up", not "is agy idle" — idleness is the gate's own check.
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process(
+            concat!(
+                "* Running command...\r\n",
+                "> \r\n",
+                " Ctx 3% (33k/1048k) |  5h 1% |  ~/workspaces/hcom | branch\r\n",
+            )
+            .as_bytes(),
+        );
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn antigravity_ready_pattern_survives_a_narrow_terminal() {
+        // Claude's footer hides when the terminal is narrow. agy's status bar is
+        // left-anchored, so the label survives truncation.
+        let mut t = make_tracker(24, 40, "Ctx ");
+        t.process(" Ctx 6% (66k/1048k) |  5h 0%\r\n".as_bytes());
+        assert!(t.is_ready());
+    }
+
+    #[test]
+    fn antigravity_frame_without_status_bar_is_not_ready() {
+        let mut t = make_tracker(24, 120, "Ctx ");
+        t.process("starting agy...\r\n".as_bytes());
+        assert!(!t.is_ready());
+    }
+
+    #[test]
+    fn antigravity_spec_patterns_accept_either_agy_frame() {
+        let patterns = crate::tool::Tool::Antigravity.ready_patterns();
+        // agy 1.1.27: status bar, no "? for shortcuts" footer.
+        let mut bar = make_tracker_with(24, 120, patterns);
+        bar.process(" Ctx 6% (66k/1048k) |  5h 0% |  ~/workspaces/hcom\r\n".as_bytes());
+        assert!(bar.is_ready());
+        // Builds that draw the footer instead.
+        let mut footer = make_tracker_with(24, 120, patterns);
+        footer.process("> \r\n  ? for shortcuts\r\n".as_bytes());
+        assert!(footer.is_ready());
     }
 }
