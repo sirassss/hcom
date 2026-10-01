@@ -58,11 +58,11 @@ agent → hooks → db → hooks/PTY delivery → other agent
 
 ## Plugin packages
 
-Upstream loads hooks per launch (`src/hooks/runtime.rs`) for Claude, Codex, Copilot, Pi, OMP, OpenCode and Kilo. Only **Cursor** and **Antigravity** still use persistent hooks, so only they are packaged as plugins here: `plugin/hcom` (Cursor manifest + `hooks-cursor.json`, beside upstream's Claude manifest and `skills` symlink) and `plugin/hcom-agy` (a generated real copy of `skills/hcom-agent-messaging/`, since `agy` does not dereference symlinks).
+Upstream loads hooks per launch (`src/hooks/runtime.rs`) for Claude, Codex, Copilot, Pi, OMP, OpenCode and Kilo. Cursor, Gemini, Kimi and Antigravity still use persistent hooks. Only **Antigravity** is packaged as a plugin here: `plugin/hcom-agy` (a generated real copy of `skills/hcom-agent-messaging/`, since `agy` does not dereference symlinks). `plugin/hcom` is upstream's Claude manifest plus the `skills` symlink; Cursor has no plugin hooks. Measured on cursor-agent 2026.09.28 and 2026.10.01: a plugin's hook for an event fires only if a `hooks.json` also declares that event, and a plugin beside hcom's own `hooks.json` fires every hook twice, so Cursor hooks live only in `~/.cursor/hooks.json` (`src/hooks/cursor.rs`).
 
 Edit `skills/hcom-agent-messaging/` and run `scripts/sync-plugin-skills.sh` (add `--publish` to also push `plugin/` to the standalone plugin repo). Never hand-edit `plugin/hcom-agy/skills/` — `tests/plugin_payload.rs` fails on drift.
 
-When upstream gains per-run hooks for Cursor/Antigravity (`HookMode::of` in `src/hooks/runtime.rs`), revert the commit tagged `siras/cursor-agy-plugin`; see `scripts/README.md`. The tag follows the commit only until the next rebase onto a newer upstream: find the commit again with `git log --grep='REVERT MARKER'` and move the tag. The revert does not touch this section, so delete it by hand afterwards.
+When upstream gains per-run hooks for Antigravity (`HookMode::of` in `src/hooks/runtime.rs`), revert the commit tagged `siras/agy-plugin`; see `scripts/README.md`. The tag follows the commit only until the next rebase onto a newer upstream: find the commit again with `git log --grep='REVERT MARKER'` and move the tag. The revert does not touch this section, so delete it by hand afterwards.
 
 ## Docs
 

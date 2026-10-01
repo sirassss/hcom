@@ -1,0 +1,9 @@
+{
+  "name": "hcom",
+  "version": "1.0.2",
+  "description": "hcom lifecycle hooks and agent messaging skill for Antigravity CLI",
+  "author": { "name": "aannoo" },
+  "homepage": "https://github.com/sirassss/hcom-plugin",
+  "repository": "https://github.com/sirassss/hcom-plugin",
+  "license": "MIT"
+}

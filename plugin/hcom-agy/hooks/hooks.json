@@ -1,0 +1,66 @@
+{
+  "hooks": {
+    "PreInvocation": [
+      {
+        "name": "hcom-sessionstart",
+        "type": "command",
+        "command": "sh -c 'cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec $cmd gemini-sessionstart || exit 0'",
+        "timeout": 15,
+        "description": "Initialize hcom session"
+      },
+      {
+        "name": "hcom-beforeagent",
+        "type": "command",
+        "command": "sh -c 'cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec $cmd gemini-beforeagent || exit 0'",
+        "timeout": 15,
+        "description": "Deliver pending messages"
+      }
+    ],
+    "PostInvocation": [
+      {
+        "name": "hcom-afteragent",
+        "type": "command",
+        "command": "sh -c 'cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec $cmd gemini-afteragent || exit 0'",
+        "timeout": 15,
+        "description": "Signal ready for messages"
+      }
+    ],
+    "Stop": [
+      {
+        "name": "hcom-sessionend",
+        "type": "command",
+        "command": "sh -c 'cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec $cmd gemini-sessionend || { printf %s eyJkZWNpc2lvbiI6ImFsbG93In0= | base64 -d; exit 0; }'",
+        "timeout": 15,
+        "description": "Disconnect from hcom"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "name": "hcom-beforetool",
+            "type": "command",
+            "command": "sh -c 'cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec $cmd gemini-beforetool || { printf %s eyJkZWNpc2lvbiI6ImFsbG93In0= | base64 -d; exit 0; }'",
+            "timeout": 15,
+            "description": "Track tool execution"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "name": "hcom-aftertool",
+            "type": "command",
+            "command": "sh -c 'cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && ANTIGRAVITY_AGENT=1 exec $cmd gemini-aftertool || exit 0'",
+            "timeout": 15,
+            "description": "Deliver messages after tools"
+          }
+        ]
+      }
+    ]
+  }
+}
