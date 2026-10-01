@@ -37,6 +37,10 @@ pub struct PidEntry {
     pub inject_port: u16,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
+    /// PID namespace `pid` was recorded in; empty when unknown (legacy entry or
+    /// a platform without PID namespaces). See [`liveness`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pid_namespace: String,
 }
 
 fn is_zero(v: &u16) -> bool {
@@ -91,6 +95,21 @@ fn pidfile_path(hcom_dir: &Path) -> PathBuf {
 /// Check if a process is alive. See [`crate::sys::process::is_alive`].
 pub fn is_alive(pid: u32) -> bool {
     crate::sys::process::is_alive(pid)
+}
+
+/// The namespace to stamp on an entry recorded by this process.
+fn current_namespace() -> String {
+    crate::sys::process::current_pid_namespace()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Liveness of a tracked entry's PID. `None`: it was recorded in a PID
+/// namespace this process cannot inspect, so a negative probe proves nothing
+/// (see [`crate::sys::process::is_alive_in`]).
+pub fn liveness(pid: u32, entry: &PidEntry) -> Option<bool> {
+    let recorded = (!entry.pid_namespace.is_empty()).then_some(entry.pid_namespace.as_str());
+    crate::sys::process::is_alive_in(pid, recorded)
 }
 
 /// Read raw pidfile data.
@@ -215,6 +234,9 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !tag.is_empty() && entry.tag.is_empty() {
             entry.tag = tag.to_string();
         }
+        if entry.pid_namespace.is_empty() {
+            entry.pid_namespace = current_namespace();
+        }
     } else {
         data.insert(
             key,
@@ -233,6 +255,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 notify_port: *notify_port,
                 inject_port: *inject_port,
                 tag: tag.to_string(),
+                pid_namespace: current_namespace(),
             },
         );
     }
@@ -245,25 +268,38 @@ pub fn record_pid(rec: &PidRecord<'_>) {
 /// Auto-prunes dead PIDs from the file. If `active_pids` is provided,
 /// also prunes PIDs that are now active from the file and filters them
 /// from the result.
+///
+/// Entries recorded in a PID namespace this process cannot inspect are neither
+/// pruned nor returned: their liveness is unknown here, so they stay on disk for
+/// a caller in the right namespace, and kill/adopt callers never get a PID that
+/// may name a different process.
 pub fn get_orphan_processes(
     hcom_dir: &Path,
     active_pids: Option<&std::collections::HashSet<u32>>,
 ) -> Vec<OrphanProcess> {
     let data = read_raw(hcom_dir);
 
-    // Filter to alive processes only
+    // Keep live entries, and foreign-namespace ones we cannot judge.
     let mut alive: HashMap<String, PidEntry> = HashMap::new();
+    let mut foreign: HashMap<String, PidEntry> = HashMap::new();
     for (pid_str, entry) in &data {
-        if let Ok(pid) = pid_str.parse::<u32>()
-            && is_alive(pid)
-        {
-            alive.insert(pid_str.clone(), entry.clone());
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        match liveness(pid, entry) {
+            Some(true) => {
+                alive.insert(pid_str.clone(), entry.clone());
+            }
+            None => {
+                foreign.insert(pid_str.clone(), entry.clone());
+            }
+            Some(false) => {}
         }
     }
 
     // Write back pruned data if anything was removed
-    if alive.len() != data.len() {
-        write_raw(hcom_dir, &alive);
+    if alive.len() + foreign.len() != data.len() {
+        write_raw(hcom_dir, &union(&alive, &foreign));
     }
 
     // Build result
@@ -285,7 +321,7 @@ pub fn get_orphan_processes(
             .map(|p| p.pid.to_string())
             .collect();
         if !active_in_file.is_empty() {
-            let mut pruned = alive;
+            let mut pruned = union(&alive, &foreign);
             for k in &active_in_file {
                 pruned.remove(k);
             }
@@ -295,6 +331,16 @@ pub fn get_orphan_processes(
     }
 
     result
+}
+
+fn union(
+    a: &HashMap<String, PidEntry>,
+    b: &HashMap<String, PidEntry>,
+) -> HashMap<String, PidEntry> {
+    a.iter()
+        .chain(b)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Remove a PID from tracking (after kill).
@@ -569,6 +615,80 @@ pub fn recover_single_orphan_to_db(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn entry_in(namespace: &str) -> PidEntry {
+        PidEntry {
+            tool: "claude".to_string(),
+            names: vec!["luna".to_string()],
+            launched_at: 1.0,
+            directory: String::new(),
+            process_id: String::new(),
+            terminal_preset: String::new(),
+            pane_id: String::new(),
+            terminal_id: String::new(),
+            kitty_listen_on: String::new(),
+            zellij_session_name: String::new(),
+            session_id: String::new(),
+            notify_port: 0,
+            inject_port: 0,
+            tag: String::new(),
+            pid_namespace: namespace.to_string(),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn record_pid_stamps_the_recording_namespace() {
+        let dir = make_temp_dir();
+        record_pid(&PidRecord::new(dir.path(), 4242, "claude", "luna", "/tmp"));
+        let entry = &read_raw(dir.path())["4242"];
+        assert_eq!(
+            Some(entry.pid_namespace.as_str()),
+            crate::sys::process::current_pid_namespace()
+        );
+    }
+
+    /// A sandboxed hcom shares the pidfile but can't judge a host PID: the entry
+    /// must stay on disk (a caller on the host still needs it) and must not be
+    /// offered to kill/adopt callers.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn orphan_scan_keeps_but_hides_entries_from_a_foreign_namespace() {
+        let dir = make_temp_dir();
+        let mut data = HashMap::new();
+        data.insert(std::process::id().to_string(), entry_in("pid:[0]"));
+        data.insert("99999999".to_string(), entry_in("pid:[0]"));
+        write_raw(dir.path(), &data);
+
+        assert!(get_orphan_processes(dir.path(), None).is_empty());
+        assert_eq!(read_raw(dir.path()).len(), 2, "foreign entries were pruned");
+
+        // The same entries recorded in our own namespace are judged normally.
+        let ours = crate::sys::process::current_pid_namespace().unwrap();
+        let mut data = HashMap::new();
+        data.insert(std::process::id().to_string(), entry_in(ours));
+        data.insert("99999999".to_string(), entry_in(ours));
+        write_raw(dir.path(), &data);
+
+        let orphans = get_orphan_processes(dir.path(), None);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].pid, std::process::id());
+        assert_eq!(read_raw(dir.path()).len(), 1, "dead entry should be pruned");
+    }
+
+    /// Entries written before namespaces were recorded keep the old behavior.
+    #[test]
+    fn orphan_scan_judges_legacy_entries_by_the_bare_probe() {
+        let dir = make_temp_dir();
+        let mut data = HashMap::new();
+        data.insert(std::process::id().to_string(), entry_in(""));
+        data.insert("99999999".to_string(), entry_in(""));
+        write_raw(dir.path(), &data);
+
+        let orphans = get_orphan_processes(dir.path(), None);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(read_raw(dir.path()).len(), 1);
+    }
 
     fn make_temp_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
