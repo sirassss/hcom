@@ -812,7 +812,13 @@ fn read_tracked_ptys() -> Option<Vec<TrackedPty>> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if !crate::pidtrack::is_alive(pid) {
+        // Not listed unless verifiably alive here: a PID recorded in another PID
+        // namespace stays in the pidfile but isn't ours to show or kill.
+        let recorded_in = info
+            .get("pid_namespace")
+            .and_then(|v| v.as_str())
+            .filter(|ns| !ns.is_empty());
+        if crate::sys::process::is_alive_in(pid, recorded_in) != Some(true) {
             continue;
         }
 

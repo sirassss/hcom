@@ -95,6 +95,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "process_id",
         "terminal_preset_effective",
         "pid_identity",
+        "pid_namespace",
     ];
     let missing: Vec<&str> = preserve_keys
         .iter()
@@ -347,7 +348,12 @@ fn migrate_placeholder_runtime_state(
             // Carry the placeholder's stored identity (or its absence) over as-is:
             // re-observing now could adopt an unrelated process that reused the PID.
             let identity = db.get_instance_pid_identity(&ph.name)?;
-            db.update_instance_pid_with_identity(canonical_name, pid_u32, identity.as_deref())?;
+            db.update_instance_pid_with_identity_in(
+                canonical_name,
+                pid_u32,
+                identity.as_deref(),
+                ph.pid_namespace().as_deref(),
+            )?;
         }
         if let Some(ref ctx) = ph.launch_context {
             db.store_launch_context(canonical_name, ctx)?;
@@ -2054,8 +2060,15 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("new"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc", "", "mozi").unwrap();
-        db.update_instance_pid_with_identity("mozi", 4242, Some("spawn-incarnation"))
-            .unwrap();
+        // Observed by the PTY wrapper in another PID namespace than this (hook)
+        // process: the bind must carry that namespace, not relabel the PID.
+        db.update_instance_pid_with_identity_in(
+            "mozi",
+            4242,
+            Some("spawn-incarnation"),
+            Some("pid:[0]"),
+        )
+        .unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
             .unwrap();
 
@@ -2071,6 +2084,7 @@ mod tests {
             db.get_instance_pid_identity("fano").unwrap().as_deref(),
             Some("spawn-incarnation")
         );
+        assert_eq!(fano.pid_namespace().as_deref(), Some("pid:[0]"));
         assert!(
             fano.launch_context
                 .as_deref()

@@ -797,8 +797,9 @@ const ORPHAN_ENDPOINT_GRACE_SECS: f64 = 60.0;
 /// If `data`'s tracked process is verifiably gone (its PID is dead or now
 /// belongs to a different process incarnation), stop the row and return
 /// `Some(stopped)`. Returns `None` when the row isn't eligible or its process
-/// is still the one it launched. Rows without a stored identity are left to
-/// the clock-based cleanup: plain liveness can't rule out PID reuse.
+/// is still the one it launched, or when its PID was recorded in another PID
+/// namespace (see below). Rows without a stored identity are left to the
+/// clock-based cleanup: plain liveness can't rule out PID reuse.
 fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bool> {
     if data.status == ST_INACTIVE
         || data.status == ST_LAUNCHING
@@ -809,6 +810,11 @@ fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bo
     }
     let pid = data.pid.and_then(|pid| u32::try_from(pid).ok())?;
     let expected_identity = data.pid_identity()?;
+    // A PID recorded in a PID namespace this process can't inspect (hcom run
+    // from a tool's sandbox, sharing the host's DB) says nothing here: its
+    // process is invisible, or a different one holds the number. Not evidence
+    // of exit, so leave the row to a caller that can see it.
+    crate::sys::process::is_alive_in(pid, data.pid_namespace().as_deref())?;
     let current_identity = crate::sys::process::identity(pid);
     let original_process_gone = match current_identity.as_deref() {
         Some(current) => current != expected_identity,
@@ -949,9 +955,12 @@ pub fn cleanup_stale_instances(
             // above. For legacy rows without one, a recycled PID can keep a dead
             // row listed. That costs a stale line in `hcom list`; the opposite
             // mistake costs a running agent.
+            // A PID recorded in a namespace this process can't inspect counts as
+            // live: not seeing it here is no evidence it exited.
             if reason != "exit_cleanup"
                 && let Some(pid) = data.pid
-                && crate::sys::process::is_alive(pid as u32)
+                && crate::sys::process::is_alive_in(pid as u32, data.pid_namespace().as_deref())
+                    != Some(false)
             {
                 crate::log::log_info(
                     "cleanup",
@@ -1229,6 +1238,55 @@ mod tests {
         .unwrap();
         assert_eq!(reap_dead_processes_throttled(&db), 1);
         assert!(!instance_exists(&db, "second"));
+        cleanup(path);
+    }
+
+    /// hcom run from a tool's sandbox shares the host's DB but not its PID
+    /// namespace: a host PID is invisible there, and the same number may name
+    /// another process. The identity check must not retire such a row.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_sweep_skips_rows_recorded_in_a_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let pid = std::process::id();
+        insert_stale_active(&db, "sandboxed", 0, 0, pid as i64);
+
+        // Identity mismatch would retire this row if it were recorded in our namespace.
+        db.update_instance_pid_with_identity_in(
+            "sandboxed",
+            pid,
+            Some("previous-boot-process"),
+            Some("pid:[0]"),
+        )
+        .unwrap();
+        assert_eq!(reap_dead_processes(&db), Some(0));
+        assert!(instance_exists(&db, "sandboxed"));
+
+        db.update_instance_pid_with_identity("sandboxed", pid, Some("previous-boot-process"))
+            .unwrap();
+        assert_eq!(reap_dead_processes(&db), Some(1));
+        assert!(!instance_exists(&db, "sandboxed"));
+        cleanup(path);
+    }
+
+    /// The clock-based path asks "is its PID alive?" before deleting a stale
+    /// row; a PID this process can't inspect must read as alive, not dead.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_stale_cleanup_keeps_dead_looking_pid_from_a_foreign_pid_namespace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_stale_active(&db, "far", 3700, 3700, DEAD_PID);
+        db.update_instance_pid_with_identity_in("far", DEAD_PID as u32, None, Some("pid:[0]"))
+            .unwrap();
+        insert_stale_active(&db, "near", 3700, 3700, DEAD_PID);
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 1, "only the row whose PID we can judge is deleted");
+        assert!(instance_exists(&db, "far"));
+        assert!(!instance_exists(&db, "near"));
         cleanup(path);
     }
 

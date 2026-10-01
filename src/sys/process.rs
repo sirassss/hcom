@@ -108,6 +108,54 @@ pub fn has_identity(pid: u32, expected: &str) -> bool {
     identity(pid).as_deref() == Some(expected)
 }
 
+/// The PID namespace this process can inspect, e.g. `pid:[4026531836]`.
+///
+/// A sandbox can have its own PID namespace while sharing hcom's DB with
+/// agents launched on the host. A PID is only interpretable inside the
+/// namespace it was observed in: [`is_alive`] on a PID from a foreign
+/// namespace names a different process, or none at all.
+///
+/// `None` on platforms without PID namespaces — callers then have nothing to
+/// compare and fall back to the bare liveness probe.
+///
+/// Read once: a process cannot change its own PID namespace (`setns` affects
+/// children, not the caller), and this is on the TUI's per-row reload path.
+pub fn current_pid_namespace() -> Option<&'static str> {
+    static NAMESPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAMESPACE
+        .get_or_init(|| {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                std::fs::read_link("/proc/self/ns/pid")
+                    .ok()
+                    .and_then(|path| path.into_os_string().into_string().ok())
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                None
+            }
+        })
+        .as_deref()
+}
+
+/// Liveness of `pid` as observed from the namespace it was recorded in.
+///
+/// `None` means this process cannot establish anything: `recorded_in` is a
+/// namespace it cannot inspect, so a negative [`is_alive`] here is not evidence
+/// that the process exited. Every caller treats `None` the same way — only
+/// `Some(false)` may drive a removal — so a sandboxed hcom sharing the host's
+/// state never unlinks a live host agent.
+///
+/// A record with no namespace (written before namespaces were recorded, or on
+/// a platform without them) gets the bare liveness probe, as it always did.
+pub fn is_alive_in(pid: u32, recorded_in: Option<&str>) -> Option<bool> {
+    match (recorded_in, current_pid_namespace()) {
+        (None, _) => Some(is_alive(pid)),
+        (Some(recorded), Some(current)) if recorded == current => Some(is_alive(pid)),
+        (Some(_), _) => None,
+    }
+}
+
 /// Whether a process with the given PID is currently alive.
 ///
 /// Unix: `kill(pid, 0)`, treating `EPERM` (the process exists but is owned by
@@ -692,6 +740,24 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_alive_in_without_a_recorded_namespace_is_the_bare_probe() {
+        assert_eq!(is_alive_in(std::process::id(), None), Some(true));
+        assert_eq!(is_alive_in(99999999, None), Some(false));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn is_alive_in_trusts_only_the_current_namespace() {
+        let current = current_pid_namespace().expect("linux exposes /proc/self/ns/pid");
+        assert!(current.starts_with("pid:["), "{current}");
+        assert_eq!(is_alive_in(std::process::id(), Some(current)), Some(true));
+        assert_eq!(is_alive_in(99999999, Some(current)), Some(false));
+        // Another namespace: our own PID proves nothing about its process.
+        assert_eq!(is_alive_in(std::process::id(), Some("pid:[0]")), None);
+        assert_eq!(is_alive_in(99999999, Some("pid:[0]")), None);
+    }
 
     #[test]
     fn test_is_alive_current_process() {

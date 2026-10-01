@@ -44,13 +44,13 @@ agent → hooks → db → hooks/PTY delivery → other agent
 - `events`: append-only history / message log / relay replication source
 - `process_bindings`, `session_bindings`, `notify_endpoints`, `kv`: routing and control plane
 
-`SCHEMA_VERSION` (`src/db/mod.rs`) tracks upstream; schema changes need a migration step, not just a DDL edit. Prefer a `launch_context` JSON key (as `pid_identity` does) over a column when the data is per-run metadata: it needs no bump, so the fork never collides with upstream's next schema version.
+`SCHEMA_VERSION` (`src/db/mod.rs`) tracks upstream; schema changes need a migration step, not just a DDL edit. Prefer a `launch_context` JSON key (as `pid_identity` and `pid_namespace` do) over a column when the data is per-run metadata: it needs no bump, so the fork never collides with upstream's next schema version.
 
 **`src/hooks/` — per-tool hook handlers** (`claude.rs`, `codex.rs`, `gemini.rs`, `cursor.rs`, …) over shared infrastructure in `common.rs`. These are the largest and most tool-quirk-dense files in the tree.
 
 **`src/pty/` + `src/delivery.rs` — message injection.** The PTY wrapper spawns the tool under a vt100-tracked screen with a TCP injection server; delivery injects a message and confirms it by watching the instance's cursor advance. Tool-specific injection quirks (prompt readiness, spinner glyphs, Enter handling) live per-tool, not in the loop.
 
-**`src/instance_lifecycle.rs` + `src/pidtrack.rs` — liveness.** Orphan detection and reboot reconciliation.
+**`src/instance_lifecycle.rs` + `src/pidtrack.rs` — liveness.** Orphan detection and reboot reconciliation are PID-namespace-aware; liveness checks must not reap agents from another namespace.
 
 **`src/relay/` — cross-device MQTT.** Retained per-device state topics plus a non-retained control topic; payloads are XChaCha20-Poly1305 under a shared PSK. See README's relay security section for the trust model before changing anything here.
 

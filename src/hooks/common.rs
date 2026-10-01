@@ -1201,9 +1201,16 @@ fn stop_instance_inner(
     // (stored identity mismatch): never signal it or track it as an orphan.
     // A merely dead leader still gets its group signalled, which reaches any
     // children it left behind.
+    // A PID recorded in a namespace this process can't inspect names nothing
+    // here (or an unrelated process): don't signal or track it.
     if pid_guard.is_none()
         && let Some(pid_val) = pid
         && !instance_data.pid_reused(pid_val as u32)
+        && crate::sys::process::is_alive_in(
+            pid_val as u32,
+            instance_data.pid_namespace().as_deref(),
+        )
+        .is_some()
     {
         let pid_u32 = pid_val as u32;
         if is_headless {
@@ -2391,6 +2398,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped, 0, "an incomplete cascade must publish no stops");
+    }
+
+    /// A PID recorded in a PID namespace this process can't inspect says nothing
+    /// here. Stopping the row must not treat it as a surviving local PTY (which
+    /// would stamp this namespace onto a foreign PID in the pidfile).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_stop_instance_does_not_track_a_pid_from_a_foreign_namespace() {
+        crate::config::Config::init();
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = crate::db::HcomDb::open_at(&hcom_dir.join("hcom.db")).unwrap();
+        let pid = std::process::id();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('far', 'claude', 'active', 'new', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.update_instance_pid_with_identity_in("far", pid, None, Some("pid:[0]"))
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('near', 'claude', 'active', 'new', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.update_instance_pid_with_identity("near", pid, None)
+            .unwrap();
+
+        stop_instance(&db, "far", "test", "closed");
+        let tracked = |dir: &std::path::Path| {
+            crate::pidtrack::get_orphan_processes(dir, None)
+                .iter()
+                .any(|orphan| orphan.pid == pid)
+        };
+        assert!(!tracked(&hcom_dir), "foreign-namespace PID was tracked");
+
+        // The same PID recorded in this namespace is a surviving local PTY.
+        stop_instance(&db, "near", "test", "closed");
+        assert!(tracked(&hcom_dir), "local surviving PTY was not tracked");
     }
 
     #[test]
