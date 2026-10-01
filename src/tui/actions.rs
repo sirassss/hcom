@@ -39,21 +39,6 @@ impl App {
         self.reload_data_inner(true);
     }
 
-    /// Update FTS search results when a text search query is active.
-    pub fn update_search(&mut self) {
-        let query = self.active_search_query().map(|q| q.to_owned());
-        match query {
-            Some(q) => {
-                let limit = std::env::var("HCOM_TUI_TIMELINE_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(5000);
-                self.data.search_results = Some(self.source.search_timeline(&q, limit));
-            }
-            None => self.data.search_results = None,
-        }
-    }
-
     fn reload_data_inner(&mut self, force: bool) {
         // Save cursor name for stability across reloads
         let saved_cursor_name = self.cursor_agent_name();
@@ -63,17 +48,15 @@ impl App {
         } else {
             match self.source.load_if_changed() {
                 Some(data) => data,
-                None => {
-                    self.update_search();
-                    return;
-                }
+                None => return,
             }
         };
         // When "show all stopped" is active, replace stopped_agents with the full list
         if self.ui.show_all_stopped {
             new_data.stopped_agents = self.source.load_all_stopped();
         }
-        // Prune selections that no longer exist
+        // Prune roster selections that no longer exist. A change to the filter
+        // set must invalidate any queued inline replay.
         let live_names: std::collections::HashSet<String> = new_data
             .agents
             .iter()
@@ -81,7 +64,12 @@ impl App {
             .chain(new_data.remote_agents.iter().map(|a| a.display_name()))
             .chain(new_data.stopped_agents.iter().map(|a| a.name.clone()))
             .collect();
-        self.ui.selected.retain(|n| live_names.contains(n));
+        let before = self.ui.msg_filter.agents.len();
+        self.ui.msg_filter.agents.retain(|n| live_names.contains(n));
+        if self.ui.msg_filter.agents.len() != before {
+            self.ui.msg_scroll = 0;
+            self.ui.trigger_inline_replay();
+        }
 
         // Edge-trigger the "relay connected" 5-second flash on not-Connected
         // → Connected. Tracks against the derived RelayHealth, not raw KV, so
@@ -117,8 +105,6 @@ impl App {
 
         // Update tracked cursor name
         self.ui.cursor_name = self.cursor_agent_name();
-
-        self.update_search();
     }
 
     /// Name of the agent currently at cursor position (local agents only).
@@ -141,7 +127,10 @@ impl App {
             },
             RpcOp::KillAgent { name } => match result.result {
                 Ok(resp) if resp.ok() => {
-                    self.ui.selected.remove(&name);
+                    if self.ui.msg_filter.agents.remove(&name) {
+                        self.ui.msg_scroll = 0;
+                        self.ui.trigger_inline_replay();
+                    }
                     self.ui.flash =
                         Some(Flash::new(format!("Killed {}", name), Theme::flash_info()));
                     self.reload_data_force();
@@ -445,7 +434,10 @@ mod tests {
     #[test]
     fn apply_rpc_result_kill_agent_success_clears_selection() {
         let mut app = test_app();
-        app.ui.selected.insert("nova".into());
+        app.ui.view_mode = ViewMode::Inline;
+        app.ui.msg_scroll = 5;
+        app.ui.inline_filter_changed = false;
+        app.ui.msg_filter.agents.insert("nova".into());
 
         app.apply_rpc_result(RpcResult {
             op: RpcOp::KillAgent {
@@ -454,7 +446,9 @@ mod tests {
             result: Ok(ok_response()),
         });
 
-        assert!(!app.ui.selected.contains("nova"));
+        assert!(!app.ui.msg_filter.agents.contains("nova"));
+        assert_eq!(app.ui.msg_scroll, 0);
+        assert!(app.ui.inline_filter_changed);
         assert!(flash_text(&app).contains("Killed nova"));
     }
 

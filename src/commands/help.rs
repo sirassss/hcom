@@ -600,6 +600,10 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     ),
     ("  name_export", "Export agent name to custom env var"),
     (
+        "  bigboss",
+        "TUI coordinator name for the B filter shortcut (default: bigboss)",
+    ),
+    (
         "  title_mode",
         "Terminal/tab title: combined, label, or off",
     ),

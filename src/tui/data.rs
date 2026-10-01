@@ -1,5 +1,4 @@
 use crate::tui::app::DataState;
-use crate::tui::model::{Event, Message};
 
 /// Data provider for the TUI.
 pub trait DataSource {
@@ -16,13 +15,34 @@ pub trait DataSource {
     }
     /// Set the default timeline event limit (overridden by HCOM_TUI_TIMELINE_LIMIT env).
     fn set_timeline_limit(&mut self, _limit: usize) {}
-    /// FTS search across all events.
-    fn search_timeline(&mut self, _query: &str, _limit: usize) -> (Vec<Message>, Vec<Event>) {
-        (vec![], vec![])
-    }
 }
 
 /// Create the DB-backed DataSource.
+#[cfg(not(test))]
 pub fn create_data_source() -> Box<dyn DataSource> {
     Box::new(crate::tui::db::DbDataSource::new())
+}
+
+/// Unit tests build `App` without holding the env lock, so a DB source would
+/// open whatever `HCOM_DIR` another test currently owns and race that test's
+/// first open (SQLITE_BUSY on Windows). Tests needing a DB set `app.source`.
+#[cfg(test)]
+pub fn create_data_source() -> Box<dyn DataSource> {
+    Box::new(FixtureSource)
+}
+
+/// Stand-in for a fixture/mock DataSource (no DB behind it). Only
+/// `load`/`load_all_stopped` are implemented; everything else must come from
+/// the trait default.
+#[cfg(test)]
+struct FixtureSource;
+
+#[cfg(test)]
+impl DataSource for FixtureSource {
+    fn load(&mut self) -> DataState {
+        DataState::empty()
+    }
+    fn load_all_stopped(&mut self) -> Vec<crate::tui::model::Agent> {
+        vec![]
+    }
 }
