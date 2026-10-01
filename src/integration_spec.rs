@@ -721,7 +721,11 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     tui_prefix: "agy ",
     adhoc_icon: None,
     released: true,
-    ready_patterns: &["? for shortcuts"],
+    // Measured on agy 1.1.27: no "? for shortcuts" footer, so with that pattern
+    // alone every launch read as blocked and no message was ever injected. The
+    // status bar renders "Ctx <pct>% (<used>/<total>)" in every frame once the
+    // TUI is up. Keep the footer too for agy builds that draw it.
+    ready_patterns: &["? for shortcuts", "Ctx "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },

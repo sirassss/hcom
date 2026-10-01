@@ -274,7 +274,10 @@ mod tests {
 
     #[test]
     fn antigravity_ready_pattern() {
-        assert_eq!(Tool::Antigravity.ready_patterns(), ["? for shortcuts"]);
+        assert_eq!(
+            Tool::Antigravity.ready_patterns(),
+            ["? for shortcuts", "Ctx "]
+        );
     }
 
     #[test]
