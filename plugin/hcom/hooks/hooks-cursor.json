@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd cursor-sessionstart || exit 0", "timeout": 15 }
+    ],
+    "beforeSubmitPrompt": [
+      { "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd cursor-beforesubmitprompt || exit 0", "timeout": 15 }
+    ],
+    "preToolUse": [
+      { "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd cursor-pretooluse || exit 0", "timeout": 15 }
+    ],
+    "postToolUse": [
+      { "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd cursor-posttooluse || exit 0", "timeout": 15 }
+    ],
+    "stop": [
+      { "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd cursor-stop || exit 0", "timeout": 30, "loop_limit": null }
+    ],
+    "sessionEnd": [
+      { "command": "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 || cmd=\"uvx hcom\"; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd cursor-sessionend || exit 0", "timeout": 15 }
+    ]
+  }
+}
