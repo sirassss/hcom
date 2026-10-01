@@ -65,6 +65,11 @@ pub const ST_INACTIVE: &str = "inactive";
 pub const ST_LAUNCHING: &str = "launching";
 pub const ST_ERROR: &str = "error";
 
+/// Contexts that hold queued delivery at a PTY or hook approval gate.
+pub fn is_delivery_paused_status_context(context: &str) -> bool {
+    context.starts_with("tui:") || matches!(context, "pty:approval" | "approval")
+}
+
 /// Valid status values (ordered for display priority).
 pub const STATUS_ORDER: &[&str] = &[
     ST_ACTIVE,
