@@ -145,6 +145,13 @@ impl InstanceRow {
         ctx.get("pid_identity")?.as_str().map(str::to_string)
     }
 
+    /// PID namespace `pid` was recorded in (see
+    /// [`crate::sys::process::current_pid_namespace`]), if any.
+    pub fn pid_namespace(&self) -> Option<String> {
+        let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;
+        ctx.get("pid_namespace")?.as_str().map(str::to_string)
+    }
+
     /// Whether a *different* live process now holds `pid` (the identity in
     /// this snapshot no longer matches), so it must not be signalled on this
     /// instance's behalf. Checked against the snapshot, not a fresh read, so
@@ -306,6 +313,25 @@ impl HcomDb {
         pid: u32,
         pid_identity: Option<&str>,
     ) -> Result<()> {
+        self.update_instance_pid_with_identity_in(
+            name,
+            pid,
+            pid_identity,
+            crate::sys::process::current_pid_namespace(),
+        )
+    }
+
+    /// Like [`Self::update_instance_pid_with_identity`] for a PID that was
+    /// observed in `pid_namespace` rather than the caller's: moving a PID
+    /// between rows must carry the namespace it was recorded in, or a hook in
+    /// a sandbox would relabel a host PID as its own.
+    pub fn update_instance_pid_with_identity_in(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: Option<&str>,
+        pid_namespace: Option<&str>,
+    ) -> Result<()> {
         match pid_identity {
             Some(pid_identity) => self.conn.execute(
                 "UPDATE instances
@@ -327,6 +353,39 @@ impl HcomDb {
                      END
                  WHERE name = ?",
                 params![pid as i64, name],
+            )?,
+        };
+        self.record_pid_namespace(name, pid_namespace)
+    }
+
+    /// Record the PID namespace the stored PID was observed in, beside its
+    /// identity. A PID is only interpretable inside that namespace, so cleanup
+    /// run from a sandbox with its own PID namespace must not read "I can't see
+    /// it" as "it exited". Nothing is recorded where the platform has no PID
+    /// namespaces (a stale value is dropped).
+    fn record_pid_namespace(&self, name: &str, pid_namespace: Option<&str>) -> Result<()> {
+        match pid_namespace {
+            Some(namespace) => self.conn.execute(
+                "UPDATE instances
+                 SET launch_context = CASE
+                     WHEN json_valid(launch_context)
+                     THEN json_set(launch_context, '$.pid_namespace', ?)
+                     WHEN launch_context IS NULL OR launch_context = ''
+                     THEN json_object('pid_namespace', ?)
+                     ELSE launch_context
+                 END
+                 WHERE name = ?",
+                params![namespace, namespace, name],
+            )?,
+            None => self.conn.execute(
+                "UPDATE instances
+                 SET launch_context = CASE
+                     WHEN json_valid(launch_context)
+                     THEN json_remove(launch_context, '$.pid_namespace')
+                     ELSE launch_context
+                 END
+                 WHERE name = ?",
+                params![name],
             )?,
         };
         Ok(())
@@ -377,14 +436,14 @@ impl HcomDb {
             .flatten())
     }
 
-    /// Clear a PID and its stored process identity.
+    /// Clear a PID and its stored process identity and namespace.
     pub fn clear_instance_pid(&self, name: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE instances
              SET pid = NULL,
                  launch_context = CASE
                      WHEN json_valid(launch_context)
-                     THEN json_remove(launch_context, '$.pid_identity')
+                     THEN json_remove(launch_context, '$.pid_identity', '$.pid_namespace')
                      ELSE launch_context
                  END
              WHERE name = ?",
@@ -1339,6 +1398,47 @@ mod tests {
         let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
         assert_eq!(launch_context["pane_id"], "42");
         assert!(launch_context.get("pid_identity").is_none());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_pid_namespace_is_recorded_beside_identity_and_cleared_with_pid() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\"}')",
+                [],
+            )
+            .unwrap();
+        let row = |db: &HcomDb| db.get_instance_full("luna").unwrap().unwrap();
+
+        // A PID observed here is recorded in this process's namespace.
+        db.update_instance_pid("luna", std::process::id()).unwrap();
+        assert_eq!(
+            row(&db).pid_namespace().as_deref(),
+            crate::sys::process::current_pid_namespace()
+        );
+
+        // A PID moved from another row keeps the namespace it was observed in.
+        db.update_instance_pid_with_identity_in("luna", 4242, Some("incarnation"), Some("pid:[7]"))
+            .unwrap();
+        assert_eq!(row(&db).pid_namespace().as_deref(), Some("pid:[7]"));
+        assert_eq!(row(&db).pid_identity().as_deref(), Some("incarnation"));
+
+        // No namespace (legacy source row, or a platform without them) records none.
+        db.update_instance_pid_with_identity_in("luna", 4242, None, None)
+            .unwrap();
+        assert_eq!(row(&db).pid_namespace(), None);
+
+        db.update_instance_pid_with_identity_in("luna", 4242, Some("incarnation"), Some("pid:[7]"))
+            .unwrap();
+        db.clear_instance_pid("luna").unwrap();
+        let after = row(&db);
+        assert_eq!(after.pid_namespace(), None);
+        assert_eq!(after.pid_identity(), None);
+        assert!(after.launch_context.unwrap().contains("\"pane_id\""));
 
         cleanup_test_db(db_path);
     }
