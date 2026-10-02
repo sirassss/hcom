@@ -2,3 +2,8 @@
 /bin/
 /.hcom/
 /node_modules/
+
+# local tooling scratch
+.superpowers/
+superpowers/
+.codegraph/
