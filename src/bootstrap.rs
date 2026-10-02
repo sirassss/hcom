@@ -64,10 +64,9 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - See who's active: list [name] [-v] [--json]
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] [--detailed (tools/io)] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
-  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
+  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN | --file PATH
   Get notified (watch agents, react): events sub [filters] [--once] | --help
   Example: events sub --idle luna → <hcom> msg when luna goes idle
-- Handoff context: bundle prepare
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--hcom-prompt 'task']
   Example: `hcom 1 claude --tag cool --hcom-prompt 'task'` → <hcom> sends you result when done
   Without --hcom-prompt: you get auto notify <hcom> when ready, then use hcom send
@@ -76,7 +75,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
-- Other commands: status (diagnostics), config (set terminal, etc), relay (remote)
+- Other: status | config | relay
 
 If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 

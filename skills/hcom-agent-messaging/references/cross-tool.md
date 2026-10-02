@@ -66,6 +66,9 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Fork**: not supported (cursor-agent has no native branch primitive — only `--resume`/`--continue`); resume preserved.
 - **Transcript**: cursor-agent writes JSONL under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Parser support is limited: no timestamps, `cwd`, or tool-result blocks; user prompts require wrapper removal.
 
+### Antigravity
+- **Hooks**: sessionstart, beforeagent, afteragent, beforetool, aftertool, sessionend (same conventional `hooks/hooks.json` path Claude reads, so its plugin ships from a separate directory)
+
 ### Grok Build
 - **Hooks**: none. hcom installs nothing for Grok; binding, status and delivery all come over the ACP client on hcom's private leader.
 - **Session binding**: from the leader's session roster (every resident session on the private leader is the TUI's). A session that newly opens idle (`/new`, `/resume` from disk) is bound at once; switching to an already-open session (dashboard, `/resume`) emits nothing, so hcom follows it when a user prompt starts there.

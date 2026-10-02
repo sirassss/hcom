@@ -106,7 +106,7 @@ done
 
 Without cleanup, orphan headless agents run indefinitely consuming resources. Always use `trap cleanup ERR INT TERM` and track launched names. See `script-template.md` for the full pattern.
 
-**Use `hcom kill` not `hcom stop`:** Kill sends SIGTERM and closes the terminal pane. Stop preserves the session for resume but leaves the pane open.
+**Use `hcom kill` not `hcom stop`:** Kill sends SIGTERM and closes the terminal pane. Stop preserves the session for resume but leaves the pane open. This applies to agents the script itself spawned, never to user-spawned ones — and a host may forbid it outright, so follow `~/.hcom/HOST.md` where it is stricter.
 
 ## Broadcast vs Mention Routing
 
