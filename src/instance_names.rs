@@ -314,7 +314,7 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
     reserve_generated_name(db)
 }
 
-pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
+pub(crate) fn lock_name_generation(db: &HcomDb) -> Result<std::fs::File> {
     use std::fs::{File, create_dir_all};
 
     let lock_path = db
@@ -337,34 +337,37 @@ pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
     crate::sys::fs::lock_exclusive(&lock_file)
         .map_err(|e| anyhow::anyhow!("flock failed: {}", e))?;
 
-    let result = (|| -> Result<String> {
-        let name = allocate_unreserved_name(db)?;
+    Ok(lock_file)
+}
 
-        // Reserve with placeholder row
-        let now = now_epoch_i64();
-        let last_event_id = db.get_last_event_id();
-        let mut data = serde_json::Map::new();
-        data.insert("name".into(), serde_json::json!(name));
-        data.insert("status".into(), serde_json::json!(PLACEHOLDER_STATUS));
-        data.insert(
-            "status_context".into(),
-            serde_json::json!(PLACEHOLDER_CONTEXT),
-        );
-        data.insert("created_at".into(), serde_json::json!(now));
-        data.insert("last_event_id".into(), serde_json::json!(last_event_id));
-        data.insert(
-            "wait_timeout".into(),
-            serde_json::json!(crate::config::HcomConfig::effective_timeout()),
-        );
-        db.save_instance_reservation(&name, &data)?;
+pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
+    let _lock = lock_name_generation(db)?;
+    reserve_generated_name_locked(db)
+}
 
-        Ok(name)
-    })();
+/// Caller holds the name-generation lock before acquiring any DB write lock.
+pub(crate) fn reserve_generated_name_locked(db: &HcomDb) -> Result<String> {
+    let name = allocate_unreserved_name(db)?;
 
-    // Lock released when `lock_file` is dropped at function scope end.
-    drop(lock_file);
+    // Reserve with placeholder row
+    let now = now_epoch_i64();
+    let last_event_id = db.get_last_event_id();
+    let mut data = serde_json::Map::new();
+    data.insert("name".into(), serde_json::json!(name));
+    data.insert("status".into(), serde_json::json!(PLACEHOLDER_STATUS));
+    data.insert(
+        "status_context".into(),
+        serde_json::json!(PLACEHOLDER_CONTEXT),
+    );
+    data.insert("created_at".into(), serde_json::json!(now));
+    data.insert("last_event_id".into(), serde_json::json!(last_event_id));
+    data.insert(
+        "wait_timeout".into(),
+        serde_json::json!(crate::config::HcomConfig::effective_timeout()),
+    );
+    db.save_instance_reservation(&name, &data)?;
 
-    result
+    Ok(name)
 }
 
 /// Sanitize agent_type for use in a structured subagent name:

@@ -204,6 +204,77 @@ fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
     Ok(0)
 }
 
+/// Reclaim a surviving row only when its process/session evidence is consistent.
+fn orphan_can_reuse_name(
+    db: &HcomDb,
+    preferred_name: &str,
+    orphan: &pidtrack::OrphanProcess,
+) -> Result<bool> {
+    // A different session/process owner is stronger evidence than the name in
+    // an old pidfile. Even minting here would steal its session via rebind.
+    if !orphan.session_id.is_empty()
+        && let Some(owner) = db.get_session_binding(&orphan.session_id)?
+        && owner != preferred_name
+    {
+        bail!("Orphan session is already owned by '{}'.", owner);
+    }
+    let bound_name = db
+        .get_process_binding_full(&orphan.process_id)?
+        .map(|(_, name)| name);
+    if let Some(owner) = bound_name.as_deref()
+        && owner != preferred_name
+    {
+        bail!("Orphan process is already owned by '{}'.", owner);
+    }
+    if preferred_name.is_empty() || !identity::is_valid_base_name(preferred_name) {
+        return Ok(false);
+    }
+    let Some(row) = db.get_instance_full(preferred_name)? else {
+        return Ok(true);
+    };
+    let same_session = !orphan.session_id.is_empty()
+        && row.session_id.as_deref() == Some(orphan.session_id.as_str());
+    let same_process = bound_name.as_deref() == Some(preferred_name);
+    if same_process
+        && row.session_id.as_deref().is_some_and(|sid| !sid.is_empty())
+        && !orphan.session_id.is_empty()
+        && !same_session
+    {
+        bail!(
+            "Orphan identity '{}' has moved to another session.",
+            preferred_name
+        );
+    }
+    if !same_session && !same_process {
+        return Ok(false);
+    }
+    if row.tool != orphan.tool {
+        bail!(
+            "Orphan identity '{}' belongs to a different tool.",
+            preferred_name
+        );
+    }
+    if let Some(pid) = row.pid {
+        // The orphan scan only returns PIDs this process can judge, so a
+        // matching number is the same process.
+        let same_pid = pid == i64::from(orphan.pid);
+        if !same_pid
+            && u32::try_from(pid).ok().and_then(|pid| {
+                crate::sys::process::is_alive_in(pid, row.pid_namespace().as_deref())
+            }) != Some(false)
+        {
+            bail!(
+                "Orphan identity '{}' still has another owner (or its liveness is unknown).",
+                preferred_name
+            );
+        }
+    } else if !same_process && db.has_process_binding_for_instance(preferred_name) {
+        // Bound to another PTY: not ours to take over. Mint a fresh name.
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Recover orphaned PTY process by PID or name.
 fn start_from_orphan(
     db: &HcomDb,
@@ -269,24 +340,28 @@ fn start_from_orphan(
     }
 
     let preferred_name = orphan.names.last().cloned().unwrap_or_default();
-    let can_reuse = !preferred_name.is_empty()
-        && identity::is_valid_base_name(&preferred_name)
-        && db.get_instance_full(&preferred_name)?.is_none();
+    // Match launch lock order: name-generation lock, then DB write lock.
+    let name_lock = instance_names::lock_name_generation(db)?;
+    // Hold ownership stable between the checks and the recovery writes.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(db.conn(), rusqlite::TransactionBehavior::Immediate)?;
+    let can_reuse = orphan_can_reuse_name(db, &preferred_name, orphan)?;
     let name = if can_reuse {
         preferred_name
     } else {
-        instance_names::generate_unique_name(db)?
+        instance_names::reserve_generated_name_locked(db)?
     };
 
     // Core DB registration
-    if let Err(e) = pidtrack::recover_single_orphan_to_db(db, orphan, &name) {
-        // Release a generated name's reservation row so retries don't strand
-        // one pending placeholder per attempt.
-        if !can_reuse {
-            let _ = db.delete_instance(&name);
-        }
-        bail!("Failed to recover orphan PID {pid}: {e}");
-    }
+    pidtrack::recover_single_orphan_to_db(db, orphan, &name)
+        .map_err(|e| anyhow::anyhow!("Failed to recover orphan PID {pid}: {e}"))?;
+    transaction.commit()?;
+    drop(name_lock);
+    // Other connections can now see the restored binding and status.
+    crate::notify::wake(db, &name, crate::notify::WakeKind::DELIVERY_LOOPS);
+
+    // Recovery may run in a management pane. Do not rename the caller's TTY;
+    // the recovered PTY refreshes its own title through its delivery loop.
 
     db.log_event(
         "life",
@@ -1639,5 +1714,224 @@ mod tests {
         let recovered = db.get_process_binding("proc-riko").unwrap().unwrap();
         assert_ne!(recovered, "riko");
         assert_eq!(instance_names(&db).len(), 2);
+    }
+
+    fn recovery_pidfile(hcom_dir: &std::path::Path) -> PathBuf {
+        let path = hcom_dir.join(".tmp/launched_pids.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({ std::process::id().to_string(): {
+                "tool": "claude", "names": ["riko"], "process_id": "proc-orphan",
+                "session_id": "sess-orphan", "launched_at": crate::shared::time::now_epoch_f64(),
+                "pid_namespace": crate::sys::process::current_pid_namespace().unwrap_or("")
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_reclaims_its_surviving_session_row() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn().execute("INSERT INTO instances (name, tool, session_id, created_at) VALUES ('riko', 'claude', 'sess-orphan', 1)", []).unwrap();
+        recovery_pidfile(&hcom_dir);
+        assert_eq!(
+            start_from_orphan(
+                &db,
+                &hcom_dir,
+                &std::process::id().to_string(),
+                &make_ctx(&[], "/tmp")
+            )
+            .unwrap(),
+            0
+        );
+        let rows = db.iter_instances_full().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "recovery must not split one session across two identities"
+        );
+        assert_eq!(rows[0].name, "riko");
+        assert_eq!(
+            db.get_process_binding_full("proc-orphan")
+                .unwrap()
+                .unwrap()
+                .1,
+            "riko"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_failure_keeps_pidfile_and_returns_error() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let path = recovery_pidfile(&hcom_dir);
+        db.conn().execute_batch("CREATE TRIGGER reject_recovery BEFORE INSERT ON instances BEGIN SELECT RAISE(FAIL, 'recovery unavailable'); END;").unwrap();
+        let result = start_from_orphan(
+            &db,
+            &hcom_dir,
+            &std::process::id().to_string(),
+            &make_ctx(&[], "/tmp"),
+        );
+        assert!(
+            result.is_err(),
+            "a failed registration must not report recovery success"
+        );
+        let pidfile: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(pidfile.get(std::process::id().to_string()).is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_does_not_rename_management_pane() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        recovery_pidfile(&hcom_dir);
+        crate::runtime_env::take_last_terminal_title();
+        start_from_orphan(
+            &db,
+            &hcom_dir,
+            &std::process::id().to_string(),
+            &make_ctx(&[], "/tmp"),
+        )
+        .unwrap();
+        assert_eq!(crate::runtime_env::take_last_terminal_title(), None);
+    }
+
+    #[test]
+    fn orphan_reuse_rejects_another_live_or_unknown_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+        let ns = crate::sys::process::current_pid_namespace().unwrap_or("");
+        db.conn().execute("INSERT INTO instances (name, tool, session_id, pid, launch_context, created_at) VALUES ('riko', 'claude', 'sess-orphan', ?1, json_object('pid_namespace', ?2), 1)", params![std::process::id(), ns]).unwrap();
+        let orphan = pidtrack::OrphanProcess {
+            pid: 99_999_999,
+            process_id: "proc-orphan".into(),
+            session_id: "sess-orphan".into(),
+            tool: "claude".into(),
+            ..Default::default()
+        };
+        assert!(orphan_can_reuse_name(&db, "riko", &orphan).is_err());
+        // Even matching process metadata must not override another live PID.
+        db.set_process_binding("proc-orphan", "sess-orphan", "riko")
+            .unwrap();
+        assert!(orphan_can_reuse_name(&db, "riko", &orphan).is_err());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            db.conn()
+                .execute(
+                    "UPDATE instances SET pid=99999998, launch_context='{\"pid_namespace\":\"pid:[foreign]\"}'",
+                    [],
+                )
+                .unwrap();
+            assert!(orphan_can_reuse_name(&db, "riko", &orphan).is_err());
+        }
+    }
+
+    #[test]
+    fn orphan_reuse_checks_tool_and_binding_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+        let orphan = pidtrack::OrphanProcess {
+            process_id: "proc-orphan".into(),
+            session_id: "sess-orphan".into(),
+            tool: "claude".into(),
+            ..Default::default()
+        };
+        assert!(orphan_can_reuse_name(&db, "riko", &orphan).unwrap());
+        assert!(!orphan_can_reuse_name(&db, "", &orphan).unwrap());
+        db.conn().execute("INSERT INTO instances (name, tool, session_id, created_at) VALUES ('riko', 'codex', 'sess-orphan', 1)", []).unwrap();
+        assert!(orphan_can_reuse_name(&db, "riko", &orphan).is_err());
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool='claude', session_id='different-session'",
+                [],
+            )
+            .unwrap();
+        assert!(!orphan_can_reuse_name(&db, "riko", &orphan).unwrap());
+        db.set_process_binding("proc-orphan", "different-session", "riko")
+            .unwrap();
+        assert!(
+            orphan_can_reuse_name(&db, "riko", &orphan).is_err(),
+            "stale process evidence cannot rewind the current session"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_field_write_failure_rolls_back_and_retains_pidfile() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        for field in ["pid", "session_id", "status"] {
+            let path = recovery_pidfile(&hcom_dir);
+            db.conn().execute_batch(&format!("CREATE TRIGGER reject_field BEFORE UPDATE OF {field} ON instances BEGIN SELECT RAISE(FAIL, 'write unavailable'); END;")).unwrap();
+            let result = start_from_orphan(
+                &db,
+                &hcom_dir,
+                &std::process::id().to_string(),
+                &make_ctx(&[], "/tmp"),
+            );
+            assert!(
+                result.is_err(),
+                "failed {field} update must not report recovery success"
+            );
+            assert!(
+                db.iter_instances_full().unwrap().is_empty(),
+                "partial recovery must roll back"
+            );
+            assert!(
+                db.get_process_binding_full("proc-orphan")
+                    .unwrap()
+                    .is_none()
+            );
+            let pidfile: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(pidfile.get(std::process::id().to_string()).is_some());
+            db.conn()
+                .execute_batch("DROP TRIGGER reject_field")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_recovery_reserves_fallback_name_without_splitting_old_row() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn().execute("INSERT INTO instances (name, tool, session_id, created_at) VALUES ('riko', 'claude', 'unrelated', 1)", []).unwrap();
+        recovery_pidfile(&hcom_dir);
+        start_from_orphan(
+            &db,
+            &hcom_dir,
+            &std::process::id().to_string(),
+            &make_ctx(&[], "/tmp"),
+        )
+        .unwrap();
+        let rows = db.iter_instances_full().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            db.get_instance_full("riko")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("unrelated")
+        );
+        let recovered = db
+            .get_process_binding_full("proc-orphan")
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_ne!(recovered, "riko");
+        assert_eq!(
+            db.get_instance_full(&recovered).unwrap().unwrap().status,
+            "listening"
+        );
     }
 }
