@@ -115,12 +115,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `install` is the tool name install-mock-tools resolves against
-        # scripts/mock-tools.pins; the relay test drives a real claude.
+        # `install` is the tool name(s) install-mock-tools resolves against
+        # scripts/mock-tools.pins, space-separated; the relay test drives a real
+        # claude, and the two cross-agent tests drive claude with claude or codex.
         include:
           - { os: ubuntu-24.04, tool: codex, install: codex, test: real_tool_codex }
           - { os: ubuntu-latest, tool: claude, install: claude, test: real_tool_claude }
           - { os: ubuntu-latest, tool: relay, install: claude, test: test_relay_roundtrip }
+          - { os: ubuntu-latest, tool: claude-claude, install: claude, test: real_tool_claude_claude }
+          - { os: ubuntu-latest, tool: claude-codex, install: claude codex, test: real_tool_claude_codex }
           - { os: windows-latest, tool: codex, install: codex, test: real_tool_codex }
           - { os: windows-latest, tool: claude, install: claude, test: real_tool_claude }
           - { os: windows-latest, tool: relay, install: claude, test: test_relay_roundtrip }
@@ -152,7 +155,9 @@ jobs:
           key: ${{ runner.os }}-mock-tools-${{ matrix.tool }}-${{ hashFiles('scripts/mock-tools.pins') }}
       - name: Install pinned tool (Unix)
         if: runner.os != 'Windows'
-        run: ./scripts/install-mock-tools.sh '${{ matrix.install }}'
+        # Unquoted on purpose: `install` may name several tools. Matrix values are
+        # fixed literals above, never user input.
+        run: ./scripts/install-mock-tools.sh ${{ matrix.install }}
       - name: Add pinned tool to PATH (Unix)
         if: runner.os != 'Windows'
         run: echo "$PWD/target/mock-tools/bin" >> "$GITHUB_PATH"
