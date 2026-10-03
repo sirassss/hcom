@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+pub mod agy_real;
 pub mod claude_mock;
 pub mod codex_mock;
 pub mod cursor_mock;

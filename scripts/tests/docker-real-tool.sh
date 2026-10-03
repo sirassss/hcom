@@ -7,9 +7,16 @@
 #   scripts/tests/docker-real-tool.sh real_tool_claude     # any other test binary
 #   scripts/tests/docker-real-tool.sh real_tool_claude_claude
 #   scripts/tests/docker-real-tool.sh real_tool_claude_codex
+#   scripts/tests/docker-real-tool.sh real_tool_claude_agy   # opt-in: real agy + your Google login
 #
 # Needs: docker; for the Cursor scenario, cursor-agent installed on the host
 # (the matching version directory is mounted read-only; it carries its own node).
+#
+# The agy scenario is the exception to "no account": agy has no mock backend, so
+# it mounts the host's agy binary read-only plus a COPY of its login (only
+# antigravity-oauth-token and installation_id, taken from $HCOM_RT_AGY_AUTH_DIR or
+# ~/.gemini/antigravity-cli, copied to a temp dir that is deleted on exit), keeps
+# the network on for the run phase, and spends a little real model quota.
 #
 # Two phases. PREPARE has network: build the image, fetch crates, install the
 # pinned Claude CLI, compile the tests. RUN has none (`--network none`), which
@@ -46,6 +53,23 @@ if [[ "$TEST" == *cursor* ]]; then
   env_args+=(-e HCOM_RT_CURSOR=1)
 fi
 
+if [[ "$TEST" == *agy* ]]; then
+  AGY_BIN="$(readlink -f "${HCOM_RT_AGY_BIN:-$(command -v agy || true)}")"
+  AGY_SRC="${HCOM_RT_AGY_AUTH_DIR:-$HOME/.gemini/antigravity-cli}"
+  if [[ ! -x "$AGY_BIN" ]]; then
+    echo "agy binary not found; put agy on PATH or set HCOM_RT_AGY_BIN" >&2
+    exit 1
+  fi
+  AGY_AUTH_TMP="$(mktemp -d)"
+  trap 'rm -rf "$AGY_AUTH_TMP"' EXIT
+  for f in antigravity-oauth-token installation_id; do
+    cp "$AGY_SRC/$f" "$AGY_AUTH_TMP/$f"
+  done
+  chmod 755 "$AGY_AUTH_TMP"; chmod 644 "$AGY_AUTH_TMP"/*
+  mounts+=(-v "$AGY_BIN:/opt/agy/agy:ro" -v "$AGY_AUTH_TMP:/opt/agy-auth:ro")
+  env_args+=(-e HCOM_RT_AGY=1 -e HCOM_RT_AGY_AUTH_DIR=/opt/agy-auth)
+fi
+
 echo "== image $IMAGE (rust $RUST_VERSION, node $NODE_VERSION)"
 docker build -q -t "$IMAGE" \
   --build-arg "RUST_VERSION=$RUST_VERSION" \
@@ -76,7 +100,15 @@ if [ -n "${HCOM_RT_CURSOR:-}" ]; then
   ln -sf /opt/cursor-agent/cursor-agent "$HOME/bin/cursor-agent"
   export PATH="$HOME/bin:$PATH"
 fi
+if [ -n "${HCOM_RT_AGY:-}" ]; then
+  mkdir -p "$HOME/bin"
+  ln -sf /opt/agy/agy "$HOME/bin/agy"
+  export PATH="$HOME/bin:$PATH"
+fi
 cargo test --locked --offline --test "$HCOM_RT_TEST" -- --ignored --nocapture --test-threads=1
 '
-echo "== run $TEST (no network)"
-docker run --rm --network none "${mounts[@]}" "${env_args[@]}" "$IMAGE" bash -c "$run"
+# Everything but agy runs with no network at all; agy needs Google's backend.
+NETWORK=none
+[[ "$TEST" == *agy* ]] && NETWORK=bridge
+echo "== run $TEST (network: $NETWORK)"
+docker run --rm --network "$NETWORK" "${mounts[@]}" "${env_args[@]}" "$IMAGE" bash -c "$run"
