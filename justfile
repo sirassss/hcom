@@ -114,7 +114,7 @@ ci *steps:
     # Every step below, in order. Named steps are validated against this up
     # front, so a typo fails before anything runs rather than after the rest of
     # the requested steps have taken minutes; step() rejects a name missing here.
-    known=(dist-check typecheck fmt clippy test msrv mock-tools real_tool_codex real_tool_claude test_relay_roundtrip)
+    known=(dist-check typecheck fmt clippy test msrv mock-tools real_tool_codex real_tool_claude real_tool_claude_claude real_tool_claude_codex test_relay_roundtrip)
     for want in $only_steps; do
         if [[ " ${known[*]} " != *" $want "* ]]; then
             echo "[ci] unknown step: $want" >&2
@@ -176,6 +176,8 @@ ci *steps:
     export PATH="{{ mock-bin }}:$PATH"
     step real_tool_codex      cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1
     step real_tool_claude     cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
+    step real_tool_claude_claude cargo test --locked --test real_tool_claude_claude -- --ignored --nocapture --test-threads=1
+    step real_tool_claude_codex  cargo test --locked --test real_tool_claude_codex -- --ignored --nocapture --test-threads=1
     step test_relay_roundtrip cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
 
     if (( skipped > 0 )); then
