@@ -19,9 +19,13 @@ ngoài `target/mock-tools` + `target/npm-cache` (project-local, gitignored, xoá
 ```sh
 scripts/tests/docker-real-tool.sh                   # kịch bản Claude -> Cursor
 scripts/tests/docker-real-tool.sh real_tool_claude  # test binary khác
+scripts/tests/docker-real-tool.sh real_tool_claude_claude  # Claude <-> Claude (khứ hồi)
+scripts/tests/docker-real-tool.sh real_tool_claude_codex   # Claude <-> Codex (khứ hồi)
+scripts/tests/docker-real-tool.sh real_tool_claude_agy     # Claude -> agy thật (opt-in, xem bên dưới)
 ```
 
 Phase prepare có mạng (build image, cài Claude pin, biên dịch), phase chạy dùng `--network none`.
+Kịch bản agy là ngoại lệ của "không cần tài khoản": agy không có backend mock (đòi OAuth Google), nên script mount binary `agy` của host (read-only) cùng một BẢN SAO login (chỉ `antigravity-oauth-token` + `installation_id`, lấy từ `$HCOM_RT_AGY_AUTH_DIR` hoặc `~/.gemini/antigravity-cli`, xoá khi script thoát), chạy phase run có mạng và tốn một ít quota model thật. Test bắt đúng bản `agy` đã pin (`PINNED_AGY` trong `tests/support/agy_real.rs`), không nằm trong `just ci`.
 Kịch bản Cursor cần `cursor-agent` đã cài trên host (thư mục phiên bản được mount read-only);
 đặt `HCOM_RT_CURSOR_DIR` nếu không ở `~/.local/share/cursor-agent/versions/<phiên bản>`.
 
