@@ -13,6 +13,7 @@
 pub mod claude_mock;
 pub mod codex_mock;
 pub mod cursor_mock;
+pub mod duo;
 pub mod mock_http;
 pub mod pins;
 pub mod real_tool;

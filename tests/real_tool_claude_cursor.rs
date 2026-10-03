@@ -22,46 +22,12 @@ use std::time::Duration;
 use support::Hcom;
 use support::claude_mock::{ClaudeCase, claude_text, claude_tool_use, latest_user_turn};
 use support::cursor_mock;
+use support::duo::{launch, wait_pty_proxy_up};
 use support::mock_http::{MockHttp, Reply};
 use support::real_tool::{ToolCase, require_pinned};
-use support::{parse_launch_names, unique_suffix};
+use support::unique_suffix;
 
 const SEND_TOOL: &str = "toolu_claude_to_cursor";
-
-fn launch(h: &Hcom, tool: &str, args: &[String]) -> String {
-    let mut argv = vec![
-        tool.to_string(),
-        "--headless".to_string(),
-        "--dir".to_string(),
-        h.workspace
-            .to_str()
-            .expect("UTF-8 workspace path")
-            .to_string(),
-        "--".to_string(),
-    ];
-    argv.extend(args.iter().cloned());
-    let (code, stdout, stderr) = h.run(argv);
-    assert_eq!(
-        code,
-        0,
-        "real {tool} launch failed:\n-- stdout --\n{stdout}\n-- stderr --\n{stderr}\n{}",
-        h.diagnostics()
-    );
-    let names = parse_launch_names(&stdout);
-    assert_eq!(
-        names.len(),
-        1,
-        "expected one launched {tool}; stdout={stdout}"
-    );
-    names[0].clone()
-}
-
-fn wait_pty_proxy_up(h: &Hcom, name: &str, what: &str) {
-    h.eventually(what, Duration::from_secs(90), || {
-        let (code, _stdout, _stderr) = h.run(["term", name]);
-        Ok((code == 0).then_some(()))
-    });
-}
 
 #[test]
 #[ignore = "requires the pinned real claude and cursor-agent binaries"]

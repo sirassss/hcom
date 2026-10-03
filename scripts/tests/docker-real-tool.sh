@@ -5,6 +5,8 @@
 #
 #   scripts/tests/docker-real-tool.sh                      # claude -> cursor scenario
 #   scripts/tests/docker-real-tool.sh real_tool_claude     # any other test binary
+#   scripts/tests/docker-real-tool.sh real_tool_claude_claude
+#   scripts/tests/docker-real-tool.sh real_tool_claude_codex
 #
 # Needs: docker; for the Cursor scenario, cursor-agent installed on the host
 # (the matching version directory is mounted read-only; it carries its own node).
@@ -29,7 +31,10 @@ mounts=(
   -v hcom-rt-cargo:/home/hcom/.cargo/registry
   -v hcom-rt-cargo-git:/home/hcom/.cargo/git
 )
-env_args=(-e CARGO_TARGET_DIR=/work/target -e HCOM_RT_TEST="$TEST")
+# Pinned npm CLIs to install: Claude always, Codex only for tests that drive it.
+TOOLS="claude"
+[[ "$TEST" == *codex* ]] && TOOLS="claude codex"
+env_args=(-e CARGO_TARGET_DIR=/work/target -e HCOM_RT_TEST="$TEST" -e HCOM_RT_TOOLS="$TOOLS")
 # Pass the CLI path to the tests; the cursor scenario needs the host install.
 if [[ "$TEST" == *cursor* ]]; then
   if [[ ! -x "$CURSOR_DIR/cursor-agent" ]]; then
@@ -56,7 +61,7 @@ docker run --rm -u root "${mounts[@]}" "$IMAGE" \
 prepare='
 set -euo pipefail
 cd /work
-./scripts/install-mock-tools.sh claude
+./scripts/install-mock-tools.sh $HCOM_RT_TOOLS
 cargo test --locked --test "$HCOM_RT_TEST" --no-run
 '
 echo "== prepare (network)"

@@ -292,7 +292,7 @@ fn wait_pty_proxy_up<C: ToolCase>(h: &Hcom, case: &C, name: &str, what: &str) ->
         .expect("bound instance present")
 }
 
-fn wait_pty_ready(h: &Hcom, name: &str, what: &str) {
+pub fn wait_pty_ready(h: &Hcom, name: &str, what: &str) {
     h.eventually(what, Duration::from_secs(90), || {
         let (code, stdout, _stderr) = h.run(["term", name, "--json"]);
         // `ready` matches the tool's ready pattern (Codex), but tools whose
