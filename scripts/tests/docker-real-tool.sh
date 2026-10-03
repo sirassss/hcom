@@ -111,4 +111,8 @@ cargo test --locked --offline --test "$HCOM_RT_TEST" -- --ignored --nocapture --
 NETWORK=none
 [[ "$TEST" == *agy* ]] && NETWORK=bridge
 echo "== run $TEST (network: $NETWORK)"
-docker run --rm --network "$NETWORK" "${mounts[@]}" "${env_args[@]}" "$IMAGE" bash -c "$run"
+# --init: the lifecycle tests wait for a killed agent's process group to be gone
+# (kill(-pgid, 0)), and a zombie still counts as a member. Without a PID 1 that
+# reaps orphans, every `hcom kill` leaves one behind and that wait times out
+# (real_tool_claude: 3 of 3 runs failed without --init, passed with it).
+docker run --rm --init --network "$NETWORK" "${mounts[@]}" "${env_args[@]}" "$IMAGE" bash -c "$run"
