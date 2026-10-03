@@ -226,3 +226,11 @@ fn install_ci_shim(h: &Hcom) -> std::path::PathBuf {
         .expect("chmod cursor shim");
     dir
 }
+
+/// The Cursor scenario is unix-only (it links config dirs with symlinks and shims
+/// `cursor-agent` with `sh`), but `prepare` still has to compile on Windows because
+/// every test binary builds `support`. Reaching this is a harness misuse.
+#[cfg(not(unix))]
+fn install_ci_shim(_h: &Hcom) -> std::path::PathBuf {
+    panic!("the Cursor real-tool scenario is only supported on unix")
+}
